@@ -1,13 +1,19 @@
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(window.location.search);
+const AUTH_STORAGE_KEY = "vibe_rdesk.passwd";
 const state = {
   socket: null,
   decoder: null,
-  writer: null,
+  audioDecoder: null,
+  audioContext: null,
+  audioSources: new Set(),
   activeCodec: "h264",
   codecString: "avc1.64001f",
   description: null,
   decoderConfigKey: "",
+  audioConfigKey: "",
+  audioEnabled: false,
+  audioNextTime: 0,
   waitingForKeyframe: true,
   stats: {},
   frameCount: 0,
@@ -24,6 +30,15 @@ const state = {
   pendingPointer: null,
   pointerRaf: 0,
   wheelAccumulator: 0,
+  localClipboard: { text: null, image_png_b64: null },
+  remoteClipboard: { text: null, image_png_b64: null },
+  localClipboardSig: "",
+  remoteClipboardSig: "",
+  localClipboardUpdatedAt: 0,
+  remoteClipboardUpdatedAt: 0,
+  clipboardRefreshTimer: 0,
+  passwd: "",
+  connecting: false,
 };
 
 const status = $("status");
@@ -31,7 +46,23 @@ const debug = $("debug");
 const canvas = $("screen");
 const ctx = canvas.getContext("2d", { alpha: false });
 const toast = $("toast");
+const authModal = $("auth-modal");
+const authForm = $("auth-form");
+const authInput = $("auth-passwd");
+const authError = $("auth-error");
 const settingsPanel = $("settings-panel");
+const uploadPanel = $("upload-panel");
+const uploadAction = $("upload-action");
+const uploadInput = $("upload-input");
+const localClipboardCard = $("local-clipboard-card");
+const remoteClipboardCard = $("remote-clipboard-card");
+const AAC_SAMPLE_RATES = [
+  96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
+  16000, 12000, 11025, 8000, 7350,
+];
+const AUDIO_TARGET_LEAD_SECONDS = 0.02;
+const AUDIO_MAX_QUEUE_SECONDS = 0.2;
+const AUDIO_RESET_GRACE_SECONDS = 0.05;
 
 function setStatus(text) {
   status.textContent = text;
@@ -54,51 +85,133 @@ toast.addEventListener("click", async () => {
   }
 });
 
+function loadStoredPassword() {
+  try {
+    return localStorage.getItem(AUTH_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function savePassword(passwd) {
+  try {
+    localStorage.setItem(AUTH_STORAGE_KEY, passwd);
+  } catch {
+    // Ignore storage failures; the session still works for this visit.
+  }
+}
+
+function getPassword() {
+  return state.passwd || authInput.value.trim();
+}
+
+function authUrl(path) {
+  const url = new URL(path, window.location.href);
+  const passwd = getPassword();
+  if (passwd) url.searchParams.set("passwd", passwd);
+  return url;
+}
+
+function setAuthPrompt(message = "") {
+  authModal.classList.remove("hidden");
+  authError.textContent = message;
+  authError.classList.toggle("hidden", !message);
+  authInput.focus({ preventScroll: true });
+  authInput.select();
+}
+
+function clearAuthPrompt() {
+  authError.textContent = "";
+  authError.classList.add("hidden");
+  authModal.classList.add("hidden");
+}
+
+async function verifyPassword(passwd) {
+  const url = new URL("/api/auth", window.location.href);
+  url.searchParams.set("passwd", passwd);
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) {
+    const message = await response.text().catch(() => "");
+    throw new Error(message || "Authentication failed");
+  }
+}
+
 async function connect() {
-  closeConnection({ manual: false, preserveStatus: true });
-  state.manualDisconnect = false;
-  clearTimeout(state.reconnectTimer);
-  const codec = $("codec").value;
-  const bitrate = Number($("bitrate").value);
-  const fps = Number($("fps").value);
-  state.activeCodec = codec;
-  state.frameCount = 0;
-  state.bytesReceived = 0;
-  const url = new URL("/ws", window.location.href);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set("codec", codec);
-  url.searchParams.set("bitrate_kbps", bitrate);
-  url.searchParams.set("fps", fps);
-  setStatus("Connecting...");
-  state.socket = new WebSocket(url);
-  state.socket.binaryType = "arraybuffer";
-  state.socket.onopen = () => {
-    state.reconnectAttempt = 0;
-    setStatus("Connected");
-    startPing();
-  };
-  state.socket.onclose = () => {
-    setStatus("Disconnected");
-    clearInterval(startPing.timer);
-    if (!state.manualDisconnect) scheduleReconnect();
-  };
-  state.socket.onerror = () => showToast("ws_error", "WebSocket error");
-  state.socket.onmessage = (event) => {
-    if (typeof event.data === "string") {
-      handleServerMessage(JSON.parse(event.data));
-    } else {
-      handleFrame(event.data);
-    }
-  };
+  if (state.connecting) return;
+  const passwd = authInput.value.trim();
+  if (!passwd) {
+    setAuthPrompt("Enter the server password.");
+    return;
+  }
+  state.connecting = true;
+  try {
+    setStatus("Authenticating...");
+    await verifyPassword(passwd);
+    savePassword(passwd);
+    state.passwd = passwd;
+    clearAuthPrompt();
+    closeConnection({ manual: false, preserveStatus: true });
+    state.manualDisconnect = false;
+    clearTimeout(state.reconnectTimer);
+    void primeAudioPlayback();
+    const codec = $("codec").value;
+    const bitrate = Number($("bitrate").value);
+    const fps = Number($("fps").value);
+    state.activeCodec = codec;
+    state.frameCount = 0;
+    state.bytesReceived = 0;
+    state.lastNetAt = performance.now();
+    const url = new URL("/ws", window.location.href);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.searchParams.set("codec", codec);
+    url.searchParams.set("bitrate_kbps", bitrate);
+    url.searchParams.set("fps", fps);
+    url.searchParams.set("passwd", passwd);
+    setStatus("Connecting...");
+    state.socket = new WebSocket(url);
+    state.socket.binaryType = "arraybuffer";
+    state.socket.onopen = () => {
+      state.reconnectAttempt = 0;
+      setStatus("Connected");
+      startPing();
+      void refreshLocalClipboard();
+      requestRemoteClipboard();
+    };
+    state.socket.onclose = () => {
+      setStatus("Disconnected");
+      clearInterval(startPing.timer);
+      if (!state.manualDisconnect) scheduleReconnect();
+    };
+    state.socket.onerror = () => showToast("ws_error", "WebSocket error");
+    state.socket.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        handleServerMessage(JSON.parse(event.data));
+      } else {
+        handleFrame(event.data);
+      }
+    };
+  } catch (error) {
+    showToast("auth_failed", error.message || String(error));
+    setAuthPrompt(error.message || "Authentication failed");
+    setStatus(state.socket?.readyState === WebSocket.OPEN ? "Connected" : "Disconnected");
+  } finally {
+    state.connecting = false;
+  }
 }
 
 function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.manualDisconnect = manual;
   clearTimeout(state.reconnectTimer);
+  clearTimeout(state.clipboardRefreshTimer);
   clearInterval(startPing.timer);
   state.decoder?.close();
   state.decoder = null;
+  state.audioDecoder?.close();
+  state.audioDecoder = null;
+  resetAudioPlayback();
   state.decoderConfigKey = "";
+  state.audioConfigKey = "";
+  state.audioEnabled = false;
   state.waitingForKeyframe = true;
   resetKeys();
   if (state.socket) {
@@ -117,6 +230,7 @@ function disconnect() {
 function captureInput() {
   state.inputCaptured = true;
   canvas.focus({ preventScroll: true });
+  void primeAudioPlayback();
 }
 
 function releaseInput() {
@@ -143,13 +257,22 @@ function handleServerMessage(message) {
     if (message.description_b64) {
       state.description = Uint8Array.from(atob(message.description_b64), (c) => c.charCodeAt(0));
     }
+    state.audioEnabled = !!message.audio_enabled;
     setupDecoder();
+    if (!state.audioEnabled) {
+      state.audioDecoder?.close();
+      state.audioDecoder = null;
+      resetAudioPlayback();
+      state.audioConfigKey = "";
+    }
     setStatus(`${message.active_encoder || "ready"} ${message.encoder_mode || ""}`.trim());
   } else if (message.type === "stats") {
     state.stats = message;
     renderDebug();
   } else if (message.type === "error") {
     showToast(message.code, message.message);
+  } else if (message.type === "clipboard" && message.side === "remote") {
+    updateClipboardState("remote", message.payload, { announce: true });
   }
 }
 
@@ -189,10 +312,17 @@ async function drawFrame(frame) {
 }
 
 function handleFrame(buffer) {
-  if (!state.decoder || state.decoder.state === "closed") return;
   const view = new DataView(buffer);
   const kind = view.getUint8(0);
-  if (kind !== 1) return;
+  if (kind === 1) {
+    handleVideoFrame(buffer, view);
+  } else if (kind === 2) {
+    handleAudioFrame(buffer, view);
+  }
+}
+
+function handleVideoFrame(buffer, view) {
+  if (!state.decoder || state.decoder.state === "closed") return;
   const key = !!view.getUint8(1);
   const sentAt = Number(view.getBigUint64(2, true));
   const length = view.getUint32(10, true);
@@ -217,6 +347,148 @@ function handleFrame(buffer) {
   }
 }
 
+function handleAudioFrame(buffer, view) {
+  if (!state.audioEnabled) return;
+  const sentAt = Number(view.getBigUint64(1, true));
+  const length = view.getUint32(9, true);
+  const bytes = new Uint8Array(buffer, 13, length);
+  const frame = parseAdtsFrame(bytes);
+  if (!frame) return;
+  setupAudioDecoder(frame);
+  if (!state.audioDecoder || state.audioDecoder.state === "closed") return;
+  try {
+    state.audioDecoder.decode(new EncodedAudioChunk({
+      type: "key",
+      timestamp: sentAt * 1000,
+      data: frame.payload,
+    }));
+  } catch (error) {
+    showToast("audio_decode_submit_failed", error.message || String(error));
+  }
+}
+
+function parseAdtsFrame(bytes) {
+  if (bytes.byteLength < 7) return null;
+  if (bytes[0] !== 0xff || (bytes[1] & 0xf0) !== 0xf0) return null;
+  const protectionAbsent = bytes[1] & 0x01;
+  const profile = ((bytes[2] & 0xc0) >> 6) + 1;
+  const sampleRateIndex = (bytes[2] & 0x3c) >> 2;
+  const sampleRate = AAC_SAMPLE_RATES[sampleRateIndex];
+  const channelConfig = ((bytes[2] & 0x01) << 2) | ((bytes[3] & 0xc0) >> 6);
+  const frameLength = ((bytes[3] & 0x03) << 11) | (bytes[4] << 3) | ((bytes[5] & 0xe0) >> 5);
+  const headerLength = protectionAbsent ? 7 : 9;
+  if (!sampleRate || !channelConfig || frameLength > bytes.byteLength || frameLength <= headerLength) {
+    return null;
+  }
+  const description = new Uint8Array([
+    (profile << 3) | (sampleRateIndex >> 1),
+    ((sampleRateIndex & 0x01) << 7) | (channelConfig << 3),
+  ]);
+  return {
+    codec: `mp4a.40.${profile}`,
+    sampleRate,
+    numberOfChannels: channelConfig,
+    description,
+    payload: bytes.subarray(headerLength, frameLength),
+  };
+}
+
+function setupAudioDecoder(frame) {
+  if (!("AudioDecoder" in window)) {
+    showToast("audio_webcodecs_missing", "This browser does not support WebCodecs audio decode");
+    return;
+  }
+  const configKey = `${frame.codec}:${frame.sampleRate}:${frame.numberOfChannels}:${btoa(String.fromCharCode(...frame.description))}`;
+  if (state.audioDecoder && state.audioDecoder.state !== "closed" && state.audioConfigKey === configKey) {
+    return;
+  }
+  state.audioDecoder?.close();
+  resetAudioPlayback();
+  state.audioDecoder = new AudioDecoder({
+    output: (audioData) => {
+      void playAudioData(audioData);
+    },
+    error: (err) => showToast("audio_decoder_error", err.message || String(err)),
+  });
+  state.audioDecoder.configure({
+    codec: frame.codec,
+    description: frame.description,
+    sampleRate: frame.sampleRate,
+    numberOfChannels: frame.numberOfChannels,
+  });
+  state.audioConfigKey = configKey;
+}
+
+function resetAudioPlayback() {
+  for (const source of state.audioSources) {
+    try {
+      source.stop();
+    } catch {
+      // Source may already be ended.
+    }
+    source.disconnect();
+  }
+  state.audioSources.clear();
+  state.audioNextTime = 0;
+}
+
+async function ensureAudioContext() {
+  if (!window.AudioContext) return null;
+  if (!state.audioContext || state.audioContext.state === "closed") {
+    state.audioContext = new AudioContext({ latencyHint: "interactive", sampleRate: 48000 });
+  }
+  if (state.audioContext.state === "suspended") {
+    await state.audioContext.resume();
+  }
+  return state.audioContext;
+}
+
+async function primeAudioPlayback() {
+  try {
+    await ensureAudioContext();
+  } catch {
+    // Autoplay policy may require a user gesture; playback will retry later.
+  }
+}
+
+async function playAudioData(audioData) {
+  const audioContext = await ensureAudioContext().catch(() => null);
+  if (!audioContext) {
+    audioData.close();
+    return;
+  }
+  const audioBuffer = audioContext.createBuffer(
+    audioData.numberOfChannels,
+    audioData.numberOfFrames,
+    audioData.sampleRate,
+  );
+  for (let channel = 0; channel < audioData.numberOfChannels; channel += 1) {
+    audioData.copyTo(audioBuffer.getChannelData(channel), {
+      planeIndex: channel,
+      format: "f32-planar",
+    });
+  }
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+  const now = audioContext.currentTime;
+  const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
+  if (!state.audioNextTime || state.audioNextTime < now - AUDIO_RESET_GRACE_SECONDS) {
+    state.audioNextTime = now + AUDIO_TARGET_LEAD_SECONDS;
+  } else if (queuedFor > AUDIO_MAX_QUEUE_SECONDS) {
+    resetAudioPlayback();
+    state.audioNextTime = now + AUDIO_TARGET_LEAD_SECONDS;
+  }
+  state.audioSources.add(source);
+  source.start(state.audioNextTime);
+  state.audioNextTime += audioBuffer.duration;
+  source.onended = () => {
+    state.audioSources.delete(source);
+    source.disconnect();
+  };
+  audioData.close();
+}
+
 function renderDebug() {
   if (params.get("debug") !== "1") return;
   debug.classList.remove("hidden");
@@ -232,6 +504,7 @@ function renderDebug() {
     `memory: ${state.stats.memory_used_mb ?? 0} MB`,
     `server net: ${(state.stats.net_tx_kbps ?? 0).toFixed(1)} kbps`,
     `client net: ${state.netKbps.toFixed(1)} kbps`,
+    `audio: ${state.audioEnabled ? "on" : "off"}`,
   ].join("\n");
 }
 
@@ -239,6 +512,14 @@ function send(message) {
   if (state.socket?.readyState === WebSocket.OPEN) {
     state.socket.send(JSON.stringify(message));
   }
+}
+
+function requestRemoteClipboard() {
+  send({ type: "clipboard_get" });
+}
+
+function sendRemoteClipboard(payload) {
+  send({ type: "clipboard_set", payload });
 }
 
 function startPing() {
@@ -359,7 +640,236 @@ function pointerToCanvas(event) {
   };
 }
 
+function normalizeClipboardPayload(payload) {
+  return {
+    text: typeof payload?.text === "string" && payload.text.length ? payload.text : null,
+    image_png_b64: typeof payload?.image_png_b64 === "string" && payload.image_png_b64.length
+      ? payload.image_png_b64
+      : null,
+  };
+}
+
+function clipboardSignature(payload) {
+  return JSON.stringify(normalizeClipboardPayload(payload));
+}
+
+function clipboardPreview(payload) {
+  const normalized = normalizeClipboardPayload(payload);
+  if (normalized.text) {
+    return normalized.text.replace(/\s+/g, " ").trim().slice(0, 120);
+  }
+  if (normalized.image_png_b64) {
+    return "[image]";
+  }
+  return "Empty";
+}
+
+function updateClipboardState(side, payload, { announce = false } = {}) {
+  const normalized = normalizeClipboardPayload(payload);
+  const signature = clipboardSignature(normalized);
+  const payloadKey = side === "local" ? "localClipboard" : "remoteClipboard";
+  const sigKey = side === "local" ? "localClipboardSig" : "remoteClipboardSig";
+  const timeKey = side === "local" ? "localClipboardUpdatedAt" : "remoteClipboardUpdatedAt";
+  const previousSignature = state[sigKey];
+  const changed = previousSignature !== signature;
+
+  state[payloadKey] = normalized;
+  if (changed) {
+    state[sigKey] = signature;
+    state[timeKey] = Date.now();
+    if (announce && (normalized.text || normalized.image_png_b64) && previousSignature) {
+      showToast(`${side}_clipboard_changed`, clipboardPreview(normalized));
+    }
+  }
+  renderClipboardCard(side, normalized);
+  return normalized;
+}
+
+function renderClipboardCard(side, payload) {
+  const textEl = $(`${side}-clipboard-text`);
+  const metaEl = $(`${side}-clipboard-meta`);
+  const imageEl = $(`${side}-clipboard-image`);
+  const hasText = !!payload.text;
+  const hasImage = !!payload.image_png_b64;
+  textEl.textContent = hasText ? payload.text.slice(0, 2000) : "Empty";
+  if (hasImage) {
+    imageEl.src = `data:image/png;base64,${payload.image_png_b64}`;
+    imageEl.classList.remove("hidden");
+  } else {
+    imageEl.src = "";
+    imageEl.classList.add("hidden");
+  }
+  if (hasText && hasImage) {
+    metaEl.textContent = "Text + image";
+  } else if (hasImage) {
+    metaEl.textContent = "Image";
+  } else if (hasText) {
+    metaEl.textContent = "Text";
+  } else {
+    metaEl.textContent = side === "local" ? "Click to refresh" : "Click to copy locally";
+  }
+}
+
+async function readLocalClipboard() {
+  const payload = { text: null, image_png_b64: null };
+  if (!navigator.clipboard?.read) {
+    if (navigator.clipboard?.readText) {
+      const text = await navigator.clipboard.readText().catch(() => "");
+      if (text) payload.text = text;
+    }
+    return payload;
+  }
+  const items = await navigator.clipboard.read();
+  for (const item of items) {
+    if (!payload.image_png_b64 && item.types.includes("image/png")) {
+      const blob = await item.getType("image/png");
+      payload.image_png_b64 = await blobToBase64(blob);
+    }
+    if (!payload.text) {
+      const textType = item.types.find((type) => type.startsWith("text/plain"));
+      if (textType) {
+        const blob = await item.getType(textType);
+        payload.text = await blob.text();
+      }
+    }
+  }
+  if (!payload.text && navigator.clipboard?.readText) {
+    const text = await navigator.clipboard.readText().catch(() => "");
+    if (text) payload.text = text;
+  }
+  return payload;
+}
+
+async function refreshLocalClipboard() {
+  try {
+    return updateClipboardState("local", await readLocalClipboard(), { announce: true });
+  } catch (error) {
+    showToast("local_clipboard_read_failed", error.message || String(error));
+    return state.localClipboard;
+  }
+}
+
+async function writeLocalClipboard(payload) {
+  const normalized = normalizeClipboardPayload(payload);
+  if (navigator.clipboard?.write && normalized.image_png_b64) {
+    const items = {};
+    items["image/png"] = base64ToBlob(normalized.image_png_b64, "image/png");
+    if (normalized.text) {
+      items["text/plain"] = new Blob([normalized.text], { type: "text/plain" });
+    }
+    await navigator.clipboard.write([new ClipboardItem(items)]);
+  } else if (normalized.text && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(normalized.text);
+  } else {
+    throw new Error("Browser clipboard write is unavailable");
+  }
+  updateClipboardState("local", normalized, { announce: true });
+}
+
+async function pushLocalClipboardToRemote() {
+  const payload = await refreshLocalClipboard();
+  if (!payload.text && !payload.image_png_b64) {
+    showToast("local_clipboard_empty", "Local clipboard is empty");
+    return;
+  }
+  sendRemoteClipboard(payload);
+}
+
+async function copyRemoteClipboardToLocal() {
+  if (!state.remoteClipboard.text && !state.remoteClipboard.image_png_b64) {
+    requestRemoteClipboard();
+    return;
+  }
+  try {
+    await writeLocalClipboard(state.remoteClipboard);
+    showToast("clipboard_copied", "Remote clipboard copied locally");
+  } catch (error) {
+    showToast("local_clipboard_write_failed", error.message || String(error));
+  }
+}
+
+function scheduleRemoteClipboardRefresh(delayMs = 250) {
+  clearTimeout(state.clipboardRefreshTimer);
+  state.clipboardRefreshTimer = setTimeout(() => {
+    requestRemoteClipboard();
+  }, delayMs);
+}
+
+async function maybeSyncClipboardShortcut(event) {
+  const modifier = event.ctrlKey || event.metaKey;
+  if (!modifier || event.altKey) return;
+  const key = event.key.toLowerCase();
+  if (key === "v") {
+    try {
+      const payload = await refreshLocalClipboard();
+      if (!payload.text && !payload.image_png_b64) {
+        return;
+      }
+      if (
+        state.remoteClipboardUpdatedAt > state.localClipboardUpdatedAt
+        && state.remoteClipboardSig
+        && state.remoteClipboardSig !== state.localClipboardSig
+      ) {
+        requestRemoteClipboard();
+        showToast("remote_clipboard_kept", clipboardPreview(state.remoteClipboard));
+        return;
+      }
+      sendRemoteClipboard(payload);
+    } catch (error) {
+      showToast("remote_clipboard_push_failed", error.message || String(error));
+    }
+  } else if (key === "c" || key === "x") {
+    scheduleRemoteClipboardRefresh(350);
+  }
+}
+
+async function uploadSelectedFile() {
+  const file = uploadInput.files?.[0];
+  if (!file) return;
+  const formData = new FormData();
+  formData.append("file", file, file.name);
+  try {
+    setStatus("Uploading...");
+    const response = await fetch(authUrl("/api/upload"), { method: "POST", body: formData });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    const body = await response.json();
+    setStatus("Connected");
+    showToast("upload_ok", `Saved to ${body.saved_as}`);
+  } catch (error) {
+    showToast("upload_failed", error.message || String(error));
+  } finally {
+    uploadInput.value = "";
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      resolve(result.split(",", 2)[1] || "");
+    };
+    reader.onerror = () => reject(reader.error || new Error("Failed to read blob"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function base64ToBlob(base64, type) {
+  const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+  return new Blob([bytes], { type });
+}
+
 function initControls() {
+  authForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void connect();
+  });
+  authInput.addEventListener("input", () => {
+    authError.textContent = "";
+    authError.classList.add("hidden");
+  });
   $("bitrate").addEventListener("input", (event) => {
     $("bitrate-value").textContent = `${event.target.value} kbps`;
   });
@@ -371,13 +881,30 @@ function initControls() {
   });
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
+  uploadAction.addEventListener("click", () => uploadInput.click());
+  uploadInput.addEventListener("change", () => {
+    void uploadSelectedFile();
+  });
+  localClipboardCard.addEventListener("click", () => {
+    void pushLocalClipboardToRemote();
+  });
+  remoteClipboardCard.addEventListener("click", () => {
+    void copyRemoteClipboardToLocal();
+  });
   settingsPanel.addEventListener("toggle", () => {
     if (settingsPanel.open) {
+      uploadPanel.open = false;
+      releaseInput();
+    }
+  });
+  uploadPanel.addEventListener("toggle", () => {
+    if (uploadPanel.open) {
+      settingsPanel.open = false;
       releaseInput();
     }
   });
   document.addEventListener("pointerdown", (event) => {
-    if (event.target instanceof HTMLElement && event.target.closest("#settings-panel")) {
+    if (event.target instanceof HTMLElement && event.target.closest("#settings-panel, #upload-panel")) {
       releaseInput();
     }
   });
@@ -445,12 +972,13 @@ function initControls() {
     event.preventDefault();
     queueWheel(event.deltaY);
   }, { passive: false });
-  window.addEventListener("keydown", (event) => {
+  window.addEventListener("keydown", async (event) => {
     if (event.key === "Escape") {
       releaseInput();
       return;
     }
     if (!shouldHandleKeyboard(event)) return;
+    await maybeSyncClipboardShortcut(event);
     const key = normalizeKey(event);
     if (!key) return;
     if (!event.repeat && state.pressedKeys.has(key)) return;
@@ -466,9 +994,18 @@ function initControls() {
     send({ type: "key", key, down: false });
     event.preventDefault();
   });
+  window.addEventListener("focus", () => {
+    void refreshLocalClipboard();
+    requestRemoteClipboard();
+  });
   window.addEventListener("blur", releaseInput);
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) releaseInput();
+    if (document.hidden) {
+      releaseInput();
+      return;
+    }
+    void refreshLocalClipboard();
+    requestRemoteClipboard();
   });
 }
 
@@ -482,6 +1019,15 @@ async function registerServiceWorker() {
   }
 }
 
+updateClipboardState("local", state.localClipboard);
+updateClipboardState("remote", state.remoteClipboard);
 initControls();
 registerServiceWorker();
-connect();
+state.passwd = loadStoredPassword();
+authInput.value = state.passwd;
+if (state.passwd) {
+  clearAuthPrompt();
+  void connect();
+} else {
+  setAuthPrompt();
+}

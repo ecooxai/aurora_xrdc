@@ -15,8 +15,34 @@
       </section>
 
       <section class="bottom-dock">
+        <div class="tool-row">
+          <details id="upload-panel" class="tool-panel upload-panel">
+            <summary id="upload-trigger" class="tool-toggle" aria-label="Uploads and Clipboard">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 16V4M7.5 8.5 12 4l4.5 4.5M5 19h14" />
+              </svg>
+            </summary>
+            <div class="upload-stack">
+              <button id="upload-action" type="button">Upload File</button>
+              <input id="upload-input" type="file" class="hidden" />
+              <div class="clipboard-stack">
+                <button id="local-clipboard-card" class="clipboard-card secondary" type="button">
+                  <span class="clipboard-title">Local Clipboard</span>
+                  <span id="local-clipboard-meta" class="clipboard-meta">Click to push remote</span>
+                  <span id="local-clipboard-text" class="clipboard-text">Empty</span>
+                  <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
+                </button>
+                <button id="remote-clipboard-card" class="clipboard-card secondary" type="button">
+                  <span class="clipboard-title">Remote Clipboard</span>
+                  <span id="remote-clipboard-meta" class="clipboard-meta">Click to copy locally</span>
+                  <span id="remote-clipboard-text" class="clipboard-text">Empty</span>
+                  <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
+                </button>
+              </div>
+            </div>
+          </details>
         <details id="settings-panel" class="settings-panel">
-          <summary class="settings-toggle" aria-label="Settings">
+          <summary class="tool-toggle settings-toggle" aria-label="Settings">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h14M22 17h-2" />
               <circle cx="16" cy="7" r="2" />
@@ -50,8 +76,21 @@
             <button id="disconnect" class="secondary">Disconnect</button>
           </div>
         </details>
+        </div>
       </section>
     </main>
+    <div id="auth-modal" class="auth-modal hidden" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+      <form id="auth-form" class="auth-card">
+        <p class="auth-kicker">Protected session</p>
+        <h1 id="auth-title">Enter password</h1>
+        <label class="auth-label" for="auth-passwd">
+          Password
+          <input id="auth-passwd" type="password" autocomplete="current-password" spellcheck="false" />
+        </label>
+        <p id="auth-error" class="auth-error hidden"></p>
+        <button type="submit">Connect</button>
+      </form>
+    </div>
     <div id="toast" class="toast hidden"></div>
     <script src="/app.js" type="module"></script>
   </body>

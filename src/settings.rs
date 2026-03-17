@@ -48,6 +48,8 @@ impl StreamConfig {
 pub struct ServerConfig {
     pub bind: String,
     pub display: String,
+    pub upload_dir: String,
+    pub passwd: String,
 }
 
 impl ServerConfig {
@@ -63,6 +65,8 @@ impl ServerConfig {
             display: display
                 .and_then(|value| value.into_string().ok())
                 .unwrap_or_else(|| ":0.0".into()),
+            upload_dir: std::env::var("VIBE_RDESK_UPLOAD_DIR").unwrap_or_else(|_| "uploads".into()),
+            passwd: String::new(),
         }
     }
 
@@ -81,6 +85,7 @@ impl ServerConfig {
     {
         let mut args = args.into_iter().map(Into::into);
         let _ = args.next();
+        let mut passwd = None;
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-p" | "--port" => {
@@ -90,9 +95,19 @@ impl ServerConfig {
                     let port = parse_port(&value)?;
                     server.bind = bind_with_port(&server.bind, port);
                 }
+                "--passwd" => {
+                    let value = args
+                        .next()
+                        .context("missing value for --passwd")?;
+                    if value.trim().is_empty() {
+                        anyhow::bail!("--passwd cannot be empty");
+                    }
+                    passwd = Some(value);
+                }
                 _ => {}
             }
         }
+        server.passwd = passwd.context("missing required --passwd; start the server with --passwd <password>")?;
         Ok(server)
     }
 }
@@ -131,16 +146,29 @@ mod tests {
         let cfg = ServerConfig::from_env_with(None, None);
         assert_eq!(cfg.bind, "0.0.0.0:8001");
         assert_eq!(cfg.display, ":0.0");
+        assert_eq!(cfg.upload_dir, "uploads");
+        assert!(cfg.passwd.is_empty());
     }
 
     #[test]
     fn server_config_applies_cli_port_override() {
         let cfg = ServerConfig::from_args_with(
-            ["vibe_rdesk", "-p", "9000"],
+            ["vibe_rdesk", "-p", "9000", "--passwd", "secret"],
             ServerConfig::from_env_with(None, None),
         )
         .unwrap();
         assert_eq!(cfg.bind, "0.0.0.0:9000");
+        assert_eq!(cfg.passwd, "secret");
+    }
+
+    #[test]
+    fn server_config_requires_passwd_flag() {
+        let err = ServerConfig::from_args_with(
+            ["vibe_rdesk", "-p", "9000"],
+            ServerConfig::from_env_with(None, None),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--passwd"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
@@ -15,4 +15,3 @@ thiserror = "2.0"
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-

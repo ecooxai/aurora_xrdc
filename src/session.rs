@@ -16,6 +16,9 @@ use tokio::{
 use tracing::{error, warn};
 
 use crate::{
+    audio::AudioFrame,
+    audio_streamer,
+    clipboard::{read_remote_clipboard, write_remote_clipboard},
     ffmpeg::{read_stderr, run_xdotool},
     messages::{ClientMessage, ServerMessage},
     settings::{ServerConfig, StreamConfig},
@@ -29,10 +32,15 @@ pub async fn handle_socket(
     config: StreamConfig,
 ) -> Result<()> {
     let (stream, child) = start(server.clone(), config.clone()).await?;
-    let child = Arc::new(Mutex::new(child));
+    let video_child = Arc::new(Mutex::new(child));
+    let (audio_stream, audio_child) = match audio_streamer::start(&server).await {
+        Ok((stream, child)) => (Some(stream), Some(Arc::new(Mutex::new(child)))),
+        Err(_) => (None, None),
+    };
     let last_latency = Arc::new(AtomicU64::new(0));
     let (mut ws_sender, receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
+    let audio_enabled = audio_stream.is_some();
     let session_id = format!("{:x}", rand_id());
     out_tx
         .send(Message::Text(
@@ -44,10 +52,22 @@ pub async fn handle_socket(
                 encoder_mode: stream.encoder.mode,
                 codec_string: config.codec.as_webcodec().into(),
                 description_b64: None,
+                audio_enabled,
             })?
             .into(),
         ))
         .await?;
+    if !audio_enabled {
+        let _ = out_tx
+            .send(Message::Text(
+                serde_json::to_string(&ServerMessage::Error {
+                    code: "audio_unavailable",
+                    message: "Audio capture is unavailable. Install and run PulseAudio/PipeWire with pactl support, or set VIBE_RDESK_AUDIO_SOURCE.".into(),
+                })?
+                .into(),
+            ))
+            .await;
+    }
     let writer_task = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
             if futures_util::SinkExt::send(&mut ws_sender, message).await.is_err() {
@@ -56,12 +76,19 @@ pub async fn handle_socket(
         }
     });
     let stats_task = spawn_stats(out_tx.clone(), config.clone(), stream.encoder.ffmpeg_encoder.clone(), stream.encoder.mode, last_latency.clone());
-    let send_task = tokio::spawn(forward_frames(out_tx.clone(), stream.rx, config.clone(), stream.encoder.ffmpeg_encoder.clone(), stream.encoder.mode));
-    let recv_task = tokio::spawn(handle_client(receiver, server.display.clone(), last_latency));
+    let send_task = tokio::spawn(forward_frames(out_tx.clone(), stream.rx, config.clone(), stream.encoder.ffmpeg_encoder.clone(), stream.encoder.mode, audio_enabled));
+    let audio_task = audio_stream.map(|stream| tokio::spawn(forward_audio(out_tx.clone(), stream.rx)));
+    let recv_task = tokio::spawn(handle_client(receiver, out_tx.clone(), server.display.clone(), last_latency));
     let _ = tokio::try_join!(send_task, recv_task);
     stats_task.abort();
+    if let Some(task) = audio_task {
+        task.abort();
+    }
     writer_task.abort();
-    kill_ffmpeg(child).await;
+    kill_ffmpeg(video_child).await;
+    if let Some(child) = audio_child {
+        kill_ffmpeg(child).await;
+    }
     Ok(())
 }
 
@@ -71,6 +98,7 @@ async fn forward_frames(
     config: StreamConfig,
     encoder: String,
     mode: &'static str,
+    audio_enabled: bool,
 ) -> Result<()> {
     while let Some(frame) = rx.recv().await {
         sender
@@ -87,11 +115,24 @@ async fn forward_frames(
                         encoder_mode: mode,
                         codec_string: frame.codec.as_webcodec().into(),
                         description_b64: frame.description_b64.clone(),
+                        audio_enabled,
                     })?
                     .into(),
                 ))
                 .await?;
         }
+    }
+    Ok(())
+}
+
+async fn forward_audio(
+    sender: mpsc::Sender<Message>,
+    mut rx: tokio::sync::mpsc::Receiver<AudioFrame>,
+) -> Result<()> {
+    while let Some(frame) = rx.recv().await {
+        sender
+            .send(Message::Binary(binary_audio_frame(&frame).into()))
+            .await?;
     }
     Ok(())
 }
@@ -138,13 +179,14 @@ fn spawn_stats(
 
 async fn handle_client(
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    sender: mpsc::Sender<Message>,
     display: String,
     last_latency: Arc<AtomicU64>,
 ) -> Result<()> {
     while let Some(message) = receiver.next().await {
         match message? {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(client) => apply_client_message(&display, client, &last_latency).await?,
+                Ok(client) => apply_client_message(&display, &sender, client, &last_latency).await?,
                 Err(err) => warn!("invalid client message: {err}"),
             },
             Message::Close(_) => break,
@@ -156,6 +198,7 @@ async fn handle_client(
 
 async fn apply_client_message(
     display: &str,
+    sender: &mpsc::Sender<Message>,
     message: ClientMessage,
     last_latency: &AtomicU64,
 ) -> Result<()> {
@@ -187,7 +230,28 @@ async fn apply_client_message(
             let current = current_ms().saturating_sub(sent_at_ms);
             last_latency.store(current, Ordering::Relaxed);
         }
+        ClientMessage::ClipboardSet { payload } => {
+            write_remote_clipboard(display, &payload).await?;
+            send_clipboard_update(display, sender).await?;
+        }
+        ClientMessage::ClipboardGet => {
+            send_clipboard_update(display, sender).await?;
+        }
     }
+    Ok(())
+}
+
+async fn send_clipboard_update(display: &str, sender: &mpsc::Sender<Message>) -> Result<()> {
+    let payload = read_remote_clipboard(display).await?;
+    sender
+        .send(Message::Text(
+            serde_json::to_string(&ServerMessage::Clipboard {
+                side: "remote",
+                payload,
+            })?
+            .into(),
+        ))
+        .await?;
     Ok(())
 }
 
@@ -206,6 +270,15 @@ fn binary_frame(frame: &StreamFrame) -> Vec<u8> {
     let mut out = Vec::with_capacity(18 + frame.bytes.len());
     out.push(1);
     out.push(u8::from(frame.keyframe));
+    out.extend_from_slice(&frame.sent_at_ms.to_le_bytes());
+    out.extend_from_slice(&(frame.bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&frame.bytes);
+    out
+}
+
+fn binary_audio_frame(frame: &AudioFrame) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17 + frame.bytes.len());
+    out.push(2);
     out.extend_from_slice(&frame.sent_at_ms.to_le_bytes());
     out.extend_from_slice(&(frame.bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&frame.bytes);

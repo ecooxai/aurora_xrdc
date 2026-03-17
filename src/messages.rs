@@ -1,4 +1,7 @@
-use crate::settings::{CodecKind, StreamConfig};
+use crate::{
+    clipboard::ClipboardPayload,
+    settings::{CodecKind, StreamConfig},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize)]
@@ -12,6 +15,7 @@ pub enum ServerMessage {
         encoder_mode: &'static str,
         codec_string: String,
         description_b64: Option<String>,
+        audio_enabled: bool,
     },
     Stats {
         capture_fps: f32,
@@ -25,6 +29,14 @@ pub enum ServerMessage {
         net_tx_kbps: f32,
         latency_ms: u64,
     },
+    Error {
+        code: &'static str,
+        message: String,
+    },
+    Clipboard {
+        side: &'static str,
+        payload: ClipboardPayload,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,4 +49,6 @@ pub enum ClientMessage {
     TouchTap,
     Key { key: String, down: bool },
     Ping { sent_at_ms: u64 },
+    ClipboardSet { payload: ClipboardPayload },
+    ClipboardGet,
 }

@@ -28,7 +28,7 @@ body {
   flex-direction: column;
 }
 
-.viewport-card, .settings-panel {
+.viewport-card, .settings-panel, .tool-panel {
   background: var(--panel);
   border: 1px solid var(--panel-border);
   box-shadow: var(--shadow);
@@ -114,17 +114,140 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 .bottom-dock {
   display: flex;
   justify-content: flex-end;
+  align-items: flex-end;
+  gap: 12px;
   padding: 12px;
   background: linear-gradient(180deg, rgba(5, 6, 7, 0), rgba(5, 6, 7, 0.82) 24%, rgba(5, 6, 7, 0.96));
 }
 
+.tool-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.upload-stack {
+  display: none;
+}
+
+.clipboard-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.clipboard-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-radius: 18px;
+  text-align: left;
+}
+
+.clipboard-title {
+  font-weight: 600;
+}
+
+.clipboard-meta {
+  color: var(--accent);
+  font-size: 0.82rem;
+}
+
+.clipboard-text {
+  min-height: 1.4em;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.clipboard-image {
+  width: 100%;
+  max-height: 140px;
+  object-fit: contain;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.tool-panel,
 .settings-panel {
   position: relative;
   border-radius: 20px;
   overflow: visible;
 }
 
-.settings-toggle {
+.auth-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background:
+    radial-gradient(circle at top, rgba(141, 230, 255, 0.14), transparent 28%),
+    rgba(2, 8, 12, 0.88);
+  backdrop-filter: blur(16px);
+}
+
+.auth-card {
+  width: min(420px, 100%);
+  display: grid;
+  gap: 14px;
+  padding: 28px;
+  border-radius: 24px;
+  background: rgba(10, 15, 18, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: var(--shadow);
+}
+
+.auth-card h1 {
+  margin: 0;
+  font-size: 1.8rem;
+  line-height: 1.1;
+}
+
+.auth-kicker {
+  margin: 0;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.75rem;
+}
+
+.auth-label {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.auth-label input {
+  width: 100%;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  padding: 12px 14px;
+  outline: none;
+}
+
+.auth-label input:focus {
+  border-color: rgba(141, 230, 255, 0.48);
+  box-shadow: 0 0 0 3px rgba(141, 230, 255, 0.12);
+}
+
+.auth-error {
+  margin: 0;
+  color: var(--danger);
+  min-height: 1.2em;
+}
+
+.upload-panel {
+  position: fixed;
+  right: 10vw;
+  bottom: 12px;
+  z-index: 20;
+}
+
+.tool-toggle {
   list-style: none;
   width: 52px;
   height: 52px;
@@ -137,11 +260,11 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   box-shadow: var(--shadow);
 }
 
-.settings-toggle::-webkit-details-marker {
+.tool-toggle::-webkit-details-marker {
   display: none;
 }
 
-.settings-toggle svg {
+.tool-toggle svg {
   width: 22px;
   height: 22px;
   fill: none;
@@ -151,18 +274,34 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   stroke-linejoin: round;
 }
 
+.tool-panel[open] .tool-toggle,
 .settings-panel[open] .settings-toggle {
   background: rgba(18, 31, 35, 0.96);
 }
 
+.tool-panel[open] .upload-stack,
 .settings-panel[open] .menu-grid,
 .settings-panel[open] .button-row {
   display: grid;
 }
 
+.tool-panel .upload-stack,
 .settings-panel .menu-grid,
 .settings-panel .button-row {
   display: none;
+}
+
+.tool-panel[open] .upload-stack {
+  position: absolute;
+  right: 0;
+  bottom: 64px;
+  width: min(340px, calc(100vw - 24px));
+  padding: 16px;
+  gap: 12px;
+  border-radius: 20px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--shadow);
 }
 
 .settings-panel[open] .menu-grid {
@@ -208,6 +347,11 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   .bottom-dock {
     justify-content: flex-end;
   }
+
+  .tool-row {
+    width: 100%;
+    justify-content: space-between;
+  }
 }
 
 @media (max-width: 640px) {
@@ -215,6 +359,7 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
     padding: 10px;
   }
 
+  .tool-panel[open] .upload-stack,
   .settings-panel[open] .menu-grid,
   .settings-panel[open] .button-row {
     width: min(320px, calc(100vw - 20px));
