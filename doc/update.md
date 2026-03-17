@@ -1,0 +1,23 @@
+## 2026-03-17 Remote Desktop MVP
+
+- Task: Build a Rust remote desktop app that serves a web client, captures the current X11 screen, streams H.264/H.265/VP8 with low-latency settings, supports pointer/touch control, adds a debug overlay, service worker, and bottom error notification, then verify build output.
+- Start: 2026-03-17 15:16:18 UTC by codex/gpt5
+- End: 2026-03-17 16:05:46 UTC by codex/gpt5
+- Total: 49m 28s
+- Plan used:
+  - Create a minimal Rust server and browser client from the empty repository.
+  - Use FFmpeg `x11grab` for capture, prefer NVENC for H.264/H.265, and fall back to CPU encoders.
+  - Stream encoded frames over WebSocket and decode them with browser WebCodecs.
+  - Relay touchpad-style pointer input and clicks to X11 through `xdotool`.
+  - Add service worker caching, in-app error notifications, debug overlay, tests, and build scripts.
+- Completed:
+  - Added an Axum-based Rust server that serves the browser UI and upgrades WebSocket sessions.
+  - Implemented FFmpeg-backed X11 capture with codec selection, bitrate/FPS tuning, and encoder fallback.
+  - Added H.264/H.265 Annex B parsing and VP8 IVF parsing for WebSocket frame delivery.
+  - Added a browser client with WebCodecs decode, touchpad controls, click buttons, debug overlay, and bottom toast notifications.
+  - Added a service worker that caches `html/js/css` assets and triggers an update check after load.
+  - Added Rust unit tests, `test.sh`, `dev.sh`, `.gitignore`, and updated project documentation.
+- Verification:
+  - `./test.sh` passed.
+  - `CARGO_TARGET_DIR=/tmp/vibe_rdesk-build cargo build --release` passed.
+  - Build output folder: `/tmp/vibe_rdesk-build`

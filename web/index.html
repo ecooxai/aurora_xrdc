@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Vibe RDesk</title>
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="viewport-card">
+        <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+        <div id="status" class="status-pill">Connecting...</div>
+        <div id="debug" class="debug-panel hidden"></div>
+      </section>
+
+      <section class="bottom-dock">
+        <details id="settings-panel" class="settings-panel">
+          <summary class="settings-toggle" aria-label="Settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h14M22 17h-2" />
+              <circle cx="16" cy="7" r="2" />
+              <circle cx="8" cy="12" r="2" />
+              <circle cx="18" cy="17" r="2" />
+            </svg>
+          </summary>
+          <div class="menu-grid">
+            <label>Codec
+              <select id="codec">
+                <option value="h264" selected>H.264</option>
+                <option value="h265">H.265</option>
+                <option value="vp8">VP8</option>
+              </select>
+            </label>
+            <label>Bitrate
+              <input id="bitrate" type="range" min="1000" max="12000" step="250" value="4000" />
+              <span id="bitrate-value">4000 kbps</span>
+            </label>
+            <label>FPS
+              <input id="fps" type="range" min="8" max="30" step="1" value="16" />
+              <span id="fps-value">16 fps</span>
+            </label>
+            <label>Scroll speed
+              <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
+              <span id="scroll-speed-value">3 / 10</span>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="connect">Connect</button>
+            <button id="disconnect" class="secondary">Disconnect</button>
+          </div>
+        </details>
+      </section>
+    </main>
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
