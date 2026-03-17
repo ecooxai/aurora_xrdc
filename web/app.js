@@ -514,6 +514,21 @@ function send(message) {
   }
 }
 
+function logInputState(kind, event, extra = {}) {
+  console.debug("[input]", {
+    kind,
+    key: event.key,
+    code: event.code,
+    repeat: event.repeat,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    altKey: event.altKey,
+    shiftKey: event.shiftKey,
+    pressedKeys: [...state.pressedKeys],
+    ...extra,
+  });
+}
+
 function requestRemoteClipboard() {
   send({ type: "clipboard_get" });
 }
@@ -795,10 +810,9 @@ function scheduleRemoteClipboardRefresh(delayMs = 250) {
   }, delayMs);
 }
 
-async function maybeSyncClipboardShortcut(event) {
-  const modifier = event.ctrlKey || event.metaKey;
-  if (!modifier || event.altKey) return;
-  const key = event.key.toLowerCase();
+async function maybeSyncClipboardShortcut({ ctrlKey, metaKey, altKey, key }) {
+  const modifier = ctrlKey || metaKey;
+  if (!modifier || altKey) return;
   if (key === "v") {
     try {
       const payload = await refreshLocalClipboard();
@@ -912,6 +926,10 @@ function initControls() {
     const point = pointerToCanvas(event);
     if (!point) return;
     captureInput();
+    logInputState("pointerdown", event, {
+      button: event.button,
+      pointerType: event.pointerType,
+    });
     queuePointerMove(point.x, point.y);
     if (event.pointerType === "touch" || event.pointerType === "pen") {
       state.activePointerId = event.pointerId;
@@ -972,19 +990,28 @@ function initControls() {
     event.preventDefault();
     queueWheel(event.deltaY);
   }, { passive: false });
-  window.addEventListener("keydown", async (event) => {
+  window.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       releaseInput();
       return;
     }
     if (!shouldHandleKeyboard(event)) return;
-    await maybeSyncClipboardShortcut(event);
     const key = normalizeKey(event);
     if (!key) return;
-    if (!event.repeat && state.pressedKeys.has(key)) return;
+    if (!event.repeat && state.pressedKeys.has(key)) {
+      logInputState("keydown-duplicate", event, { normalizedKey: key });
+      return;
+    }
     if (!event.repeat) state.pressedKeys.add(key);
+    logInputState("keydown", event, { normalizedKey: key });
     send({ type: "key", key, down: true });
     event.preventDefault();
+    void maybeSyncClipboardShortcut({
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      altKey: event.altKey,
+      key: event.key.toLowerCase(),
+    });
   });
   window.addEventListener("keyup", (event) => {
     if (!shouldHandleKeyboard(event)) return;
