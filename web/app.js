@@ -1,6 +1,9 @@
 const $ = (id) => document.getElementById(id);
-const params = new URLSearchParams(window.location.search);
 const AUTH_STORAGE_KEY = "vibe_rdesk.passwd";
+const SETTINGS_STORAGE_KEY = "vibe_rdesk.settings";
+const TOUCH_LONG_PRESS_MS = 1000;
+const TOUCH_MOVE_CANCEL_PX = 14;
+const DIRECT_TOUCH_SCROLL_MULTIPLIER = 3;
 const state = {
   socket: null,
   decoder: null,
@@ -15,7 +18,6 @@ const state = {
   audioEnabled: false,
   audioNextTime: 0,
   waitingForKeyframe: true,
-  stats: {},
   frameCount: 0,
   bytesReceived: 0,
   lastNetAt: performance.now(),
@@ -23,12 +25,19 @@ const state = {
   manualDisconnect: false,
   reconnectTimer: null,
   reconnectAttempt: 0,
-  activePointerId: null,
-  touchGesture: null,
+  touchPointers: new Map(),
+  touchLongPressTimer: 0,
+  touchLongPressPointerId: null,
+  touchDragPointerId: null,
+  touchScrollLastY: null,
   inputCaptured: false,
   pressedKeys: new Set(),
+  suppressedKeyups: new Set(),
+  activePasteShortcut: false,
   pendingPointer: null,
   pointerRaf: 0,
+  pendingRelativePointer: null,
+  relativePointerRaf: 0,
   wheelAccumulator: 0,
   localClipboard: { text: null, image_png_b64: null },
   remoteClipboard: { text: null, image_png_b64: null },
@@ -36,13 +45,12 @@ const state = {
   remoteClipboardSig: "",
   localClipboardUpdatedAt: 0,
   remoteClipboardUpdatedAt: 0,
-  clipboardRefreshTimer: 0,
+  clipboardRefreshTimers: [],
   passwd: "",
   connecting: false,
 };
 
 const status = $("status");
-const debug = $("debug");
 const canvas = $("screen");
 const ctx = canvas.getContext("2d", { alpha: false });
 const toast = $("toast");
@@ -51,11 +59,24 @@ const authForm = $("auth-form");
 const authInput = $("auth-passwd");
 const authError = $("auth-error");
 const settingsPanel = $("settings-panel");
+const encoderStatus = $("encoder-status");
+const codecSelect = $("codec");
+const bitrateInput = $("bitrate");
+const bitrateValue = $("bitrate-value");
+const fpsInput = $("fps");
+const fpsValue = $("fps-value");
+const scrollSpeedInput = $("scroll-speed");
+const scrollSpeedValue = $("scroll-speed-value");
+const touchModeSelect = $("touch-mode");
+const directTouchScrollInput = $("direct-touch-scroll");
+const directTouchScrollLabel = $("direct-touch-scroll-label");
 const uploadPanel = $("upload-panel");
 const uploadAction = $("upload-action");
 const uploadInput = $("upload-input");
-const localClipboardCard = $("local-clipboard-card");
-const remoteClipboardCard = $("remote-clipboard-card");
+const localClipboardCopyBtn = $("local-clipboard-copy-btn");
+const localClipboardSyncBtn = $("local-clipboard-sync-btn");
+const remoteClipboardCopyBtn = $("remote-clipboard-copy-btn");
+const remoteClipboardSyncBtn = $("remote-clipboard-sync-btn");
 const AAC_SAMPLE_RATES = [
   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
   16000, 12000, 11025, 8000, 7350,
@@ -66,6 +87,11 @@ const AUDIO_RESET_GRACE_SECONDS = 0.05;
 
 function setStatus(text) {
   status.textContent = text;
+  status.classList.toggle("hidden", text === "Connected");
+}
+
+function setEncoderStatus(text) {
+  encoderStatus.textContent = text;
 }
 
 function showToast(code, message) {
@@ -99,6 +125,90 @@ function savePassword(passwd) {
   } catch {
     // Ignore storage failures; the session still works for this visit.
   }
+}
+
+function clampControlValue(control, value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  const min = Number(control.min);
+  const max = Number(control.max);
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function normalizeSettings(settings = {}) {
+  const allowedCodecs = new Set(Array.from(codecSelect.options, (option) => option.value));
+  const allowedTouchModes = new Set(Array.from(touchModeSelect.options, (option) => option.value));
+  const defaultBitrate = Number(bitrateInput.value);
+  const defaultFps = Number(fpsInput.value);
+  const defaultScrollSpeed = Number(scrollSpeedInput.value);
+  return {
+    codec: allowedCodecs.has(settings.codec) ? settings.codec : codecSelect.value,
+    bitrate: clampControlValue(bitrateInput, settings.bitrate, defaultBitrate),
+    fps: clampControlValue(fpsInput, settings.fps, defaultFps),
+    scrollSpeed: clampControlValue(scrollSpeedInput, settings.scrollSpeed, defaultScrollSpeed),
+    touchMode: allowedTouchModes.has(settings.touchMode) ? settings.touchMode : touchModeSelect.value,
+    directTouchScroll: settings.directTouchScroll === true,
+  };
+}
+
+function readSettingsFromControls() {
+  return normalizeSettings({
+    codec: codecSelect.value,
+    bitrate: bitrateInput.value,
+    fps: fpsInput.value,
+    scrollSpeed: scrollSpeedInput.value,
+    touchMode: touchModeSelect.value,
+    directTouchScroll: directTouchScrollInput.checked,
+  });
+}
+
+function saveSettings(settings = readSettingsFromControls()) {
+  try {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // Ignore storage failures; the session still works for this visit.
+  }
+}
+
+function loadStoredSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!raw) return readSettingsFromControls();
+    return normalizeSettings(JSON.parse(raw));
+  } catch {
+    return readSettingsFromControls();
+  }
+}
+
+function renderSettingsValues(settings = readSettingsFromControls()) {
+  bitrateValue.textContent = `${settings.bitrate} kbps`;
+  fpsValue.textContent = `${settings.fps} fps`;
+  scrollSpeedValue.textContent = `${settings.scrollSpeed} / 10`;
+}
+
+function syncTouchModeControls(settings = readSettingsFromControls()) {
+  const isDirectTouch = settings.touchMode === "direct_touch";
+  directTouchScrollInput.disabled = !isDirectTouch;
+  directTouchScrollLabel.classList.toggle("is-disabled", !isDirectTouch);
+}
+
+function applySettings(settings) {
+  const normalized = normalizeSettings(settings);
+  codecSelect.value = normalized.codec;
+  bitrateInput.value = String(normalized.bitrate);
+  fpsInput.value = String(normalized.fps);
+  scrollSpeedInput.value = String(normalized.scrollSpeed);
+  touchModeSelect.value = normalized.touchMode;
+  directTouchScrollInput.checked = normalized.directTouchScroll;
+  renderSettingsValues(normalized);
+  syncTouchModeControls(normalized);
+}
+
+function persistCurrentSettings() {
+  const settings = readSettingsFromControls();
+  renderSettingsValues(settings);
+  syncTouchModeControls(settings);
+  saveSettings(settings);
 }
 
 function getPassword() {
@@ -154,9 +264,7 @@ async function connect() {
     state.manualDisconnect = false;
     clearTimeout(state.reconnectTimer);
     void primeAudioPlayback();
-    const codec = $("codec").value;
-    const bitrate = Number($("bitrate").value);
-    const fps = Number($("fps").value);
+    const { codec, bitrate, fps } = readSettingsFromControls();
     state.activeCodec = codec;
     state.frameCount = 0;
     state.bytesReceived = 0;
@@ -168,6 +276,7 @@ async function connect() {
     url.searchParams.set("fps", fps);
     url.searchParams.set("passwd", passwd);
     setStatus("Connecting...");
+    setEncoderStatus("Connecting...");
     state.socket = new WebSocket(url);
     state.socket.binaryType = "arraybuffer";
     state.socket.onopen = () => {
@@ -202,7 +311,7 @@ async function connect() {
 function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.manualDisconnect = manual;
   clearTimeout(state.reconnectTimer);
-  clearTimeout(state.clipboardRefreshTimer);
+  clearClipboardRefreshTimers();
   clearInterval(startPing.timer);
   state.decoder?.close();
   state.decoder = null;
@@ -220,6 +329,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
     socket.onclose = null;
     socket.close();
   }
+  if (!preserveStatus) setEncoderStatus("Not connected");
   if (!preserveStatus) setStatus("Disconnected");
 }
 
@@ -234,8 +344,10 @@ function captureInput() {
 }
 
 function releaseInput() {
+  resetTouchInteraction();
   state.inputCaptured = false;
   resetKeys();
+  send({ type: "reset_input" });
 }
 
 function scheduleReconnect() {
@@ -265,10 +377,7 @@ function handleServerMessage(message) {
       resetAudioPlayback();
       state.audioConfigKey = "";
     }
-    setStatus(`${message.active_encoder || "ready"} ${message.encoder_mode || ""}`.trim());
-  } else if (message.type === "stats") {
-    state.stats = message;
-    renderDebug();
+    setEncoderStatus(`${message.active_encoder || "ready"} ${message.encoder_mode || ""}`.trim());
   } else if (message.type === "error") {
     showToast(message.code, message.message);
   } else if (message.type === "clipboard" && message.side === "remote") {
@@ -489,25 +598,6 @@ async function playAudioData(audioData) {
   audioData.close();
 }
 
-function renderDebug() {
-  if (params.get("debug") !== "1") return;
-  debug.classList.remove("hidden");
-  const latency = state.stats.latency_ms ?? 0;
-  debug.textContent = [
-    `codec: ${state.stats.codec ?? state.activeCodec}`,
-    `encoder: ${state.stats.active_encoder ?? "-"}`,
-    `mode: ${state.stats.encoder_mode ?? "-"}`,
-    `capture fps: ${state.stats.capture_fps ?? 0}`,
-    `client frames: ${state.frameCount}`,
-    `latency: ${latency} ms`,
-    `cpu: ${(state.stats.cpu_usage ?? 0).toFixed(1)}%`,
-    `memory: ${state.stats.memory_used_mb ?? 0} MB`,
-    `server net: ${(state.stats.net_tx_kbps ?? 0).toFixed(1)} kbps`,
-    `client net: ${state.netKbps.toFixed(1)} kbps`,
-    `audio: ${state.audioEnabled ? "on" : "off"}`,
-  ].join("\n");
-}
-
 function send(message) {
   if (state.socket?.readyState === WebSocket.OPEN) {
     state.socket.send(JSON.stringify(message));
@@ -549,6 +639,56 @@ function resetKeys() {
     send({ type: "key", key, down: false });
   }
   state.pressedKeys.clear();
+  state.suppressedKeyups.clear();
+  state.activePasteShortcut = false;
+}
+
+function releasePressedKey(key) {
+  if (!state.pressedKeys.has(key)) return false;
+  state.pressedKeys.delete(key);
+  send({ type: "key", key, down: false });
+  return true;
+}
+
+function releaseClipboardChord(primaryKey) {
+  releasePressedKey(primaryKey);
+  releasePressedKey("Control_L");
+  releasePressedKey("Control_R");
+  releasePressedKey("Super_L");
+  releasePressedKey("Super_R");
+}
+
+function currentClipboardModifiers() {
+  return ["Control_L", "Control_R", "Super_L", "Super_R"].filter((key) => state.pressedKeys.has(key));
+}
+
+function markSuppressedKeyups(keys) {
+  for (const key of keys) {
+    state.suppressedKeyups.add(key);
+  }
+}
+
+function dropPressedKey(key) {
+  state.pressedKeys.delete(key);
+}
+
+function reconcileModifierState(event) {
+  if (!event.ctrlKey) {
+    releasePressedKey("Control_L");
+    releasePressedKey("Control_R");
+  }
+  if (!event.metaKey) {
+    releasePressedKey("Super_L");
+    releasePressedKey("Super_R");
+  }
+  if (!event.altKey) {
+    releasePressedKey("Alt_L");
+    releasePressedKey("Alt_R");
+  }
+  if (!event.shiftKey) {
+    releasePressedKey("Shift_L");
+    releasePressedKey("Shift_R");
+  }
 }
 
 function normalizeKey(event) {
@@ -644,15 +784,258 @@ function queuePointerMove(x, y) {
   });
 }
 
-function pointerToCanvas(event) {
+function queueRelativePointerMove(dx, dy) {
+  if (!dx && !dy) return;
+  const pending = state.pendingRelativePointer || { dx: 0, dy: 0 };
+  pending.dx += dx;
+  pending.dy += dy;
+  state.pendingRelativePointer = pending;
+  if (state.relativePointerRaf) return;
+  state.relativePointerRaf = requestAnimationFrame(() => {
+    state.relativePointerRaf = 0;
+    const delta = state.pendingRelativePointer;
+    state.pendingRelativePointer = null;
+    if (!delta || (!delta.dx && !delta.dy)) return;
+    send({ type: "pointer_move", dx: delta.dx, dy: delta.dy });
+  });
+}
+
+function clientPointToCanvas(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   if (!rect.width || !rect.height) return null;
-  const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
-  const y = Math.min(Math.max(event.clientY - rect.top, 0), rect.height);
+  const x = Math.min(Math.max(clientX - rect.left, 0), rect.width);
+  const y = Math.min(Math.max(clientY - rect.top, 0), rect.height);
   return {
     x: Math.round((x / rect.width) * canvas.width),
     y: Math.round((y / rect.height) * canvas.height),
   };
+}
+
+function pointerToCanvas(event) {
+  return clientPointToCanvas(event.clientX, event.clientY);
+}
+
+function clientDeltaToRemote(dx, dy) {
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  return {
+    dx: (dx / rect.width) * canvas.width,
+    dy: (dy / rect.height) * canvas.height,
+  };
+}
+
+function isTouchPointer(event) {
+  return event.pointerType === "touch" || event.pointerType === "pen";
+}
+
+function getTouchMode() {
+  return touchModeSelect.value;
+}
+
+function isDirectTouchScrollEnabled() {
+  return getTouchMode() === "direct_touch" && directTouchScrollInput.checked;
+}
+
+function clearTouchLongPress() {
+  if (state.touchLongPressTimer) {
+    clearTimeout(state.touchLongPressTimer);
+    state.touchLongPressTimer = 0;
+  }
+  state.touchLongPressPointerId = null;
+}
+
+function resetTouchInteraction() {
+  clearTouchLongPress();
+  state.touchPointers.clear();
+  state.touchDragPointerId = null;
+  state.touchScrollLastY = null;
+  state.pendingPointer = null;
+  state.pendingRelativePointer = null;
+  if (state.pointerRaf) {
+    cancelAnimationFrame(state.pointerRaf);
+    state.pointerRaf = 0;
+  }
+  if (state.relativePointerRaf) {
+    cancelAnimationFrame(state.relativePointerRaf);
+    state.relativePointerRaf = 0;
+  }
+}
+
+function getAverageTouchClientY() {
+  if (!state.touchPointers.size) return null;
+  let total = 0;
+  for (const touch of state.touchPointers.values()) {
+    total += touch.clientY;
+  }
+  return total / state.touchPointers.size;
+}
+
+function updateTouchPointer(event) {
+  const touch = state.touchPointers.get(event.pointerId);
+  if (!touch) return null;
+  const previous = { clientX: touch.clientX, clientY: touch.clientY };
+  touch.clientX = event.clientX;
+  touch.clientY = event.clientY;
+  return previous;
+}
+
+function resetRemainingTouchStart() {
+  if (state.touchPointers.size !== 1) return;
+  const [pointerId, touch] = state.touchPointers.entries().next().value;
+  touch.startX = touch.clientX;
+  touch.startY = touch.clientY;
+  state.touchPointers.set(pointerId, touch);
+  if (state.touchDragPointerId === pointerId) return;
+  scheduleTouchLongPress(pointerId);
+}
+
+function scheduleTouchLongPress(pointerId) {
+  clearTouchLongPress();
+  if (state.touchPointers.size !== 1) return;
+  const touch = state.touchPointers.get(pointerId);
+  if (!touch) return;
+  state.touchLongPressPointerId = pointerId;
+  state.touchLongPressTimer = window.setTimeout(() => {
+    state.touchLongPressTimer = 0;
+    const activeTouch = state.touchPointers.get(pointerId);
+    if (!activeTouch || state.touchPointers.size !== 1) return;
+    if (getTouchMode() === "direct_touch") {
+      const point = clientPointToCanvas(activeTouch.clientX, activeTouch.clientY);
+      if (point) send({ type: "pointer_absolute", x: point.x, y: point.y });
+    }
+    send({ type: "pointer_button", button: 1, down: true });
+    state.touchDragPointerId = pointerId;
+  }, TOUCH_LONG_PRESS_MS);
+}
+
+function maybeCancelTouchLongPress(pointerId) {
+  if (state.touchLongPressPointerId !== pointerId) return;
+  const touch = state.touchPointers.get(pointerId);
+  if (!touch) {
+    clearTouchLongPress();
+    return;
+  }
+  const movedX = touch.clientX - touch.startX;
+  const movedY = touch.clientY - touch.startY;
+  if (Math.hypot(movedX, movedY) >= TOUCH_MOVE_CANCEL_PX) {
+    clearTouchLongPress();
+  }
+}
+
+function startTouchScroll() {
+  clearTouchLongPress();
+  state.touchScrollLastY = getAverageTouchClientY();
+}
+
+function handleTouchPointerDown(event) {
+  captureInput();
+  state.touchPointers.set(event.pointerId, {
+    startX: event.clientX,
+    startY: event.clientY,
+    clientX: event.clientX,
+    clientY: event.clientY,
+  });
+  canvas.setPointerCapture(event.pointerId);
+  if (state.touchPointers.size === 1) {
+    if (getTouchMode() === "direct_touch") {
+      const point = pointerToCanvas(event);
+      if (point) queuePointerMove(point.x, point.y);
+    }
+    scheduleTouchLongPress(event.pointerId);
+  } else if (state.touchPointers.size === 2) {
+    if (state.touchDragPointerId === null) {
+      startTouchScroll();
+    } else {
+      clearTouchLongPress();
+    }
+  } else {
+    clearTouchLongPress();
+  }
+  event.preventDefault();
+}
+
+function handleTouchPointerMove(event) {
+  const previous = updateTouchPointer(event);
+  if (!previous) return;
+  const isDragging = state.touchDragPointerId === event.pointerId;
+  if (state.touchPointers.size >= 2) {
+    if (state.touchDragPointerId !== null) {
+      event.preventDefault();
+      return;
+    }
+    if (state.touchScrollLastY === null) {
+      startTouchScroll();
+    } else {
+      const averageY = getAverageTouchClientY();
+      if (averageY !== null) {
+        queueWheel(averageY - state.touchScrollLastY);
+        state.touchScrollLastY = averageY;
+      }
+    }
+    event.preventDefault();
+    return;
+  }
+  maybeCancelTouchLongPress(event.pointerId);
+  if (getTouchMode() === "direct_touch") {
+    if (isDragging) {
+      const point = pointerToCanvas(event);
+      if (point) queuePointerMove(point.x, point.y);
+    } else if (isDirectTouchScrollEnabled()) {
+      const touch = state.touchPointers.get(event.pointerId);
+      if (!touch) {
+        event.preventDefault();
+        return;
+      }
+      const movedX = touch.clientX - touch.startX;
+      const movedY = touch.clientY - touch.startY;
+      if (Math.hypot(movedX, movedY) < TOUCH_MOVE_CANCEL_PX) {
+        event.preventDefault();
+        return;
+      }
+      clearTouchLongPress();
+      queueWheel((previous.clientY - event.clientY) * DIRECT_TOUCH_SCROLL_MULTIPLIER);
+    } else {
+      const point = pointerToCanvas(event);
+      if (point) queuePointerMove(point.x, point.y);
+    }
+  } else {
+    const delta = clientDeltaToRemote(event.clientX - previous.clientX, event.clientY - previous.clientY);
+    if (delta) queueRelativePointerMove(delta.dx, delta.dy);
+  }
+  event.preventDefault();
+}
+
+function handleTouchPointerEnd(event) {
+  if (!state.touchPointers.has(event.pointerId)) return;
+  const touch = state.touchPointers.get(event.pointerId);
+  const wasSingleTouch = state.touchPointers.size === 1;
+  const wasDragging = state.touchDragPointerId === event.pointerId;
+  const movedDistance = touch
+    ? Math.hypot(touch.clientX - touch.startX, touch.clientY - touch.startY)
+    : TOUCH_MOVE_CANCEL_PX;
+  const isTap = wasSingleTouch && !wasDragging && movedDistance < TOUCH_MOVE_CANCEL_PX;
+  if (state.touchLongPressPointerId === event.pointerId) {
+    clearTouchLongPress();
+  }
+  state.touchPointers.delete(event.pointerId);
+  if (wasDragging) {
+    send({ type: "pointer_button", button: 1, down: false });
+    state.touchDragPointerId = null;
+  } else if (isTap) {
+    send({ type: "pointer_button", button: 1, down: true });
+    send({ type: "pointer_button", button: 1, down: false });
+  }
+  if (state.touchPointers.size >= 2) {
+    state.touchScrollLastY = getAverageTouchClientY();
+  } else {
+    state.touchScrollLastY = null;
+  }
+  if (state.touchPointers.size === 1) {
+    resetRemainingTouchStart();
+  } else if (!state.touchPointers.size) {
+    clearTouchLongPress();
+  }
+  event.preventDefault();
 }
 
 function normalizeClipboardPayload(payload) {
@@ -706,7 +1089,7 @@ function renderClipboardCard(side, payload) {
   const imageEl = $(`${side}-clipboard-image`);
   const hasText = !!payload.text;
   const hasImage = !!payload.image_png_b64;
-  textEl.textContent = hasText ? payload.text.slice(0, 2000) : "Empty";
+  textEl.textContent = hasText ? payload.text : "Empty";
   if (hasImage) {
     imageEl.src = `data:image/png;base64,${payload.image_png_b64}`;
     imageEl.classList.remove("hidden");
@@ -721,7 +1104,7 @@ function renderClipboardCard(side, payload) {
   } else if (hasText) {
     metaEl.textContent = "Text";
   } else {
-    metaEl.textContent = side === "local" ? "Click to refresh" : "Click to copy locally";
+    metaEl.textContent = side === "local" ? "Ready to push remote" : "Ready to copy locally";
   }
 }
 
@@ -803,38 +1186,86 @@ async function copyRemoteClipboardToLocal() {
   }
 }
 
-function scheduleRemoteClipboardRefresh(delayMs = 250) {
-  clearTimeout(state.clipboardRefreshTimer);
-  state.clipboardRefreshTimer = setTimeout(() => {
+async function copyClipboardText(side) {
+  const payload = side === "local" ? state.localClipboard : state.remoteClipboard;
+  if (!payload.text) {
+    showToast("clipboard_text_empty", `${side} clipboard has no text`);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(payload.text);
+    showToast("clipboard_text_copied", `${side} clipboard text copied`);
+  } catch (error) {
+    showToast("clipboard_text_copy_failed", error.message || String(error));
+  }
+}
+
+function clearClipboardRefreshTimers() {
+  for (const timer of state.clipboardRefreshTimers) {
+    clearTimeout(timer);
+  }
+  state.clipboardRefreshTimers = [];
+}
+
+function scheduleRemoteClipboardRefresh(delaysMs = [250]) {
+  clearClipboardRefreshTimers();
+  state.clipboardRefreshTimers = delaysMs.map((delayMs) => setTimeout(() => {
     requestRemoteClipboard();
-  }, delayMs);
+  }, delayMs));
 }
 
 async function maybeSyncClipboardShortcut({ ctrlKey, metaKey, altKey, key }) {
   const modifier = ctrlKey || metaKey;
   if (!modifier || altKey) return;
-  if (key === "v") {
-    try {
-      const payload = await refreshLocalClipboard();
-      if (!payload.text && !payload.image_png_b64) {
-        return;
-      }
-      if (
-        state.remoteClipboardUpdatedAt > state.localClipboardUpdatedAt
-        && state.remoteClipboardSig
-        && state.remoteClipboardSig !== state.localClipboardSig
-      ) {
-        requestRemoteClipboard();
-        showToast("remote_clipboard_kept", clipboardPreview(state.remoteClipboard));
-        return;
-      }
-      sendRemoteClipboard(payload);
-    } catch (error) {
-      showToast("remote_clipboard_push_failed", error.message || String(error));
-    }
-  } else if (key === "c" || key === "x") {
-    scheduleRemoteClipboardRefresh(350);
+  if (key === "c" || key === "x") {
+    scheduleRemoteClipboardRefresh([180, 500, 1000, 1800]);
   }
+}
+
+async function syncLocalClipboardForPaste() {
+  try {
+    const payload = await refreshLocalClipboard();
+    if (!payload.text && !payload.image_png_b64) {
+      return;
+    }
+    if (
+      state.remoteClipboardUpdatedAt > state.localClipboardUpdatedAt
+      && state.remoteClipboardSig
+      && state.remoteClipboardSig !== state.localClipboardSig
+    ) {
+      requestRemoteClipboard();
+      showToast("remote_clipboard_kept", clipboardPreview(state.remoteClipboard));
+      return;
+    }
+    sendRemoteClipboard(payload);
+  } catch (error) {
+    showToast("remote_clipboard_push_failed", error.message || String(error));
+  }
+}
+
+async function triggerRemotePasteShortcut() {
+  if (state.activePasteShortcut) return;
+  state.activePasteShortcut = true;
+  const modifierKeys = currentClipboardModifiers();
+  markSuppressedKeyups([...modifierKeys, "v"]);
+  try {
+    for (const key of modifierKeys) {
+      dropPressedKey(key);
+    }
+    send({ type: "reset_input" });
+    await syncLocalClipboardForPaste();
+    send({ type: "paste" });
+  } finally {
+    state.activePasteShortcut = false;
+  }
+}
+
+function handleClipboardShortcut(primaryKey, action) {
+  if (!state.inputCaptured) return;
+  setTimeout(() => {
+    releaseClipboardChord(primaryKey);
+  }, 0);
+  void action();
 }
 
 async function uploadSelectedFile() {
@@ -884,26 +1315,32 @@ function initControls() {
     authError.textContent = "";
     authError.classList.add("hidden");
   });
-  $("bitrate").addEventListener("input", (event) => {
-    $("bitrate-value").textContent = `${event.target.value} kbps`;
-  });
-  $("fps").addEventListener("input", (event) => {
-    $("fps-value").textContent = `${event.target.value} fps`;
-  });
-  $("scroll-speed").addEventListener("input", (event) => {
-    $("scroll-speed-value").textContent = `${event.target.value} / 10`;
-  });
+  codecSelect.addEventListener("change", persistCurrentSettings);
+  bitrateInput.addEventListener("input", persistCurrentSettings);
+  bitrateInput.addEventListener("change", persistCurrentSettings);
+  fpsInput.addEventListener("input", persistCurrentSettings);
+  fpsInput.addEventListener("change", persistCurrentSettings);
+  scrollSpeedInput.addEventListener("input", persistCurrentSettings);
+  scrollSpeedInput.addEventListener("change", persistCurrentSettings);
+  touchModeSelect.addEventListener("change", persistCurrentSettings);
+  directTouchScrollInput.addEventListener("change", persistCurrentSettings);
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
   uploadAction.addEventListener("click", () => uploadInput.click());
   uploadInput.addEventListener("change", () => {
     void uploadSelectedFile();
   });
-  localClipboardCard.addEventListener("click", () => {
+  localClipboardSyncBtn.addEventListener("click", () => {
     void pushLocalClipboardToRemote();
   });
-  remoteClipboardCard.addEventListener("click", () => {
+  remoteClipboardSyncBtn.addEventListener("click", () => {
     void copyRemoteClipboardToLocal();
+  });
+  localClipboardCopyBtn.addEventListener("click", () => {
+    void copyClipboardText("local");
+  });
+  remoteClipboardCopyBtn.addEventListener("click", () => {
+    void copyClipboardText("remote");
   });
   settingsPanel.addEventListener("toggle", () => {
     if (settingsPanel.open) {
@@ -923,55 +1360,42 @@ function initControls() {
     }
   });
   canvas.addEventListener("pointerdown", (event) => {
+    if (isTouchPointer(event)) {
+      logInputState("pointerdown", event, {
+        button: event.button,
+        pointerType: event.pointerType,
+      });
+      handleTouchPointerDown(event);
+      return;
+    }
     const point = pointerToCanvas(event);
     if (!point) return;
     captureInput();
+    reconcileModifierState(event);
     logInputState("pointerdown", event, {
       button: event.button,
       pointerType: event.pointerType,
     });
     queuePointerMove(point.x, point.y);
-    if (event.pointerType === "touch" || event.pointerType === "pen") {
-      state.activePointerId = event.pointerId;
-      state.touchGesture = {
-        startX: point.x,
-        startY: point.y,
-        moved: false,
-      };
-      canvas.setPointerCapture(event.pointerId);
-      event.preventDefault();
-      return;
-    }
     if (event.button === 0 || event.button === 2 || event.button === 1) {
       send({ type: "pointer_button", button: event.button + 1, down: true });
       event.preventDefault();
     }
   });
   canvas.addEventListener("pointermove", (event) => {
+    if (isTouchPointer(event)) {
+      handleTouchPointerMove(event);
+      return;
+    }
     const point = pointerToCanvas(event);
     if (!point) return;
-    if (event.pointerType === "touch" || event.pointerType === "pen") {
-      if (event.pointerId !== state.activePointerId) return;
-      const gesture = state.touchGesture;
-      if (gesture && (Math.abs(point.x - gesture.startX) > 8 || Math.abs(point.y - gesture.startY) > 8)) {
-        gesture.moved = true;
-      }
-      event.preventDefault();
-    }
+    reconcileModifierState(event);
     queuePointerMove(point.x, point.y);
   });
   canvas.addEventListener("pointerup", (event) => {
-    if (event.pointerType === "touch" || event.pointerType === "pen") {
-      if (event.pointerId !== state.activePointerId) return;
-      const point = pointerToCanvas(event);
-      if (point) queuePointerMove(point.x, point.y);
-      if (state.touchGesture && !state.touchGesture.moved) {
-        send({ type: "pointer_button", button: 1, down: true });
-        send({ type: "pointer_button", button: 1, down: false });
-      }
-      state.activePointerId = null;
-      state.touchGesture = null;
-      event.preventDefault();
+    reconcileModifierState(event);
+    if (isTouchPointer(event)) {
+      handleTouchPointerEnd(event);
       return;
     }
     if (event.button === 0 || event.button === 2 || event.button === 1) {
@@ -980,14 +1404,14 @@ function initControls() {
     }
   });
   canvas.addEventListener("pointercancel", (event) => {
-    if (event.pointerId === state.activePointerId) {
-      state.activePointerId = null;
-      state.touchGesture = null;
+    if (isTouchPointer(event)) {
+      handleTouchPointerEnd(event);
     }
   });
   canvas.addEventListener("contextmenu", (event) => event.preventDefault());
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
+    reconcileModifierState(event);
     queueWheel(event.deltaY);
   }, { passive: false });
   window.addEventListener("keydown", (event) => {
@@ -996,8 +1420,16 @@ function initControls() {
       return;
     }
     if (!shouldHandleKeyboard(event)) return;
+    reconcileModifierState(event);
     const key = normalizeKey(event);
     if (!key) return;
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && key === "v") {
+      event.preventDefault();
+      if (!event.repeat) {
+        void triggerRemotePasteShortcut();
+      }
+      return;
+    }
     if (!event.repeat && state.pressedKeys.has(key)) {
       logInputState("keydown-duplicate", event, { normalizedKey: key });
       return;
@@ -1013,11 +1445,29 @@ function initControls() {
       key: event.key.toLowerCase(),
     });
   });
+  window.addEventListener("paste", () => {
+    if (!state.inputCaptured || state.activePasteShortcut) return;
+    void triggerRemotePasteShortcut();
+  });
+  window.addEventListener("copy", () => {
+    handleClipboardShortcut("c", async () => scheduleRemoteClipboardRefresh([180, 500, 1000, 1800]));
+  });
+  window.addEventListener("cut", () => {
+    handleClipboardShortcut("x", async () => scheduleRemoteClipboardRefresh([180, 500, 1000, 1800]));
+  });
   window.addEventListener("keyup", (event) => {
-    if (!shouldHandleKeyboard(event)) return;
     const key = normalizeKey(event);
     if (!key) return;
-    state.pressedKeys.delete(key);
+    if (state.suppressedKeyups.delete(key)) {
+      event.preventDefault();
+      return;
+    }
+    const released = releasePressedKey(key);
+    if (released) {
+      event.preventDefault();
+      return;
+    }
+    if (!shouldHandleKeyboard(event)) return;
     send({ type: "key", key, down: false });
     event.preventDefault();
   });
@@ -1048,6 +1498,7 @@ async function registerServiceWorker() {
 
 updateClipboardState("local", state.localClipboard);
 updateClipboardState("remote", state.remoteClipboard);
+applySettings(loadStoredSettings());
 initControls();
 registerServiceWorker();
 state.passwd = loadStoredPassword();

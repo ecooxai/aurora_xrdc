@@ -9,6 +9,10 @@
   --accent-2: #f5c26b;
   --danger: #ff6f6f;
   --shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+  --dock-edge: 10vw;
+  --dock-bottom: 12px;
+  --fab-size: 52px;
+  --dock-gap: 12px;
 }
 
 * { box-sizing: border-box; }
@@ -40,6 +44,21 @@ body {
   gap: 12px;
 }
 label { display: grid; gap: 8px; color: var(--muted); font-size: 0.95rem; }
+.toggle-label {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+}
+
+.toggle-label input[type="checkbox"] {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--accent);
+}
+
+.toggle-label.is-disabled {
+  opacity: 0.55;
+}
+
 select, input, button {
   font: inherit;
 }
@@ -87,7 +106,7 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   outline: none;
 }
 
-.status-pill, .debug-panel, .toast {
+.status-pill, .toast {
   position: absolute;
   backdrop-filter: blur(8px);
 }
@@ -99,18 +118,6 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   background: rgba(4, 17, 24, 0.72);
   border: 1px solid rgba(98, 213, 255, 0.24);
 }
-.debug-panel {
-  top: 12px;
-  right: 12px;
-  max-width: 280px;
-  padding: 12px;
-  border-radius: 16px;
-  background: rgba(4, 17, 24, 0.8);
-  border: 1px solid rgba(255,255,255,0.1);
-  color: var(--muted);
-  white-space: pre-line;
-}
-
 .bottom-dock {
   display: flex;
   justify-content: flex-end;
@@ -137,10 +144,50 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
 .clipboard-card {
   display: grid;
-  gap: 8px;
+  gap: 10px;
   padding: 14px;
   border-radius: 18px;
   text-align: left;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.clipboard-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.clipboard-heading {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.clipboard-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.clipboard-action {
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 0.82rem;
+}
+
+.clipboard-content {
+  display: grid;
+  gap: 10px;
+  min-height: 100px;
+  max-height: 100px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(3, 9, 12, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .clipboard-title {
@@ -157,11 +204,13 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   color: var(--muted);
   white-space: pre-wrap;
   word-break: break-word;
+  user-select: text;
+  cursor: text;
 }
 
 .clipboard-image {
   width: 100%;
-  max-height: 140px;
+  max-height: 100%;
   object-fit: contain;
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.04);
@@ -173,6 +222,27 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   position: relative;
   border-radius: 20px;
   overflow: visible;
+}
+
+.settings-status {
+  display: grid;
+  gap: 4px;
+  min-width: 180px;
+  padding: 12px 16px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+}
+
+.settings-status-label {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.72rem;
+  color: var(--accent);
+}
+
+.settings-status-value {
+  font-size: 0.98rem;
+  color: var(--text);
 }
 
 .auth-modal {
@@ -242,8 +312,15 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
 .upload-panel {
   position: fixed;
-  right: 10vw;
-  bottom: 12px;
+  right: var(--dock-edge);
+  bottom: var(--dock-bottom);
+  z-index: 20;
+}
+
+.settings-panel {
+  position: fixed;
+  right: calc(var(--dock-edge) + var(--fab-size) + var(--dock-gap));
+  bottom: var(--dock-bottom);
   z-index: 20;
 }
 
@@ -280,14 +357,12 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 }
 
 .tool-panel[open] .upload-stack,
-.settings-panel[open] .menu-grid,
-.settings-panel[open] .button-row {
+.settings-panel[open] .settings-card {
   display: grid;
 }
 
 .tool-panel .upload-stack,
-.settings-panel .menu-grid,
-.settings-panel .button-row {
+.settings-panel .settings-card {
   display: none;
 }
 
@@ -295,7 +370,7 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   position: absolute;
   right: 0;
   bottom: 64px;
-  width: min(340px, calc(100vw - 24px));
+  width: min(460px, calc(100vw - 24px));
   padding: 16px;
   gap: 12px;
   border-radius: 20px;
@@ -305,29 +380,24 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 }
 
 .settings-panel[open] .menu-grid {
+  display: grid;
+}
+
+.settings-panel[open] .settings-card {
   position: absolute;
   right: 0;
   bottom: 64px;
   width: min(360px, calc(100vw - 24px));
-  padding: 16px;
-  border-radius: 20px 20px 0 0;
+  padding: 0 16px 16px;
+  gap: 16px;
+  border-radius: 20px;
   background: var(--panel);
   border: 1px solid var(--panel-border);
-  border-bottom: none;
   box-shadow: var(--shadow);
 }
 
 .settings-panel[open] .button-row {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  width: min(360px, calc(100vw - 24px));
-  padding: 0 16px 16px;
-  border-radius: 0 0 20px 20px;
-  background: var(--panel);
-  border: 1px solid var(--panel-border);
-  border-top: none;
-  box-shadow: var(--shadow);
+  display: grid;
   grid-auto-flow: column;
 }
 .toast {
@@ -349,23 +419,44 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   }
 
   .tool-row {
-    width: 100%;
-    justify-content: space-between;
+    justify-content: flex-end;
   }
 }
 
 @media (max-width: 640px) {
+  :root {
+    --dock-edge: 10px;
+    --dock-bottom: 10px;
+  }
+
   .bottom-dock {
     padding: 10px;
   }
 
   .tool-panel[open] .upload-stack,
-  .settings-panel[open] .menu-grid,
-  .settings-panel[open] .button-row {
-    width: min(320px, calc(100vw - 20px));
+  .settings-panel[open] .settings-card {
+    width: min(360px, calc(100vw - 20px));
+  }
+
+  .settings-panel {
+    right: calc(var(--dock-edge) + var(--fab-size) + var(--dock-gap));
+  }
+
+  .settings-panel[open] .settings-card {
+    position: fixed;
+    right: 0;
+    bottom: calc(var(--dock-bottom) + var(--fab-size) + var(--dock-gap));
   }
 
   .settings-panel[open] .button-row {
     grid-auto-flow: row;
+  }
+
+  .clipboard-header {
+    flex-direction: column;
+  }
+
+  .clipboard-actions {
+    justify-content: flex-start;
   }
 }

@@ -48,6 +48,8 @@ pub enum ClientMessage {
     PointerWheel { delta_y: i32 },
     TouchTap,
     Key { key: String, down: bool },
+    Paste,
+    ResetInput,
     Ping { sent_at_ms: u64 },
     ClipboardSet { payload: ClipboardPayload },
     ClipboardGet,
