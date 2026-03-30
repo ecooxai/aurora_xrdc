@@ -7,7 +7,11 @@ if [[ -f "${HOME}/.cargo/env" ]]; then
     . "${HOME}/.cargo/env"
 fi
 
-dbus-launch pulseaudio &
+# Start PulseAudio when available, but avoid noisy DBus-related failures in
+# environments where it is already running or no system bus exists.
+if command -v pulseaudio >/dev/null 2>&1 && ! pulseaudio --check 2>/dev/null; then
+    pulseaudio --start >/dev/null 2>&1 || true
+fi
 
 WATCH_DIRS=(src web Cargo.toml)
 DEBOUNCE_SECONDS=5
