@@ -11,7 +11,6 @@
       <section class="viewport-card">
         <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
         <div id="status" class="status-pill">Connecting...</div>
-        <div id="debug" class="debug-panel hidden"></div>
       </section>
 
       <section class="bottom-dock">
@@ -26,56 +25,92 @@
               <button id="upload-action" type="button">Upload File</button>
               <input id="upload-input" type="file" class="hidden" />
               <div class="clipboard-stack">
-                <button id="local-clipboard-card" class="clipboard-card secondary" type="button">
-                  <span class="clipboard-title">Local Clipboard</span>
-                  <span id="local-clipboard-meta" class="clipboard-meta">Click to push remote</span>
-                  <span id="local-clipboard-text" class="clipboard-text">Empty</span>
-                  <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
-                </button>
-                <button id="remote-clipboard-card" class="clipboard-card secondary" type="button">
-                  <span class="clipboard-title">Remote Clipboard</span>
-                  <span id="remote-clipboard-meta" class="clipboard-meta">Click to copy locally</span>
-                  <span id="remote-clipboard-text" class="clipboard-text">Empty</span>
-                  <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
-                </button>
+                <section id="local-clipboard-card" class="clipboard-card secondary">
+                  <div class="clipboard-header">
+                    <div class="clipboard-heading">
+                      <span class="clipboard-title">Local Clipboard</span>
+                      <span id="local-clipboard-meta" class="clipboard-meta">Ready to push remote</span>
+                    </div>
+                    <div class="clipboard-actions">
+                      <button id="local-clipboard-copy-btn" class="clipboard-action secondary" type="button">Copy Text</button>
+                      <button id="local-clipboard-sync-btn" class="clipboard-action" type="button">Push Remote</button>
+                    </div>
+                  </div>
+                  <div class="clipboard-content">
+                    <div id="local-clipboard-text" class="clipboard-text">Empty</div>
+                    <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
+                  </div>
+                </section>
+                <section id="remote-clipboard-card" class="clipboard-card secondary">
+                  <div class="clipboard-header">
+                    <div class="clipboard-heading">
+                      <span class="clipboard-title">Remote Clipboard</span>
+                      <span id="remote-clipboard-meta" class="clipboard-meta">Ready to copy locally</span>
+                    </div>
+                    <div class="clipboard-actions">
+                      <button id="remote-clipboard-copy-btn" class="clipboard-action secondary" type="button">Copy Text</button>
+                      <button id="remote-clipboard-sync-btn" class="clipboard-action" type="button">Copy Local</button>
+                    </div>
+                  </div>
+                  <div class="clipboard-content">
+                    <div id="remote-clipboard-text" class="clipboard-text">Empty</div>
+                    <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
+                  </div>
+                </section>
               </div>
             </div>
           </details>
-        <details id="settings-panel" class="settings-panel">
-          <summary class="tool-toggle settings-toggle" aria-label="Settings">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h14M22 17h-2" />
-              <circle cx="16" cy="7" r="2" />
-              <circle cx="8" cy="12" r="2" />
-              <circle cx="18" cy="17" r="2" />
-            </svg>
-          </summary>
-          <div class="menu-grid">
-            <label>Codec
-              <select id="codec">
-                <option value="h264" selected>H.264</option>
-                <option value="h265">H.265</option>
-                <option value="vp8">VP8</option>
-              </select>
-            </label>
-            <label>Bitrate
-              <input id="bitrate" type="range" min="1000" max="12000" step="250" value="4000" />
-              <span id="bitrate-value">4000 kbps</span>
-            </label>
-            <label>FPS
-              <input id="fps" type="range" min="8" max="30" step="1" value="16" />
-              <span id="fps-value">16 fps</span>
-            </label>
-            <label>Scroll speed
-              <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
-              <span id="scroll-speed-value">3 / 10</span>
-            </label>
-          </div>
-          <div class="button-row">
-            <button id="connect">Connect</button>
-            <button id="disconnect" class="secondary">Disconnect</button>
-          </div>
-        </details>
+          <details id="settings-panel" class="settings-panel">
+            <summary class="tool-toggle settings-toggle" aria-label="Settings">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h14M22 17h-2" />
+                <circle cx="16" cy="7" r="2" />
+                <circle cx="8" cy="12" r="2" />
+                <circle cx="18" cy="17" r="2" />
+              </svg>
+            </summary>
+            <div class="settings-card">
+              <div class="settings-status">
+                <span class="settings-status-label">Encoder</span>
+                <span id="encoder-status" class="settings-status-value">Not connected</span>
+              </div>
+              <div class="menu-grid">
+                <label>Codec
+                  <select id="codec">
+                    <option value="h264" selected>H.264</option>
+                    <option value="h265">H.265</option>
+                    <option value="vp8">VP8</option>
+                  </select>
+                </label>
+                <label>Bitrate
+                  <input id="bitrate" type="range" min="1000" max="12000" step="250" value="4000" />
+                  <span id="bitrate-value">4000 kbps</span>
+                </label>
+                <label>FPS
+                  <input id="fps" type="range" min="8" max="30" step="1" value="16" />
+                  <span id="fps-value">16 fps</span>
+                </label>
+                <label>Scroll speed
+                  <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
+                  <span id="scroll-speed-value">3 / 10</span>
+                </label>
+                <label>Touch mode
+                  <select id="touch-mode">
+                    <option value="direct_touch">Direct touch</option>
+                    <option value="touchpad">Touchpad</option>
+                  </select>
+                </label>
+                <label id="direct-touch-scroll-label" class="toggle-label">
+                  <span>Direct touch one-finger scroll</span>
+                  <input id="direct-touch-scroll" type="checkbox" />
+                </label>
+              </div>
+              <div class="button-row">
+                <button id="connect">Connect</button>
+                <button id="disconnect" class="secondary">Disconnect</button>
+              </div>
+            </div>
+          </details>
         </div>
       </section>
     </main>

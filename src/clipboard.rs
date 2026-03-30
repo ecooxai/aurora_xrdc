@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt, process::Command};
+use tracing::warn;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClipboardPayload {
@@ -85,13 +86,17 @@ async fn xclip_input_bytes(display: &str, args: &[&str], bytes: &[u8]) -> Result
             .await
             .context("failed to write xclip stdin")?;
     }
-    let output = child
-        .wait_with_output()
-        .await
-        .context("failed to wait for xclip")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("xclip exited with {}: {}", output.status, stderr.trim()));
-    }
+    tokio::spawn(async move {
+        match child.wait_with_output().await {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("xclip exited with {}: {}", output.status, stderr.trim());
+            }
+            Err(err) => {
+                warn!("failed to wait for xclip: {err}");
+            }
+        }
+    });
     Ok(())
 }

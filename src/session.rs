@@ -193,6 +193,7 @@ async fn handle_client(
             _ => {}
         }
     }
+    reset_input_state(&display).await?;
     Ok(())
 }
 
@@ -224,6 +225,13 @@ async fn apply_client_message(
             let action = if down { "keydown" } else { "keyup" };
             run_xdotool(display, [action, &key]).await?;
         }
+        ClientMessage::Paste => {
+            reset_input_state(display).await?;
+            run_xdotool(display, ["key", "ctrl+v"]).await?;
+        }
+        ClientMessage::ResetInput => {
+            reset_input_state(display).await?;
+        }
         ClientMessage::Ping { sent_at_ms } => {
             let now = crate::streamer::start;
             let _ = now;
@@ -232,11 +240,38 @@ async fn apply_client_message(
         }
         ClientMessage::ClipboardSet { payload } => {
             write_remote_clipboard(display, &payload).await?;
-            send_clipboard_update(display, sender).await?;
+            sender
+                .send(Message::Text(
+                    serde_json::to_string(&ServerMessage::Clipboard {
+                        side: "remote",
+                        payload,
+                    })?
+                    .into(),
+                ))
+                .await?;
         }
         ClientMessage::ClipboardGet => {
             send_clipboard_update(display, sender).await?;
         }
+    }
+    Ok(())
+}
+
+async fn reset_input_state(display: &str) -> Result<()> {
+    for button in ["1", "2", "3", "4", "5"] {
+        run_xdotool(display, ["mouseup", button]).await?;
+    }
+    for key in [
+        "Shift_L",
+        "Shift_R",
+        "Control_L",
+        "Control_R",
+        "Alt_L",
+        "Alt_R",
+        "Super_L",
+        "Super_R",
+    ] {
+        run_xdotool(display, ["keyup", key]).await?;
     }
     Ok(())
 }
