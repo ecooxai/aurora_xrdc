@@ -12,7 +12,6 @@ install_apt() {
     ca-certificates \
     dbus-x11 \
     xauth \
-    dbus-launch \
     pulseaudio \
     wireplumber \
     pulseaudio-utils
