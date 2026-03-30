@@ -43,10 +43,19 @@ DISPLAY=:11 XAUTHORITY="$HOME/.Xauthority" \
   ffmpeg -y -loglevel error -f x11grab -video_size 1280x720 -i :11 -frames:v 1 /tmp/screen11_live.png
 DISPLAY=:11 XAUTHORITY="$HOME/.Xauthority" \
   ffmpeg -y -loglevel error -f x11grab -video_size 1280x720 -i :11 -frames:v 1 /tmp/screen11_live.jpg
+DISPLAY=:11 XAUTHORITY="$HOME/.Xauthority" \
+  xwd -root -silent -out /tmp/screen11_live.xwd
+convert /tmp/screen11_live.xwd /tmp/screen11_live_xwd.png
+convert /tmp/screen11_live.xwd /tmp/screen11_live_xwd.jpg
 
 python3 - <<'PY'
 from PIL import Image
-for path in ['/tmp/screen11_live.png', '/tmp/screen11_live.jpg']:
+for path in [
+    '/tmp/screen11_live.png',
+    '/tmp/screen11_live.jpg',
+    '/tmp/screen11_live_xwd.png',
+    '/tmp/screen11_live_xwd.jpg',
+]:
     img = Image.open(path).convert('RGB')
     colors = sorted(img.getcolors(maxcolors=10_000_000), reverse=True)[:10]
     print(path, img.size, colors[:10])
