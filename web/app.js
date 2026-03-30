@@ -337,15 +337,30 @@ function disconnect() {
   closeConnection({ manual: true });
 }
 
+async function requestKeyboardLock() {
+  if (!navigator.keyboard?.lock) return;
+  try {
+    await navigator.keyboard.lock();
+  } catch {
+    // Some browsers or contexts reject keyboard lock; key handling still works without it.
+  }
+}
+
+function releaseKeyboardLock() {
+  navigator.keyboard?.unlock?.();
+}
+
 function captureInput() {
   state.inputCaptured = true;
   canvas.focus({ preventScroll: true });
+  void requestKeyboardLock();
   void primeAudioPlayback();
 }
 
 function releaseInput() {
   resetTouchInteraction();
   state.inputCaptured = false;
+  releaseKeyboardLock();
   resetKeys();
   send({ type: "reset_input" });
 }
@@ -737,6 +752,16 @@ function normalizeKey(event) {
   if (event.code === "NumpadEnter") return "KP_Enter";
   if (/^F([1-9]|1[0-2])$/.test(event.key)) return event.key;
   return event.key?.length === 1 ? event.key : null;
+}
+
+function isReleaseInputChord(event) {
+  return (
+    state.inputCaptured
+    && event.ctrlKey
+    && event.altKey
+    && event.shiftKey
+    && event.key === "Escape"
+  );
 }
 
 function shouldHandleKeyboard(event) {
@@ -1415,7 +1440,8 @@ function initControls() {
     queueWheel(event.deltaY);
   }, { passive: false });
   window.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
+    if (isReleaseInputChord(event)) {
+      event.preventDefault();
       releaseInput();
       return;
     }
