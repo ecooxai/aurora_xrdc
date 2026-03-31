@@ -17,12 +17,80 @@ WATCH_DIRS=(src web Cargo.toml)
 DEBOUNCE_SECONDS=5
 REBUILD_RETRY_SECONDS=10
 APP_PID=""
+XVFB_PID=""
+XTERM_PID=""
+FALLBACK_DISPLAY=":11"
 
 cleanup() {
     if [[ -n "${APP_PID}" ]] && kill -0 "${APP_PID}" 2>/dev/null; then
         kill "${APP_PID}" 2>/dev/null || true
         wait "${APP_PID}" 2>/dev/null || true
     fi
+    if [[ -n "${XTERM_PID}" ]] && kill -0 "${XTERM_PID}" 2>/dev/null; then
+        kill "${XTERM_PID}" 2>/dev/null || true
+        wait "${XTERM_PID}" 2>/dev/null || true
+    fi
+    if [[ -n "${XVFB_PID}" ]] && kill -0 "${XVFB_PID}" 2>/dev/null; then
+        kill "${XVFB_PID}" 2>/dev/null || true
+        wait "${XVFB_PID}" 2>/dev/null || true
+    fi
+}
+
+display_ready() {
+    local display="${1:-}"
+    [[ -n "${display}" ]] || return 1
+    command -v xdpyinfo >/dev/null 2>&1 || return 1
+    DISPLAY="${display}" xdpyinfo >/dev/null 2>&1
+}
+
+start_fallback_xserver() {
+    if ! command -v Xvfb >/dev/null 2>&1; then
+        echo "[dev] DISPLAY is unavailable and Xvfb is not installed." >&2
+        return 1
+    fi
+    if ! command -v xterm >/dev/null 2>&1; then
+        echo "[dev] DISPLAY is unavailable and xterm is not installed." >&2
+        return 1
+    fi
+
+    export DISPLAY="${FALLBACK_DISPLAY}"
+
+    if display_ready "${DISPLAY}"; then
+        echo "[dev] reusing existing X server on ${DISPLAY}"
+    else
+        echo "[dev] DISPLAY is unavailable, starting Xvfb on ${DISPLAY}"
+        rm -f "/tmp/.X11-unix/X${DISPLAY#:}" "/tmp/.X${DISPLAY#*:}-lock"
+        Xvfb "${DISPLAY}" -screen 0 1280x720x24 >/tmp/xvfb11.log 2>&1 &
+        XVFB_PID=$!
+
+        for _ in $(seq 1 20); do
+            if display_ready "${DISPLAY}"; then
+                break
+            fi
+            sleep 0.5
+        done
+
+        if ! display_ready "${DISPLAY}"; then
+            echo "[dev] failed to start Xvfb on ${DISPLAY}" >&2
+            return 1
+        fi
+    fi
+
+    if ! pgrep -f "xterm -geometry 100x30+80+60 -title vibe_rdesk-dev-xterm" >/dev/null 2>&1; then
+        DISPLAY="${DISPLAY}" xterm -geometry 100x30+80+60 -title vibe_rdesk-dev-xterm >/tmp/xterm11.log 2>&1 &
+        XTERM_PID=$!
+    fi
+
+    echo "[dev] using DISPLAY=${DISPLAY}"
+}
+
+ensure_display() {
+    if display_ready "${DISPLAY:-}"; then
+        echo "[dev] using existing DISPLAY=${DISPLAY}"
+        return 0
+    fi
+
+    start_fallback_xserver
 }
 
 build_and_run() {
@@ -64,6 +132,7 @@ wait_for_change_polling() {
 
 trap cleanup EXIT INT TERM
 
+ensure_display
 build_and_run "$@"
 
 while true; do
