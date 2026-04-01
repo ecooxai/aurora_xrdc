@@ -8,6 +8,7 @@ const CLIPBOARD_HISTORY_LIMIT = 100;
 const VIEW_ZOOM_STEP_PERCENT = 10;
 const VIEW_ZOOM_MIN_PERCENT = 10;
 const VIEW_ZOOM_MAX_PERCENT = 300;
+const LATENCY_PROBE_INTERVAL_MS = 3000;
 const state = {
   socket: null,
   decoder: null,
@@ -54,6 +55,9 @@ const state = {
   remoteScreenWidth: null,
   remoteScreenHeight: null,
   viewZoomPercent: 100,
+  wsLatencyMs: null,
+  latencyProbeSeq: 0,
+  latencyProbeSentAt: new Map(),
 };
 
 const status = $("status");
@@ -159,20 +163,27 @@ function renderStatusMetrics({
   memory_total_mb,
   swap_used_mb,
   swap_total_mb,
-  latency_ms,
   net_tx_kbps,
 } = {}) {
   statusCpu.textContent = formatPercent(cpu_usage);
   statusRam.textContent = formatMemoryUsage(memory_used_mb, memory_total_mb);
   statusSwap.textContent = formatMemoryUsage(swap_used_mb, swap_total_mb);
-  statusLatency.textContent = Number.isFinite(latency_ms) ? `${latency_ms} ms` : "--";
+  renderLatencyMetric();
   statusSpeed.textContent = formatMbPerSecond(net_tx_kbps);
   statusUpdatedAt.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
 }
 
+function renderLatencyMetric() {
+  statusLatency.textContent = Number.isFinite(state.wsLatencyMs)
+    ? `${Math.round(state.wsLatencyMs)} ms`
+    : "--";
+}
+
 function resetStatusMetrics() {
+  state.wsLatencyMs = null;
+  state.latencyProbeSentAt.clear();
   renderStatusMetrics({});
-  statusUpdatedAt.textContent = "Updates every 3s";
+  statusUpdatedAt.textContent = "Stats and latency every 3s";
 }
 
 function formatDimensions(width, height) {
@@ -498,6 +509,11 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.manualDisconnect = manual;
   clearTimeout(state.reconnectTimer);
   clearInterval(startPing.timer);
+  state.latencyProbeSentAt.clear();
+  if (!preserveStatus) {
+    state.wsLatencyMs = null;
+    renderLatencyMetric();
+  }
   stopRemoteClipboardPolling();
   state.decoder?.close();
   state.decoder = null;
@@ -595,6 +611,13 @@ function handleServerMessage(message) {
   } else if (message.type === "stats") {
     setEncoderStatus(`${message.active_encoder || "ready"} ${message.encoder_mode || ""}`.trim());
     renderStatusMetrics(message);
+  } else if (message.type === "pong") {
+    const sentAt = state.latencyProbeSentAt.get(message.seq);
+    if (sentAt !== undefined) {
+      state.latencyProbeSentAt.delete(message.seq);
+      state.wsLatencyMs = performance.now() - sentAt;
+      renderLatencyMetric();
+    }
   } else if (message.type === "error") {
     showToast(message.code, message.message);
   } else if (message.type === "clipboard" && message.side === "remote") {
@@ -860,9 +883,24 @@ function sendPasteClipboard(payload) {
 
 function startPing() {
   clearInterval(startPing.timer);
+  sendLatencyProbe();
   startPing.timer = setInterval(() => {
-    send({ type: "ping", sent_at_ms: Date.now() });
-  }, 1000);
+    sendLatencyProbe();
+  }, LATENCY_PROBE_INTERVAL_MS);
+}
+
+function sendLatencyProbe() {
+  if (state.socket?.readyState !== WebSocket.OPEN) return;
+  state.latencyProbeSeq += 1;
+  const seq = state.latencyProbeSeq;
+  state.latencyProbeSentAt.set(seq, performance.now());
+  if (state.latencyProbeSentAt.size > 4) {
+    const oldestSeq = state.latencyProbeSentAt.keys().next().value;
+    if (oldestSeq !== undefined) {
+      state.latencyProbeSentAt.delete(oldestSeq);
+    }
+  }
+  send({ type: "ping", seq });
 }
 
 function startRemoteClipboardPolling() {

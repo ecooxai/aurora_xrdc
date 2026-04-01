@@ -30,7 +30,9 @@ pub enum ServerMessage {
         swap_used_mb: u64,
         swap_total_mb: u64,
         net_tx_kbps: f32,
-        latency_ms: u64,
+    },
+    Pong {
+        seq: u64,
     },
     Error {
         code: &'static str,
@@ -55,7 +57,7 @@ pub enum ClientMessage {
     Paste,
     PasteClipboard { payload: ClipboardPayload },
     ResetInput,
-    Ping { sent_at_ms: u64 },
+    Ping { seq: u64 },
     ClipboardSet { payload: ClipboardPayload },
     ClipboardGet,
 }

@@ -10,9 +10,11 @@
   --danger: #ff6f6f;
   --shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
   --dock-edge: 10vw;
-  --dock-bottom: 12px;
+  --dock-bottom: 6px;
   --fab-size: 56px;
-  --dock-gap: 12px;
+  --dock-gap: 8px;
+  --control-card-offset-x: 18px;
+  --control-card-offset-y: -6px;
 }
 
 * { box-sizing: border-box; }
@@ -138,7 +140,7 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   justify-content: flex-end;
   align-items: flex-end;
   gap: 12px;
-  padding: 12px;
+  padding: 6px 12px;
   background: linear-gradient(180deg, rgba(5, 6, 7, 0), rgba(5, 6, 7, 0.82) 24%, rgba(5, 6, 7, 0.96));
 }
 
@@ -150,7 +152,7 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
 .control-panel {
   position: fixed;
-  right: var(--dock-edge);
+  right: 0;
   bottom: var(--dock-bottom);
   z-index: 20;
   border-radius: 24px;
@@ -162,15 +164,16 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 }
 
 .control-panel[open] .control-card {
-  position: absolute;
-  right: 0;
-  bottom: calc(var(--fab-size) + var(--dock-gap));
+  position: fixed;
+  right: 50px;
+  bottom: 0;
   width: min(420px, calc(100vw - 24px));
   height: 300px;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
   gap: 10px;
-  padding: 12px;
+  padding: 12px 12px 0;
   border-radius: 24px;
   background:
     linear-gradient(180deg, rgba(18, 29, 34, 0.98), rgba(9, 14, 17, 0.98)),
@@ -181,10 +184,12 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 }
 
 .tab-row {
+  grid-row: 2;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
+  margin: 0 -1px -1px;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.06);
@@ -207,6 +212,8 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 }
 
 .tab-panel {
+  grid-row: 1;
+  grid-column: 1;
   display: none;
   min-height: 0;
   gap: 10px;
@@ -613,25 +620,26 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   }
 
   .control-panel {
-    right: calc(var(--dock-edge) + var(--fab-size) + var(--dock-gap));
+    right: calc(var(--fab-size) + var(--dock-gap));
   }
 }
 
 @media (max-width: 640px) {
   :root {
     --dock-edge: 10px;
-    --dock-bottom: 10px;
+    --dock-bottom: 4px;
+    --control-card-offset-x: 12px;
+    --control-card-offset-y: -6px;
   }
 
   .bottom-dock {
-    padding: 10px;
+    padding: 6px 10px;
   }
 
   .control-panel[open] .control-card {
     width: min(380px, calc(100vw - 20px));
-    position: fixed;
-    right: var(--dock-edge);
-    bottom: calc(var(--dock-bottom) + var(--fab-size) + var(--dock-gap));
+    right: 50px;
+    bottom: 0;
   }
 
   .button-row {

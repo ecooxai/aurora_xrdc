@@ -1,9 +1,6 @@
 use std::{
     collections::HashSet,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -38,7 +35,6 @@ pub async fn handle_socket(
         Ok((stream, child)) => (Some(stream), Some(Arc::new(Mutex::new(child)))),
         Err(_) => (None, None),
     };
-    let last_latency = Arc::new(AtomicU64::new(0));
     let (mut ws_sender, receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
     let audio_enabled = audio_stream.is_some();
@@ -71,15 +67,35 @@ pub async fn handle_socket(
     }
     let writer_task = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
-            if futures_util::SinkExt::send(&mut ws_sender, message).await.is_err() {
+            if futures_util::SinkExt::send(&mut ws_sender, message)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     });
-    let stats_task = spawn_stats(out_tx.clone(), config.clone(), stream.encoder.ffmpeg_encoder.clone(), stream.encoder.mode, last_latency.clone());
-    let send_task = tokio::spawn(forward_frames(out_tx.clone(), stream.rx, config.clone(), stream.encoder.ffmpeg_encoder.clone(), stream.encoder.mode, audio_enabled));
-    let audio_task = audio_stream.map(|stream| tokio::spawn(forward_audio(out_tx.clone(), stream.rx)));
-    let recv_task = tokio::spawn(handle_client(receiver, out_tx.clone(), server.display.clone(), last_latency));
+    let stats_task = spawn_stats(
+        out_tx.clone(),
+        config.clone(),
+        stream.encoder.ffmpeg_encoder.clone(),
+        stream.encoder.mode,
+    );
+    let send_task = tokio::spawn(forward_frames(
+        out_tx.clone(),
+        stream.rx,
+        config.clone(),
+        stream.encoder.ffmpeg_encoder.clone(),
+        stream.encoder.mode,
+        audio_enabled,
+    ));
+    let audio_task =
+        audio_stream.map(|stream| tokio::spawn(forward_audio(out_tx.clone(), stream.rx)));
+    let recv_task = tokio::spawn(handle_client(
+        receiver,
+        out_tx.clone(),
+        server.display.clone(),
+    ));
     let _ = tokio::try_join!(send_task, recv_task);
     stats_task.abort();
     if let Some(task) = audio_task {
@@ -143,7 +159,6 @@ fn spawn_stats(
     config: StreamConfig,
     encoder: String,
     mode: &'static str,
-    latency: Arc<AtomicU64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sampler = StatsSampler::new();
@@ -164,7 +179,6 @@ fn spawn_stats(
                 swap_used_mb: sample.swap_used_mb,
                 swap_total_mb: sample.swap_total_mb,
                 net_tx_kbps: sample.net_tx_kbps,
-                latency_ms: latency.load(Ordering::Relaxed),
             };
             match serde_json::to_string(&msg) {
                 Ok(text) => {
@@ -185,13 +199,14 @@ async fn handle_client(
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
     sender: mpsc::Sender<Message>,
     display: String,
-    last_latency: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut pressed_keys = HashSet::new();
     while let Some(message) = receiver.next().await {
         match message? {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(client) => apply_client_message(&display, &sender, client, &last_latency, &mut pressed_keys).await?,
+                Ok(client) => {
+                    apply_client_message(&display, &sender, client, &mut pressed_keys).await?
+                }
                 Err(err) => warn!("invalid client message: {err}"),
             },
             Message::Close(_) => break,
@@ -206,12 +221,20 @@ async fn apply_client_message(
     display: &str,
     sender: &mpsc::Sender<Message>,
     message: ClientMessage,
-    last_latency: &AtomicU64,
     pressed_keys: &mut HashSet<String>,
 ) -> Result<()> {
     match message {
         ClientMessage::PointerMove { dx, dy } => {
-            run_xdotool(display, ["mousemove_relative", "--", &dx.round().to_string(), &dy.round().to_string()]).await?;
+            run_xdotool(
+                display,
+                [
+                    "mousemove_relative",
+                    "--",
+                    &dx.round().to_string(),
+                    &dy.round().to_string(),
+                ],
+            )
+            .await?;
         }
         ClientMessage::PointerAbsolute { x, y } => {
             run_xdotool(display, ["mousemove", &x.to_string(), &y.to_string()]).await?;
@@ -261,11 +284,12 @@ async fn apply_client_message(
         ClientMessage::ResetInput => {
             reset_input_state(display, pressed_keys).await?;
         }
-        ClientMessage::Ping { sent_at_ms } => {
-            let now = crate::streamer::start;
-            let _ = now;
-            let current = current_ms().saturating_sub(sent_at_ms);
-            last_latency.store(current, Ordering::Relaxed);
+        ClientMessage::Ping { seq } => {
+            sender
+                .send(Message::Text(
+                    serde_json::to_string(&ServerMessage::Pong { seq })?.into(),
+                ))
+                .await?;
         }
         ClientMessage::ClipboardSet { payload } => {
             write_remote_clipboard(display, &payload).await?;
@@ -318,14 +342,7 @@ async fn type_remote_text(display: &str, text: &str) -> Result<()> {
         if !segment.is_empty() {
             run_xdotool(
                 display,
-                [
-                    "type",
-                    "--delay",
-                    "0",
-                    "--clearmodifiers",
-                    "--",
-                    *segment,
-                ],
+                ["type", "--delay", "0", "--clearmodifiers", "--", *segment],
             )
             .await?;
         }
