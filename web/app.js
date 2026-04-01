@@ -32,8 +32,6 @@ const state = {
   touchScrollLastY: null,
   inputCaptured: false,
   pressedKeys: new Set(),
-  suppressedKeyups: new Set(),
-  activePasteShortcut: false,
   pendingPointer: null,
   pointerRaf: 0,
   pendingRelativePointer: null,
@@ -45,7 +43,6 @@ const state = {
   remoteClipboardSig: "",
   localClipboardUpdatedAt: 0,
   remoteClipboardUpdatedAt: 0,
-  clipboardRefreshTimers: [],
   passwd: "",
   connecting: false,
 };
@@ -311,7 +308,6 @@ async function connect() {
 function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.manualDisconnect = manual;
   clearTimeout(state.reconnectTimer);
-  clearClipboardRefreshTimers();
   clearInterval(startPing.timer);
   state.decoder?.close();
   state.decoder = null;
@@ -654,8 +650,6 @@ function resetKeys() {
     send({ type: "key", key, down: false });
   }
   state.pressedKeys.clear();
-  state.suppressedKeyups.clear();
-  state.activePasteShortcut = false;
 }
 
 function releasePressedKey(key) {
@@ -665,55 +659,81 @@ function releasePressedKey(key) {
   return true;
 }
 
-function releaseClipboardChord(primaryKey) {
-  releasePressedKey(primaryKey);
-  releasePressedKey("Control_L");
-  releasePressedKey("Control_R");
-  releasePressedKey("Super_L");
-  releasePressedKey("Super_R");
+function modifierLogicalState(event, modifier) {
+  if (typeof event.getModifierState === "function") {
+    return event.getModifierState(modifier);
+  }
+  if (modifier === "Control") return !!event.ctrlKey;
+  if (modifier === "Meta") return !!event.metaKey;
+  if (modifier === "Alt") return !!event.altKey;
+  if (modifier === "Shift") return !!event.shiftKey;
+  return false;
 }
 
-function currentClipboardModifiers() {
-  return ["Control_L", "Control_R", "Super_L", "Super_R"].filter((key) => state.pressedKeys.has(key));
-}
-
-function markSuppressedKeyups(keys) {
+function releaseModifierKeys(keys) {
   for (const key of keys) {
-    state.suppressedKeyups.add(key);
+    releasePressedKey(key);
   }
 }
 
-function dropPressedKey(key) {
-  state.pressedKeys.delete(key);
-}
-
-function reconcileModifierState(event) {
-  if (!event.ctrlKey) {
-    releasePressedKey("Control_L");
-    releasePressedKey("Control_R");
-  }
-  if (!event.metaKey) {
-    releasePressedKey("Super_L");
-    releasePressedKey("Super_R");
-  }
-  if (!event.altKey) {
-    releasePressedKey("Alt_L");
-    releasePressedKey("Alt_R");
-  }
-  if (!event.shiftKey) {
-    releasePressedKey("Shift_L");
-    releasePressedKey("Shift_R");
+function synchronizeModifierState(event, { pressMissing = false } = {}) {
+  const modifiers = [
+    {
+      logical: "Control",
+      keys: ["Control_L", "Control_R"],
+      fallback: "Control_L",
+    },
+    {
+      logical: "Meta",
+      keys: ["Super_L", "Super_R"],
+      fallback: "Super_L",
+    },
+    {
+      logical: "Alt",
+      keys: ["Alt_L", "Alt_R"],
+      fallback: "Alt_L",
+    },
+    {
+      logical: "Shift",
+      keys: ["Shift_L", "Shift_R"],
+      fallback: "Shift_L",
+    },
+  ];
+  for (const modifier of modifiers) {
+    if (!modifierLogicalState(event, modifier.logical)) {
+      releaseModifierKeys(modifier.keys);
+      continue;
+    }
+    if (!pressMissing) continue;
+    if (modifier.keys.some((key) => state.pressedKeys.has(key))) continue;
+    state.pressedKeys.add(modifier.fallback);
+    send({ type: "key", key: modifier.fallback, down: true });
   }
 }
 
 function normalizeKey(event) {
-  const modifierMap = {
+  const modifierCodeMap = {
+    ShiftLeft: "Shift_L",
+    ShiftRight: "Shift_R",
+    ControlLeft: "Control_L",
+    ControlRight: "Control_R",
+    AltLeft: "Alt_L",
+    AltRight: "Alt_R",
+    MetaLeft: "Super_L",
+    MetaRight: "Super_R",
+  };
+  if (modifierCodeMap[event.code]) return modifierCodeMap[event.code];
+
+  const modifierKeyMap = {
     Shift: event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT ? "Shift_R" : "Shift_L",
     Control: event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT ? "Control_R" : "Control_L",
+    Ctrl: event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT ? "Control_R" : "Control_L",
     Alt: event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT ? "Alt_R" : "Alt_L",
+    AltGraph: event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT ? "Alt_R" : "Alt_L",
     Meta: event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT ? "Super_R" : "Super_L",
+    OS: event.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT ? "Super_R" : "Super_L",
   };
-  if (modifierMap[event.key]) return modifierMap[event.key];
+  if (modifierKeyMap[event.key]) return modifierKeyMap[event.key];
 
   const codeMap = {
     Backquote: "grave",
@@ -1225,74 +1245,6 @@ async function copyClipboardText(side) {
   }
 }
 
-function clearClipboardRefreshTimers() {
-  for (const timer of state.clipboardRefreshTimers) {
-    clearTimeout(timer);
-  }
-  state.clipboardRefreshTimers = [];
-}
-
-function scheduleRemoteClipboardRefresh(delaysMs = [250]) {
-  clearClipboardRefreshTimers();
-  state.clipboardRefreshTimers = delaysMs.map((delayMs) => setTimeout(() => {
-    requestRemoteClipboard();
-  }, delayMs));
-}
-
-async function maybeSyncClipboardShortcut({ ctrlKey, metaKey, altKey, key }) {
-  const modifier = ctrlKey || metaKey;
-  if (!modifier || altKey) return;
-  if (key === "c" || key === "x") {
-    scheduleRemoteClipboardRefresh([180, 500, 1000, 1800]);
-  }
-}
-
-async function syncLocalClipboardForPaste() {
-  try {
-    const payload = await refreshLocalClipboard();
-    if (!payload.text && !payload.image_png_b64) {
-      return;
-    }
-    if (
-      state.remoteClipboardUpdatedAt > state.localClipboardUpdatedAt
-      && state.remoteClipboardSig
-      && state.remoteClipboardSig !== state.localClipboardSig
-    ) {
-      requestRemoteClipboard();
-      showToast("remote_clipboard_kept", clipboardPreview(state.remoteClipboard));
-      return;
-    }
-    sendRemoteClipboard(payload);
-  } catch (error) {
-    showToast("remote_clipboard_push_failed", error.message || String(error));
-  }
-}
-
-async function triggerRemotePasteShortcut() {
-  if (state.activePasteShortcut) return;
-  state.activePasteShortcut = true;
-  const modifierKeys = currentClipboardModifiers();
-  markSuppressedKeyups([...modifierKeys, "v"]);
-  try {
-    for (const key of modifierKeys) {
-      dropPressedKey(key);
-    }
-    send({ type: "reset_input" });
-    await syncLocalClipboardForPaste();
-    send({ type: "paste" });
-  } finally {
-    state.activePasteShortcut = false;
-  }
-}
-
-function handleClipboardShortcut(primaryKey, action) {
-  if (!state.inputCaptured) return;
-  setTimeout(() => {
-    releaseClipboardChord(primaryKey);
-  }, 0);
-  void action();
-}
-
 async function uploadSelectedFile() {
   const file = uploadInput.files?.[0];
   if (!file) return;
@@ -1396,7 +1348,7 @@ function initControls() {
     const point = pointerToCanvas(event);
     if (!point) return;
     captureInput();
-    reconcileModifierState(event);
+    synchronizeModifierState(event);
     logInputState("pointerdown", event, {
       button: event.button,
       pointerType: event.pointerType,
@@ -1414,11 +1366,11 @@ function initControls() {
     }
     const point = pointerToCanvas(event);
     if (!point) return;
-    reconcileModifierState(event);
+    synchronizeModifierState(event);
     queuePointerMove(point.x, point.y);
   });
   canvas.addEventListener("pointerup", (event) => {
-    reconcileModifierState(event);
+    synchronizeModifierState(event);
     if (isTouchPointer(event)) {
       handleTouchPointerEnd(event);
       return;
@@ -1436,7 +1388,7 @@ function initControls() {
   canvas.addEventListener("contextmenu", (event) => event.preventDefault());
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
-    reconcileModifierState(event);
+    synchronizeModifierState(event);
     queueWheel(event.deltaY);
   }, { passive: false });
   window.addEventListener("keydown", (event) => {
@@ -1446,49 +1398,24 @@ function initControls() {
       return;
     }
     if (!shouldHandleKeyboard(event)) return;
-    reconcileModifierState(event);
+    synchronizeModifierState(event, { pressMissing: true });
     const key = normalizeKey(event);
     if (!key) return;
-    if ((event.ctrlKey || event.metaKey) && !event.altKey && key === "v") {
-      event.preventDefault();
-      if (!event.repeat) {
-        void triggerRemotePasteShortcut();
-      }
-      return;
-    }
     if (!event.repeat && state.pressedKeys.has(key)) {
       logInputState("keydown-duplicate", event, { normalizedKey: key });
+      event.preventDefault();
       return;
     }
     if (!event.repeat) state.pressedKeys.add(key);
     logInputState("keydown", event, { normalizedKey: key });
     send({ type: "key", key, down: true });
     event.preventDefault();
-    void maybeSyncClipboardShortcut({
-      ctrlKey: event.ctrlKey,
-      metaKey: event.metaKey,
-      altKey: event.altKey,
-      key: event.key.toLowerCase(),
-    });
-  });
-  window.addEventListener("paste", () => {
-    if (!state.inputCaptured || state.activePasteShortcut) return;
-    void triggerRemotePasteShortcut();
-  });
-  window.addEventListener("copy", () => {
-    handleClipboardShortcut("c", async () => scheduleRemoteClipboardRefresh([180, 500, 1000, 1800]));
-  });
-  window.addEventListener("cut", () => {
-    handleClipboardShortcut("x", async () => scheduleRemoteClipboardRefresh([180, 500, 1000, 1800]));
   });
   window.addEventListener("keyup", (event) => {
     const key = normalizeKey(event);
     if (!key) return;
-    if (state.suppressedKeyups.delete(key)) {
-      event.preventDefault();
-      return;
-    }
     const released = releasePressedKey(key);
+    synchronizeModifierState(event);
     if (released) {
       event.preventDefault();
       return;
@@ -1512,13 +1439,21 @@ function initControls() {
   });
 }
 
-async function registerServiceWorker() {
+async function removeServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
   try {
-    const reg = await navigator.serviceWorker.register("/sw.js");
-    setTimeout(() => reg.update(), 10000);
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(registrations.map((registration) => registration.unregister()));
+    if ("caches" in window) {
+      const cacheNames = await caches.keys();
+      await Promise.all(
+        cacheNames
+          .filter((cacheName) => cacheName.startsWith("vibe-rdesk-"))
+          .map((cacheName) => caches.delete(cacheName)),
+      );
+    }
   } catch (error) {
-    showToast("sw_register_failed", error.message || String(error));
+    showToast("sw_remove_failed", error.message || String(error));
   }
 }
 
@@ -1526,7 +1461,7 @@ updateClipboardState("local", state.localClipboard);
 updateClipboardState("remote", state.remoteClipboard);
 applySettings(loadStoredSettings());
 initControls();
-registerServiceWorker();
+void removeServiceWorker();
 state.passwd = loadStoredPassword();
 authInput.value = state.passwd;
 if (state.passwd) {

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -183,17 +184,18 @@ async fn handle_client(
     display: String,
     last_latency: Arc<AtomicU64>,
 ) -> Result<()> {
+    let mut pressed_keys = HashSet::new();
     while let Some(message) = receiver.next().await {
         match message? {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(client) => apply_client_message(&display, &sender, client, &last_latency).await?,
+                Ok(client) => apply_client_message(&display, &sender, client, &last_latency, &mut pressed_keys).await?,
                 Err(err) => warn!("invalid client message: {err}"),
             },
             Message::Close(_) => break,
             _ => {}
         }
     }
-    reset_input_state(&display).await?;
+    reset_input_state(&display, &mut pressed_keys).await?;
     Ok(())
 }
 
@@ -202,6 +204,7 @@ async fn apply_client_message(
     sender: &mpsc::Sender<Message>,
     message: ClientMessage,
     last_latency: &AtomicU64,
+    pressed_keys: &mut HashSet<String>,
 ) -> Result<()> {
     match message {
         ClientMessage::PointerMove { dx, dy } => {
@@ -222,15 +225,20 @@ async fn apply_client_message(
             run_xdotool(display, ["click", "1"]).await?;
         }
         ClientMessage::Key { key, down } => {
+            if down {
+                pressed_keys.insert(key.clone());
+            } else {
+                pressed_keys.remove(&key);
+            }
             let action = if down { "keydown" } else { "keyup" };
             run_xdotool(display, [action, &key]).await?;
         }
         ClientMessage::Paste => {
-            reset_input_state(display).await?;
+            reset_input_state(display, pressed_keys).await?;
             run_xdotool(display, ["key", "ctrl+v"]).await?;
         }
         ClientMessage::ResetInput => {
-            reset_input_state(display).await?;
+            reset_input_state(display, pressed_keys).await?;
         }
         ClientMessage::Ping { sent_at_ms } => {
             let now = crate::streamer::start;
@@ -257,9 +265,12 @@ async fn apply_client_message(
     Ok(())
 }
 
-async fn reset_input_state(display: &str) -> Result<()> {
+async fn reset_input_state(display: &str, pressed_keys: &mut HashSet<String>) -> Result<()> {
     for button in ["1", "2", "3", "4", "5"] {
         run_xdotool(display, ["mouseup", button]).await?;
+    }
+    for key in pressed_keys.drain() {
+        run_xdotool(display, ["keyup", &key]).await?;
     }
     for key in [
         "Shift_L",

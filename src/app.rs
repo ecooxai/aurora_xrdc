@@ -29,7 +29,6 @@ use crate::{
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
-const SW_JS: &str = include_str!("../web/sw.js");
 
 #[derive(Clone)]
 struct AppState {
@@ -140,7 +139,6 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/", get(index))
         .route("/app.js", get(js))
         .route("/app.css", get(css))
-        .route("/sw.js", get(sw))
         .route("/healthz", get(healthz))
         .route("/api/auth", get(auth))
         .route("/ws", get(ws))
@@ -166,10 +164,6 @@ async fn js() -> Response {
 
 async fn css() -> Response {
     asset("text/css; charset=utf-8", APP_CSS)
-}
-
-async fn sw() -> Response {
-    asset("application/javascript; charset=utf-8", SW_JS)
 }
 
 async fn healthz() -> impl IntoResponse {
