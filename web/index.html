@@ -15,100 +15,127 @@
 
       <section class="bottom-dock">
         <div class="tool-row">
-          <details id="upload-panel" class="tool-panel upload-panel">
-            <summary id="upload-trigger" class="tool-toggle" aria-label="Uploads and Clipboard">
+          <details id="control-panel" class="control-panel">
+            <summary id="control-trigger" class="tool-toggle control-toggle" aria-label="Controls">
               <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 16V4M7.5 8.5 12 4l4.5 4.5M5 19h14" />
+                <path d="M4 7h16M4 12h16M4 17h16" />
+                <circle cx="9" cy="7" r="1.8" />
+                <circle cx="15" cy="12" r="1.8" />
+                <circle cx="11" cy="17" r="1.8" />
               </svg>
             </summary>
-            <div class="upload-stack">
-              <button id="upload-action" type="button">Upload File</button>
-              <input id="upload-input" type="file" class="hidden" />
-              <div class="clipboard-stack">
-                <section id="local-clipboard-card" class="clipboard-card secondary">
-                  <div class="clipboard-header">
-                    <div class="clipboard-heading">
-                      <span class="clipboard-title">Local Clipboard</span>
-                      <span id="local-clipboard-meta" class="clipboard-meta">Ready to push remote</span>
-                    </div>
-                    <div class="clipboard-actions">
-                      <button id="local-clipboard-copy-btn" class="clipboard-action secondary" type="button">Copy Text</button>
-                      <button id="local-clipboard-sync-btn" class="clipboard-action" type="button">Push Remote</button>
-                    </div>
-                  </div>
-                  <div class="clipboard-content">
-                    <div id="local-clipboard-text" class="clipboard-text">Empty</div>
-                    <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
-                  </div>
-                </section>
-                <section id="remote-clipboard-card" class="clipboard-card secondary">
-                  <div class="clipboard-header">
-                    <div class="clipboard-heading">
-                      <span class="clipboard-title">Remote Clipboard</span>
-                      <span id="remote-clipboard-meta" class="clipboard-meta">Ready to copy locally</span>
-                    </div>
-                    <div class="clipboard-actions">
-                      <button id="remote-clipboard-copy-btn" class="clipboard-action secondary" type="button">Copy Text</button>
-                      <button id="remote-clipboard-sync-btn" class="clipboard-action" type="button">Copy Local</button>
-                    </div>
-                  </div>
-                  <div class="clipboard-content">
-                    <div id="remote-clipboard-text" class="clipboard-text">Empty</div>
-                    <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
-                  </div>
-                </section>
+            <div class="control-card">
+              <div class="tab-row" role="tablist" aria-label="Control sections">
+                <button id="tab-button-status" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-status" data-tab-target="status">Status</button>
+                <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Settings</button>
+                <button id="tab-button-transfer" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-transfer" data-tab-target="transfer">Transfer</button>
               </div>
-            </div>
-          </details>
-          <details id="settings-panel" class="settings-panel">
-            <summary class="tool-toggle settings-toggle" aria-label="Settings">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h14M22 17h-2" />
-                <circle cx="16" cy="7" r="2" />
-                <circle cx="8" cy="12" r="2" />
-                <circle cx="18" cy="17" r="2" />
-              </svg>
-            </summary>
-            <div class="settings-card">
-              <div class="settings-status">
-                <span class="settings-status-label">Encoder</span>
-                <span id="encoder-status" class="settings-status-value">Not connected</span>
-              </div>
-              <div class="menu-grid">
-                <label>Codec
-                  <select id="codec">
-                    <option value="h264" selected>H.264</option>
-                    <option value="h265">H.265</option>
-                    <option value="vp8">VP8</option>
-                  </select>
-                </label>
-                <label>Bitrate
-                  <input id="bitrate" type="range" min="1000" max="12000" step="250" value="4000" />
-                  <span id="bitrate-value">4000 kbps</span>
-                </label>
-                <label>FPS
-                  <input id="fps" type="range" min="8" max="30" step="1" value="16" />
-                  <span id="fps-value">16 fps</span>
-                </label>
-                <label>Scroll speed
-                  <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
-                  <span id="scroll-speed-value">3 / 10</span>
-                </label>
-                <label>Touch mode
-                  <select id="touch-mode">
-                    <option value="direct_touch">Direct touch</option>
-                    <option value="touchpad">Touchpad</option>
-                  </select>
-                </label>
-                <label id="direct-touch-scroll-label" class="toggle-label">
-                  <span>Direct touch one-finger scroll</span>
-                  <input id="direct-touch-scroll" type="checkbox" />
-                </label>
-              </div>
-              <div class="button-row">
-                <button id="connect">Connect</button>
-                <button id="disconnect" class="secondary">Disconnect</button>
-              </div>
+              <section id="tab-panel-status" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-button-status">
+                <div class="status-grid">
+                  <article class="metric-card metric-card-wide">
+                    <span class="metric-label">Encoder</span>
+                    <strong id="encoder-status" class="metric-value">Not connected</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">CPU</span>
+                    <strong id="status-cpu" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">RAM</span>
+                    <strong id="status-ram" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Swap</span>
+                    <strong id="status-swap" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Latency</span>
+                    <strong id="status-latency" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card metric-card-wide">
+                    <span class="metric-label">Realtime Speed</span>
+                    <strong id="status-speed" class="metric-value">--</strong>
+                    <span id="status-updated-at" class="metric-meta">Updates every 3s</span>
+                  </article>
+                </div>
+              </section>
+              <section id="tab-panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-settings" hidden>
+                <div class="menu-grid">
+                  <label>Codec
+                    <select id="codec">
+                      <option value="h264" selected>H.264</option>
+                      <option value="h265">H.265</option>
+                      <option value="vp8">VP8</option>
+                    </select>
+                  </label>
+                  <label>Bitrate
+                    <input id="bitrate" type="range" min="1000" max="12000" step="250" value="4000" />
+                    <span id="bitrate-value">4000 kbps</span>
+                  </label>
+                  <label>FPS
+                    <input id="fps" type="range" min="8" max="30" step="1" value="16" />
+                    <span id="fps-value">16 fps</span>
+                  </label>
+                  <label>Scroll speed
+                    <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
+                    <span id="scroll-speed-value">3 / 10</span>
+                  </label>
+                  <label>Touch mode
+                    <select id="touch-mode">
+                      <option value="direct_touch">Direct touch</option>
+                      <option value="touchpad">Touchpad</option>
+                    </select>
+                  </label>
+                  <label id="direct-touch-scroll-label" class="toggle-label">
+                    <span>Direct touch one-finger scroll</span>
+                    <input id="direct-touch-scroll" type="checkbox" />
+                  </label>
+                </div>
+                <div class="button-row">
+                  <button id="connect">Connect</button>
+                  <button id="disconnect" class="secondary">Disconnect</button>
+                </div>
+              </section>
+              <section id="tab-panel-transfer" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-transfer" hidden>
+                <div class="upload-stack">
+                  <button id="upload-action" type="button">Upload File</button>
+                  <input id="upload-input" type="file" class="hidden" />
+                </div>
+                <div class="clipboard-stack">
+                  <section id="local-clipboard-card" class="clipboard-card secondary">
+                    <div class="clipboard-header">
+                      <div class="clipboard-heading">
+                        <span class="clipboard-title">Local Clipboard</span>
+                        <span id="local-clipboard-meta" class="clipboard-meta">Ready to push remote</span>
+                      </div>
+                      <div class="clipboard-actions">
+                        <button id="local-clipboard-copy-btn" class="clipboard-action secondary" type="button">Copy Text</button>
+                        <button id="local-clipboard-sync-btn" class="clipboard-action" type="button">Push Remote</button>
+                      </div>
+                    </div>
+                    <div class="clipboard-content">
+                      <div id="local-clipboard-text" class="clipboard-text">Empty</div>
+                      <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
+                    </div>
+                  </section>
+                  <section id="remote-clipboard-card" class="clipboard-card secondary">
+                    <div class="clipboard-header">
+                      <div class="clipboard-heading">
+                        <span class="clipboard-title">Remote Clipboard</span>
+                        <span id="remote-clipboard-meta" class="clipboard-meta">Ready to copy locally</span>
+                      </div>
+                      <div class="clipboard-actions">
+                        <button id="remote-clipboard-copy-btn" class="clipboard-action secondary" type="button">Copy Text</button>
+                        <button id="remote-clipboard-sync-btn" class="clipboard-action" type="button">Copy Local</button>
+                      </div>
+                    </div>
+                    <div class="clipboard-content">
+                      <div id="remote-clipboard-text" class="clipboard-text">Empty</div>
+                      <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
+                    </div>
+                  </section>
+                </div>
+              </section>
             </div>
           </details>
         </div>

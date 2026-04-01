@@ -12,6 +12,9 @@ pub struct StatsSampler {
 pub struct Sample {
     pub cpu_usage: f32,
     pub memory_used_mb: u64,
+    pub memory_total_mb: u64,
+    pub swap_used_mb: u64,
+    pub swap_total_mb: u64,
     pub net_tx_kbps: f32,
 }
 
@@ -47,8 +50,10 @@ impl StatsSampler {
         Sample {
             cpu_usage: self.system.global_cpu_usage(),
             memory_used_mb: self.system.used_memory() / 1024 / 1024,
+            memory_total_mb: self.system.total_memory() / 1024 / 1024,
+            swap_used_mb: self.system.used_swap() / 1024 / 1024,
+            swap_total_mb: self.system.total_swap() / 1024 / 1024,
             net_tx_kbps: (delta as f32 * 8.0) / seconds / 1000.0,
         }
     }
 }
-

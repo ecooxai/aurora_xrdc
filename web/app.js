@@ -20,6 +20,7 @@ const state = {
   waitingForKeyframe: true,
   frameCount: 0,
   bytesReceived: 0,
+  netWindowBytes: 0,
   lastNetAt: performance.now(),
   netKbps: 0,
   manualDisconnect: false,
@@ -55,7 +56,7 @@ const authModal = $("auth-modal");
 const authForm = $("auth-form");
 const authInput = $("auth-passwd");
 const authError = $("auth-error");
-const settingsPanel = $("settings-panel");
+const controlPanel = $("control-panel");
 const encoderStatus = $("encoder-status");
 const codecSelect = $("codec");
 const bitrateInput = $("bitrate");
@@ -67,9 +68,16 @@ const scrollSpeedValue = $("scroll-speed-value");
 const touchModeSelect = $("touch-mode");
 const directTouchScrollInput = $("direct-touch-scroll");
 const directTouchScrollLabel = $("direct-touch-scroll-label");
-const uploadPanel = $("upload-panel");
 const uploadAction = $("upload-action");
 const uploadInput = $("upload-input");
+const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
+const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
+const statusCpu = $("status-cpu");
+const statusRam = $("status-ram");
+const statusSwap = $("status-swap");
+const statusLatency = $("status-latency");
+const statusSpeed = $("status-speed");
+const statusUpdatedAt = $("status-updated-at");
 const localClipboardCopyBtn = $("local-clipboard-copy-btn");
 const localClipboardSyncBtn = $("local-clipboard-sync-btn");
 const remoteClipboardCopyBtn = $("remote-clipboard-copy-btn");
@@ -89,6 +97,62 @@ function setStatus(text) {
 
 function setEncoderStatus(text) {
   encoderStatus.textContent = text;
+}
+
+function formatPercent(value) {
+  if (!Number.isFinite(value)) return "--";
+  return `${value.toFixed(value >= 10 ? 0 : 1)}%`;
+}
+
+function formatMbPerSecond(kbps) {
+  if (!Number.isFinite(kbps) || kbps < 0) return "--";
+  return `${(kbps / 1000).toFixed(kbps >= 1000 ? 2 : 1)} Mb/s`;
+}
+
+function formatMemoryUsage(usedMb, totalMb) {
+  if (!Number.isFinite(usedMb) || usedMb < 0) return "--";
+  if (!Number.isFinite(totalMb) || totalMb <= 0) {
+    return `${usedMb} MB`;
+  }
+  const usedGb = usedMb / 1024;
+  const totalGb = totalMb / 1024;
+  const percent = (usedMb / totalMb) * 100;
+  return `${usedGb.toFixed(1)} / ${totalGb.toFixed(1)} GB (${percent.toFixed(0)}%)`;
+}
+
+function renderStatusMetrics({
+  cpu_usage,
+  memory_used_mb,
+  memory_total_mb,
+  swap_used_mb,
+  swap_total_mb,
+  latency_ms,
+  net_tx_kbps,
+} = {}) {
+  statusCpu.textContent = formatPercent(cpu_usage);
+  statusRam.textContent = formatMemoryUsage(memory_used_mb, memory_total_mb);
+  statusSwap.textContent = formatMemoryUsage(swap_used_mb, swap_total_mb);
+  statusLatency.textContent = Number.isFinite(latency_ms) ? `${latency_ms} ms` : "--";
+  statusSpeed.textContent = formatMbPerSecond(net_tx_kbps);
+  statusUpdatedAt.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+}
+
+function resetStatusMetrics() {
+  renderStatusMetrics({});
+  statusUpdatedAt.textContent = "Updates every 3s";
+}
+
+function setActiveTab(tabName) {
+  for (const button of tabButtons) {
+    const active = button.dataset.tabTarget === tabName;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  for (const panel of tabPanels) {
+    const active = panel.id === `tab-panel-${tabName}`;
+    panel.classList.toggle("is-active", active);
+    panel.hidden = !active;
+  }
 }
 
 function showToast(code, message) {
@@ -265,6 +329,8 @@ async function connect() {
     state.activeCodec = codec;
     state.frameCount = 0;
     state.bytesReceived = 0;
+    state.netWindowBytes = 0;
+    state.netKbps = 0;
     state.lastNetAt = performance.now();
     const url = new URL("/ws", window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -318,6 +384,8 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.audioConfigKey = "";
   state.audioEnabled = false;
   state.waitingForKeyframe = true;
+  state.netWindowBytes = 0;
+  state.netKbps = 0;
   resetKeys();
   if (state.socket) {
     const socket = state.socket;
@@ -327,6 +395,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   }
   if (!preserveStatus) setEncoderStatus("Not connected");
   if (!preserveStatus) setStatus("Disconnected");
+  if (!preserveStatus) resetStatusMetrics();
 }
 
 function disconnect() {
@@ -389,6 +458,9 @@ function handleServerMessage(message) {
       state.audioConfigKey = "";
     }
     setEncoderStatus(`${message.active_encoder || "ready"} ${message.encoder_mode || ""}`.trim());
+  } else if (message.type === "stats") {
+    setEncoderStatus(`${message.active_encoder || "ready"} ${message.encoder_mode || ""}`.trim());
+    renderStatusMetrics(message);
   } else if (message.type === "error") {
     showToast(message.code, message.message);
   } else if (message.type === "clipboard" && message.side === "remote") {
@@ -448,9 +520,14 @@ function handleVideoFrame(buffer, view) {
   const length = view.getUint32(10, true);
   const bytes = new Uint8Array(buffer, 14, length);
   state.bytesReceived += length;
+  state.netWindowBytes += length;
   const now = performance.now();
-  const deltaSec = Math.max(0.2, (now - state.lastNetAt) / 1000);
-  state.netKbps = (state.bytesReceived * 8) / deltaSec / 1000;
+  const deltaSec = (now - state.lastNetAt) / 1000;
+  if (deltaSec >= 0.25) {
+    state.netKbps = (state.netWindowBytes * 8) / Math.max(deltaSec, 0.001) / 1000;
+    state.netWindowBytes = 0;
+    state.lastNetAt = now;
+  }
   const timestamp = sentAt * 1000;
   if (state.waitingForKeyframe) {
     if (!key) return;
@@ -788,7 +865,7 @@ function shouldHandleKeyboard(event) {
   if (!state.inputCaptured) return false;
   const target = event.target;
   if (target instanceof HTMLElement) {
-    if (target.closest("#settings-panel")) return false;
+    if (target.closest("#control-panel")) return false;
     if (target.matches("input, select, textarea, button")) return false;
   }
   return true;
@@ -1257,7 +1334,7 @@ async function uploadSelectedFile() {
       throw new Error(await response.text());
     }
     const body = await response.json();
-    setStatus("Connected");
+    setStatus(state.socket?.readyState === WebSocket.OPEN ? "Connected" : "Disconnected");
     showToast("upload_ok", `Saved to ${body.saved_as}`);
   } catch (error) {
     showToast("upload_failed", error.message || String(error));
@@ -1301,6 +1378,11 @@ function initControls() {
   scrollSpeedInput.addEventListener("change", persistCurrentSettings);
   touchModeSelect.addEventListener("change", persistCurrentSettings);
   directTouchScrollInput.addEventListener("change", persistCurrentSettings);
+  for (const button of tabButtons) {
+    button.addEventListener("click", () => {
+      setActiveTab(button.dataset.tabTarget || "status");
+    });
+  }
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
   uploadAction.addEventListener("click", () => uploadInput.click());
@@ -1319,20 +1401,13 @@ function initControls() {
   remoteClipboardCopyBtn.addEventListener("click", () => {
     void copyClipboardText("remote");
   });
-  settingsPanel.addEventListener("toggle", () => {
-    if (settingsPanel.open) {
-      uploadPanel.open = false;
-      releaseInput();
-    }
-  });
-  uploadPanel.addEventListener("toggle", () => {
-    if (uploadPanel.open) {
-      settingsPanel.open = false;
+  controlPanel.addEventListener("toggle", () => {
+    if (controlPanel.open) {
       releaseInput();
     }
   });
   document.addEventListener("pointerdown", (event) => {
-    if (event.target instanceof HTMLElement && event.target.closest("#settings-panel, #upload-panel")) {
+    if (event.target instanceof HTMLElement && event.target.closest("#control-panel")) {
       releaseInput();
     }
   });
@@ -1459,7 +1534,9 @@ async function removeServiceWorker() {
 
 updateClipboardState("local", state.localClipboard);
 updateClipboardState("remote", state.remoteClipboard);
+setActiveTab("status");
 applySettings(loadStoredSettings());
+resetStatusMetrics();
 initControls();
 void removeServiceWorker();
 state.passwd = loadStoredPassword();

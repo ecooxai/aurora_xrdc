@@ -147,7 +147,7 @@ fn spawn_stats(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sampler = StatsSampler::new();
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut tick = tokio::time::interval(Duration::from_secs(3));
         loop {
             tick.tick().await;
             let sample = sampler.sample();
@@ -160,6 +160,9 @@ fn spawn_stats(
                 codec: config.codec,
                 cpu_usage: sample.cpu_usage,
                 memory_used_mb: sample.memory_used_mb,
+                memory_total_mb: sample.memory_total_mb,
+                swap_used_mb: sample.swap_used_mb,
+                swap_total_mb: sample.swap_total_mb,
                 net_tx_kbps: sample.net_tx_kbps,
                 latency_ms: latency.load(Ordering::Relaxed),
             };
