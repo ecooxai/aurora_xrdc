@@ -243,18 +243,18 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
 .upload-stack {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .clipboard-stack {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .clipboard-card {
   display: grid;
-  gap: 8px;
-  padding: 10px;
+  gap: 6px;
+  padding: 8px;
   border-radius: 14px;
   text-align: left;
   background: rgba(255, 255, 255, 0.04);
@@ -289,11 +289,13 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
 .clipboard-content {
   display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
   gap: 8px;
-  min-height: 76px;
-  max-height: 76px;
-  overflow: auto;
-  padding: 8px 10px;
+  min-height: 0;
+  max-height: none;
+  overflow: hidden;
+  padding: 6px 8px;
   border-radius: 12px;
   background: rgba(3, 9, 12, 0.75);
   border: 1px solid rgba(255, 255, 255, 0.06);
@@ -310,21 +312,90 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 }
 
 .clipboard-text {
-  min-height: 1.4em;
+  min-height: 1.2em;
   color: var(--muted);
-  white-space: pre-wrap;
-  word-break: break-word;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   user-select: text;
   cursor: text;
 }
 
 .clipboard-image {
-  width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  border-radius: 12px;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+
+.clipboard-history-card {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 14px;
+  text-align: left;
   background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.clipboard-history-list {
+  display: grid;
+  gap: 4px;
+  max-height: 128px;
+  overflow: auto;
+}
+
+.clipboard-history-item,
+.clipboard-history-empty {
+  padding: 6px 8px;
+  border-radius: 10px;
+  background: rgba(3, 9, 12, 0.75);
   border: 1px solid rgba(255, 255, 255, 0.06);
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.3;
+}
+
+.clipboard-history-item {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.clipboard-history-side {
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.62rem;
+}
+
+.clipboard-history-image {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+
+.clipboard-history-text {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.clipboard-history-text.is-copyable {
+  cursor: pointer;
+}
+
+.clipboard-history-text.is-copyable:hover {
+  color: var(--text);
 }
 
 .control-card label {

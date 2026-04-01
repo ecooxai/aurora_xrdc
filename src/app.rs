@@ -20,7 +20,10 @@ use tracing::{info, warn};
 use tokio::sync::Mutex;
 
 use crate::{
-    clipboard::{ClipboardPayload, ensure_upload_dir, read_remote_clipboard, write_remote_clipboard},
+    clipboard::{
+        ClipboardHistoryEntry, ClipboardPayload, ensure_upload_dir, read_clipboard_history,
+        read_remote_clipboard, write_clipboard_history, write_remote_clipboard,
+    },
     ffmpeg,
     session,
     settings::{CodecKind, ServerConfig, StreamConfig},
@@ -143,6 +146,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/api/auth", get(auth))
         .route("/ws", get(ws))
         .route("/api/upload", post(upload))
+        .route("/api/clipboard/history", get(get_clipboard_history).post(set_clipboard_history))
         .route("/api/clipboard/remote", get(get_remote_clipboard).post(set_remote_clipboard))
         .with_state(Arc::new(AppState {
             server,
@@ -248,6 +252,33 @@ async fn get_remote_clipboard(
         .await
         .map_err(internal_error)?;
     Ok(Json(payload))
+}
+
+async fn get_clipboard_history(
+    Query(auth): Query<AuthQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ClipboardHistoryEntry>>, (StatusCode, String)> {
+    state
+        .auth
+        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .await?;
+    let history = read_clipboard_history().await.map_err(internal_error)?;
+    Ok(Json(history))
+}
+
+async fn set_clipboard_history(
+    Query(auth): Query<AuthQuery>,
+    State(state): State<Arc<AppState>>,
+    Json(history): Json<Vec<ClipboardHistoryEntry>>,
+) -> Result<Json<Vec<ClipboardHistoryEntry>>, (StatusCode, String)> {
+    state
+        .auth
+        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .await?;
+    write_clipboard_history(&history)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(history))
 }
 
 async fn set_remote_clipboard(

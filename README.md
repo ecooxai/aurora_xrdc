@@ -38,7 +38,7 @@ The server listens on `0.0.0.0:8001` by default.
 
 - `VIBE_RDESK_BIND`: bind address, defaults to `0.0.0.0:8001`.
 - `DISPLAY`: X11 display, defaults to `:0.0`.
-- `VIBE_RDESK_UPLOAD_DIR`: upload directory, defaults to `uploads`.
+- `VIBE_RDESK_UPLOAD_DIR`: upload directory, defaults to `~/Desktop`. A leading `~/` is expanded against the server user's home directory.
 
 ## Browser UI
 

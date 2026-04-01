@@ -240,6 +240,21 @@ async fn apply_client_message(
             reset_input_state(display, pressed_keys).await?;
             run_xdotool(display, ["key", "ctrl+v"]).await?;
         }
+        ClientMessage::PasteClipboard { payload } => {
+            write_remote_clipboard(display, &payload).await?;
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            sender
+                .send(Message::Text(
+                    serde_json::to_string(&ServerMessage::Clipboard {
+                        side: "remote",
+                        payload: payload.clone(),
+                    })?
+                    .into(),
+                ))
+                .await?;
+            reset_input_state(display, pressed_keys).await?;
+            run_xdotool(display, ["key", "ctrl+v"]).await?;
+        }
         ClientMessage::ResetInput => {
             reset_input_state(display, pressed_keys).await?;
         }

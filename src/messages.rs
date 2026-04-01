@@ -52,6 +52,7 @@ pub enum ClientMessage {
     TouchTap,
     Key { key: String, down: bool },
     Paste,
+    PasteClipboard { payload: ClipboardPayload },
     ResetInput,
     Ping { sent_at_ms: u64 },
     ClipboardSet { payload: ClipboardPayload },

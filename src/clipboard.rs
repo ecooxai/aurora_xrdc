@@ -6,10 +6,19 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt, process::Command};
 use tracing::warn;
 
+pub const CLIPBOARD_HISTORY_LIMIT: usize = 100;
+const CLIPBOARD_HISTORY_PATH: &str = "/tmp/vibe_rdesk_clipboard_history.json";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClipboardPayload {
     pub text: Option<String>,
     pub image_png_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClipboardHistoryEntry {
+    pub side: String,
+    pub payload: ClipboardPayload,
 }
 
 pub async fn read_remote_clipboard(display: &str) -> Result<ClipboardPayload> {
@@ -48,6 +57,31 @@ pub async fn ensure_upload_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .await
         .with_context(|| format!("failed to create upload dir {}", path.display()))
+}
+
+pub async fn read_clipboard_history() -> Result<Vec<ClipboardHistoryEntry>> {
+    let bytes = match fs::read(CLIPBOARD_HISTORY_PATH).await {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read clipboard history {}", CLIPBOARD_HISTORY_PATH));
+        }
+    };
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse clipboard history {}", CLIPBOARD_HISTORY_PATH))
+}
+
+pub async fn write_clipboard_history(entries: &[ClipboardHistoryEntry]) -> Result<()> {
+    let trimmed: Vec<ClipboardHistoryEntry> = entries
+        .iter()
+        .take(CLIPBOARD_HISTORY_LIMIT)
+        .cloned()
+        .collect();
+    let bytes = serde_json::to_vec(&trimmed).context("failed to serialize clipboard history")?;
+    fs::write(CLIPBOARD_HISTORY_PATH, bytes)
+        .await
+        .with_context(|| format!("failed to write clipboard history {}", CLIPBOARD_HISTORY_PATH))
 }
 
 async fn xclip_output(display: &str, args: &[&str]) -> Result<String> {

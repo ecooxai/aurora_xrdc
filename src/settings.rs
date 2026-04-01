@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::{ffi::OsString, path::PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -54,10 +55,20 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn from_env() -> Self {
-        Self::from_env_with(std::env::var_os("VIBE_RDESK_BIND"), std::env::var_os("DISPLAY"))
+        Self::from_env_with(
+            std::env::var_os("VIBE_RDESK_BIND"),
+            std::env::var_os("DISPLAY"),
+            std::env::var_os("VIBE_RDESK_UPLOAD_DIR"),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
     }
 
-    fn from_env_with(bind: Option<std::ffi::OsString>, display: Option<std::ffi::OsString>) -> Self {
+    fn from_env_with(
+        bind: Option<OsString>,
+        display: Option<OsString>,
+        upload_dir: Option<OsString>,
+        home_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             bind: bind
                 .and_then(|value| value.into_string().ok())
@@ -65,7 +76,9 @@ impl ServerConfig {
             display: display
                 .and_then(|value| value.into_string().ok())
                 .unwrap_or_else(|| ":0.0".into()),
-            upload_dir: std::env::var("VIBE_RDESK_UPLOAD_DIR").unwrap_or_else(|_| "uploads".into()),
+            upload_dir: resolve_upload_dir(upload_dir, home_dir)
+                .to_string_lossy()
+                .into_owned(),
             passwd: String::new(),
         }
     }
@@ -112,6 +125,35 @@ impl ServerConfig {
     }
 }
 
+fn resolve_upload_dir(upload_dir: Option<OsString>, home_dir: Option<PathBuf>) -> PathBuf {
+    match upload_dir {
+        Some(path) => expand_home_path(PathBuf::from(path), home_dir),
+        None => default_upload_dir(home_dir),
+    }
+}
+
+fn expand_home_path(path: PathBuf, home_dir: Option<PathBuf>) -> PathBuf {
+    let Some(path_str) = path.to_str() else {
+        return path;
+    };
+    match path_str {
+        "~" => home_dir.unwrap_or(path),
+        _ => match path_str.strip_prefix("~/") {
+            Some(suffix) => match home_dir {
+                Some(home_dir) => home_dir.join(suffix),
+                None => path,
+            },
+            None => path,
+        },
+    }
+}
+
+fn default_upload_dir(home_dir: Option<PathBuf>) -> PathBuf {
+    home_dir
+        .map(|home_dir| home_dir.join("Desktop"))
+        .unwrap_or_else(|| PathBuf::from("Desktop"))
+}
+
 fn parse_port(value: &str) -> Result<u16> {
     value
         .parse::<u16>()
@@ -128,6 +170,7 @@ fn bind_with_port(bind: &str, port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::{CodecKind, ServerConfig, StreamConfig};
+    use std::path::PathBuf;
 
     #[test]
     fn stream_config_clamps_values() {
@@ -143,10 +186,15 @@ mod tests {
 
     #[test]
     fn server_config_defaults_to_port_8001() {
-        let cfg = ServerConfig::from_env_with(None, None);
+        let cfg = ServerConfig::from_env_with(
+            None,
+            None,
+            None,
+            Some(PathBuf::from("/tmp/vibe-rdesk-home")),
+        );
         assert_eq!(cfg.bind, "0.0.0.0:8001");
         assert_eq!(cfg.display, ":0.0");
-        assert_eq!(cfg.upload_dir, "uploads");
+        assert_eq!(cfg.upload_dir, "/tmp/vibe-rdesk-home/Desktop");
         assert!(cfg.passwd.is_empty());
     }
 
@@ -154,7 +202,7 @@ mod tests {
     fn server_config_applies_cli_port_override() {
         let cfg = ServerConfig::from_args_with(
             ["vibe_rdesk", "-p", "9000", "--passwd", "secret"],
-            ServerConfig::from_env_with(None, None),
+            ServerConfig::from_env_with(None, None, None, None),
         )
         .unwrap();
         assert_eq!(cfg.bind, "0.0.0.0:9000");
@@ -165,7 +213,7 @@ mod tests {
     fn server_config_requires_passwd_flag() {
         let err = ServerConfig::from_args_with(
             ["vibe_rdesk", "-p", "9000"],
-            ServerConfig::from_env_with(None, None),
+            ServerConfig::from_env_with(None, None, None, None),
         )
         .unwrap_err();
         assert!(err.to_string().contains("--passwd"));
@@ -173,8 +221,19 @@ mod tests {
 
     #[test]
     fn server_config_keeps_host_when_port_overridden() {
-        let mut cfg = ServerConfig::from_env_with(Some("127.0.0.1:3000".into()), None);
+        let mut cfg = ServerConfig::from_env_with(Some("127.0.0.1:3000".into()), None, None, None);
         cfg.bind = super::bind_with_port(&cfg.bind, 8001);
         assert_eq!(cfg.bind, "127.0.0.1:8001");
+    }
+
+    #[test]
+    fn server_config_expands_tilde_upload_dir() {
+        let cfg = ServerConfig::from_env_with(
+            None,
+            None,
+            Some("~/Desktop/uploads".into()),
+            Some(PathBuf::from("/home/tester")),
+        );
+        assert_eq!(cfg.upload_dir, "/home/tester/Desktop/uploads");
     }
 }

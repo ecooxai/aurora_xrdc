@@ -4,6 +4,7 @@ const SETTINGS_STORAGE_KEY = "vibe_rdesk.settings";
 const TOUCH_LONG_PRESS_MS = 1000;
 const TOUCH_MOVE_CANCEL_PX = 14;
 const DIRECT_TOUCH_SCROLL_MULTIPLIER = 3;
+const CLIPBOARD_HISTORY_LIMIT = 100;
 const state = {
   socket: null,
   decoder: null,
@@ -44,6 +45,7 @@ const state = {
   remoteClipboardSig: "",
   localClipboardUpdatedAt: 0,
   remoteClipboardUpdatedAt: 0,
+  clipboardHistory: [],
   passwd: "",
   connecting: false,
 };
@@ -78,10 +80,10 @@ const statusSwap = $("status-swap");
 const statusLatency = $("status-latency");
 const statusSpeed = $("status-speed");
 const statusUpdatedAt = $("status-updated-at");
-const localClipboardCopyBtn = $("local-clipboard-copy-btn");
 const localClipboardSyncBtn = $("local-clipboard-sync-btn");
-const remoteClipboardCopyBtn = $("remote-clipboard-copy-btn");
 const remoteClipboardSyncBtn = $("remote-clipboard-sync-btn");
+const clipboardHistoryList = $("clipboard-history-list");
+const clipboardHistoryEmpty = $("clipboard-history-empty");
 const AAC_SAMPLE_RATES = [
   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
   16000, 12000, 11025, 8000, 7350,
@@ -283,6 +285,17 @@ function authUrl(path) {
   return url;
 }
 
+function normalizeClipboardHistory(entries) {
+  if (!Array.isArray(entries)) return [];
+  return entries
+    .map((entry) => ({
+      side: entry?.side === "remote" ? "remote" : "local",
+      payload: normalizeClipboardPayload(entry?.payload),
+    }))
+    .filter((entry) => hasClipboardContent(entry.payload))
+    .slice(0, CLIPBOARD_HISTORY_LIMIT);
+}
+
 function setAuthPrompt(message = "") {
   authModal.classList.remove("hidden");
   authError.textContent = message;
@@ -307,6 +320,26 @@ async function verifyPassword(passwd) {
   }
 }
 
+async function loadClipboardHistory() {
+  const response = await fetch(authUrl("/api/clipboard/history"), { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(await response.text().catch(() => "Failed to load clipboard history"));
+  }
+  state.clipboardHistory = normalizeClipboardHistory(await response.json());
+  renderClipboardHistory();
+}
+
+async function saveClipboardHistory() {
+  const response = await fetch(authUrl("/api/clipboard/history"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(state.clipboardHistory),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text().catch(() => "Failed to save clipboard history"));
+  }
+}
+
 async function connect() {
   if (state.connecting) return;
   const passwd = authInput.value.trim();
@@ -322,6 +355,7 @@ async function connect() {
     state.passwd = passwd;
     clearAuthPrompt();
     closeConnection({ manual: false, preserveStatus: true });
+    await loadClipboardHistory();
     state.manualDisconnect = false;
     clearTimeout(state.reconnectTimer);
     void primeAudioPlayback();
@@ -346,12 +380,13 @@ async function connect() {
       state.reconnectAttempt = 0;
       setStatus("Connected");
       startPing();
+      startRemoteClipboardPolling();
       void refreshLocalClipboard();
-      requestRemoteClipboard();
     };
     state.socket.onclose = () => {
       setStatus("Disconnected");
       clearInterval(startPing.timer);
+      stopRemoteClipboardPolling();
       if (!state.manualDisconnect) scheduleReconnect();
     };
     state.socket.onerror = () => showToast("ws_error", "WebSocket error");
@@ -375,6 +410,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.manualDisconnect = manual;
   clearTimeout(state.reconnectTimer);
   clearInterval(startPing.timer);
+  stopRemoteClipboardPolling();
   state.decoder?.close();
   state.decoder = null;
   state.audioDecoder?.close();
@@ -711,8 +747,8 @@ function requestRemoteClipboard() {
   send({ type: "clipboard_get" });
 }
 
-function sendRemoteClipboard(payload) {
-  send({ type: "clipboard_set", payload });
+function sendPasteClipboard(payload) {
+  send({ type: "paste_clipboard", payload });
 }
 
 function startPing() {
@@ -720,6 +756,18 @@ function startPing() {
   startPing.timer = setInterval(() => {
     send({ type: "ping", sent_at_ms: Date.now() });
   }, 1000);
+}
+
+function startRemoteClipboardPolling() {
+  stopRemoteClipboardPolling();
+  requestRemoteClipboard();
+  startRemoteClipboardPolling.timer = setInterval(() => {
+    requestRemoteClipboard();
+  }, 3000);
+}
+
+function stopRemoteClipboardPolling() {
+  clearInterval(startRemoteClipboardPolling.timer);
 }
 
 function resetKeys() {
@@ -1184,17 +1232,106 @@ function clipboardPreview(payload) {
   return "Empty";
 }
 
+function clipboardLine(payload) {
+  const normalized = normalizeClipboardPayload(payload);
+  if (normalized.text) {
+    const singleLine = normalized.text.replace(/\s+/g, " ").trim();
+    if (singleLine.length > 33) {
+      return `${singleLine.slice(0, 20)}...${singleLine.slice(-10)}`;
+    }
+    return singleLine;
+  }
+  if (normalized.image_png_b64) {
+    return "[image]";
+  }
+  return "Empty";
+}
+
+function hasClipboardContent(payload) {
+  const normalized = normalizeClipboardPayload(payload);
+  return !!(normalized.text || normalized.image_png_b64);
+}
+
+function renderClipboardHistory() {
+  clipboardHistoryList.replaceChildren();
+  const entries = state.clipboardHistory;
+  clipboardHistoryEmpty.classList.toggle("hidden", entries.length > 0);
+  if (!entries.length) {
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  for (const entry of entries) {
+    const item = document.createElement("div");
+    item.className = "clipboard-history-item";
+
+    const side = document.createElement("span");
+    side.className = "clipboard-history-side";
+    side.textContent = entry.side;
+
+    const image = document.createElement("img");
+    image.className = "clipboard-history-image";
+    image.alt = `${entry.side} clipboard history preview`;
+    if (entry.payload.image_png_b64) {
+      image.src = `data:image/png;base64,${entry.payload.image_png_b64}`;
+    } else {
+      image.classList.add("hidden");
+    }
+
+    const text = document.createElement("span");
+    text.className = "clipboard-history-text";
+    text.textContent = clipboardLine(entry.payload);
+    text.title = entry.payload.text || clipboardPreview(entry.payload);
+    if (entry.payload.text) {
+      text.classList.add("is-copyable");
+      text.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(entry.payload.text);
+          showToast("clipboard_history_copied", "History text copied");
+        } catch (error) {
+          showToast("clipboard_history_copy_failed", error.message || String(error));
+        }
+      });
+    }
+
+    item.append(side, image, text);
+    fragment.append(item);
+  }
+  clipboardHistoryList.append(fragment);
+}
+
+function pushClipboardHistory(side, payload) {
+  const normalized = normalizeClipboardPayload(payload);
+  if (!hasClipboardContent(normalized)) {
+    return;
+  }
+  state.clipboardHistory.unshift({ side, payload: normalized });
+  if (state.clipboardHistory.length > CLIPBOARD_HISTORY_LIMIT) {
+    state.clipboardHistory.length = CLIPBOARD_HISTORY_LIMIT;
+  }
+  renderClipboardHistory();
+  if (!state.passwd) {
+    return;
+  }
+  void saveClipboardHistory().catch((error) => {
+    showToast("clipboard_history_save_failed", error.message || String(error));
+  });
+}
+
 function updateClipboardState(side, payload, { announce = false } = {}) {
   const normalized = normalizeClipboardPayload(payload);
   const signature = clipboardSignature(normalized);
   const payloadKey = side === "local" ? "localClipboard" : "remoteClipboard";
   const sigKey = side === "local" ? "localClipboardSig" : "remoteClipboardSig";
   const timeKey = side === "local" ? "localClipboardUpdatedAt" : "remoteClipboardUpdatedAt";
+  const previousPayload = state[payloadKey];
   const previousSignature = state[sigKey];
   const changed = previousSignature !== signature;
 
   state[payloadKey] = normalized;
   if (changed) {
+    if (previousSignature) {
+      pushClipboardHistory(side, previousPayload);
+    }
     state[sigKey] = signature;
     state[timeKey] = Date.now();
     if (announce && (normalized.text || normalized.image_png_b64) && previousSignature) {
@@ -1211,7 +1348,9 @@ function renderClipboardCard(side, payload) {
   const imageEl = $(`${side}-clipboard-image`);
   const hasText = !!payload.text;
   const hasImage = !!payload.image_png_b64;
-  textEl.textContent = hasText ? payload.text : "Empty";
+  const line = clipboardLine(payload);
+  textEl.textContent = line;
+  textEl.title = line === "Empty" ? "" : (payload.text || (hasImage ? "[image]" : line));
   if (hasImage) {
     imageEl.src = `data:image/png;base64,${payload.image_png_b64}`;
     imageEl.classList.remove("hidden");
@@ -1226,7 +1365,7 @@ function renderClipboardCard(side, payload) {
   } else if (hasText) {
     metaEl.textContent = "Text";
   } else {
-    metaEl.textContent = side === "local" ? "Ready to push remote" : "Ready to copy locally";
+    metaEl.textContent = side === "local" ? "Ready to paste remotely" : "Auto-refresh every 3s";
   }
 }
 
@@ -1286,13 +1425,18 @@ async function writeLocalClipboard(payload) {
   updateClipboardState("local", normalized, { announce: true });
 }
 
-async function pushLocalClipboardToRemote() {
+async function pasteLocalClipboardToRemote() {
+  if (state.socket?.readyState !== WebSocket.OPEN) {
+    showToast("paste_unavailable", "Connect to the server first");
+    return;
+  }
   const payload = await refreshLocalClipboard();
   if (!payload.text && !payload.image_png_b64) {
     showToast("local_clipboard_empty", "Local clipboard is empty");
     return;
   }
-  sendRemoteClipboard(payload);
+  sendPasteClipboard(payload);
+  showToast("paste_sent", "Local clipboard pasted on the server");
 }
 
 async function copyRemoteClipboardToLocal() {
@@ -1305,20 +1449,6 @@ async function copyRemoteClipboardToLocal() {
     showToast("clipboard_copied", "Remote clipboard copied locally");
   } catch (error) {
     showToast("local_clipboard_write_failed", error.message || String(error));
-  }
-}
-
-async function copyClipboardText(side) {
-  const payload = side === "local" ? state.localClipboard : state.remoteClipboard;
-  if (!payload.text) {
-    showToast("clipboard_text_empty", `${side} clipboard has no text`);
-    return;
-  }
-  try {
-    await navigator.clipboard.writeText(payload.text);
-    showToast("clipboard_text_copied", `${side} clipboard text copied`);
-  } catch (error) {
-    showToast("clipboard_text_copy_failed", error.message || String(error));
   }
 }
 
@@ -1390,16 +1520,10 @@ function initControls() {
     void uploadSelectedFile();
   });
   localClipboardSyncBtn.addEventListener("click", () => {
-    void pushLocalClipboardToRemote();
+    void pasteLocalClipboardToRemote();
   });
   remoteClipboardSyncBtn.addEventListener("click", () => {
     void copyRemoteClipboardToLocal();
-  });
-  localClipboardCopyBtn.addEventListener("click", () => {
-    void copyClipboardText("local");
-  });
-  remoteClipboardCopyBtn.addEventListener("click", () => {
-    void copyClipboardText("remote");
   });
   controlPanel.addEventListener("toggle", () => {
     if (controlPanel.open) {
@@ -1534,6 +1658,7 @@ async function removeServiceWorker() {
 
 updateClipboardState("local", state.localClipboard);
 updateClipboardState("remote", state.remoteClipboard);
+renderClipboardHistory();
 setActiveTab("status");
 applySettings(loadStoredSettings());
 resetStatusMetrics();
