@@ -85,25 +85,40 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
 .viewport-card {
   position: relative;
-  overflow: hidden;
+  overflow: auto;
   flex: 1;
   min-height: 0;
   border: none;
   border-radius: 0;
   box-shadow: none;
   background: #000;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.viewport-stage {
+  min-width: 100%;
+  min-height: 100%;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
 }
 
 #screen {
   display: block;
-  width: 100%;
+  width: auto;
   height: auto;
-  margin: 0;
+  margin: 0 auto;
   border: none;
   border-radius: 0;
   background: #000;
   touch-action: none;
   outline: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-user-drag: none;
 }
 
 .status-pill, .toast {
@@ -167,7 +182,7 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
 .tab-row {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
   border-radius: 14px;
@@ -211,6 +226,12 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   gap: 8px;
 }
 
+.view-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .metric-card {
   display: grid;
   gap: 5px;
@@ -239,6 +260,23 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 .metric-meta {
   color: var(--muted);
   font-size: 0.7rem;
+}
+
+.zoom-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.zoom-controls button {
+  flex: 1 1 0;
+}
+
+.zoom-value {
+  min-width: 52px;
+  text-align: center;
+  font-size: 0.94rem;
+  line-height: 1.15;
 }
 
 .upload-stack {
@@ -413,6 +451,13 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   padding: 8px 10px;
 }
 
+.control-card button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  transform: none;
+  filter: none;
+}
+
 .control-card .button-row {
   gap: 8px;
 }
@@ -512,6 +557,33 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 .control-panel[open] .tool-toggle {
   background: rgba(18, 31, 35, 0.96);
 }
+
+.mobile-keyboard-trigger {
+  position: fixed;
+  right: var(--dock-edge);
+  bottom: var(--dock-bottom);
+  z-index: 20;
+  display: none;
+}
+
+.mobile-keyboard-trigger.is-active {
+  background: rgba(18, 31, 35, 0.96);
+  border-color: rgba(141, 230, 255, 0.32);
+}
+
+.mobile-keyboard-input {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+  resize: none;
+}
+
 .toast {
   left: 50%;
   bottom: 18px;
@@ -532,6 +604,16 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
   .tool-row {
     justify-content: flex-end;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .mobile-keyboard-trigger {
+    display: grid;
+  }
+
+  .control-panel {
+    right: calc(var(--dock-edge) + var(--fab-size) + var(--dock-gap));
   }
 }
 
@@ -565,6 +647,15 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   }
 
   .status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .view-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .zoom-controls {
+    display: grid;
     grid-template-columns: 1fr;
   }
 }

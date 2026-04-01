@@ -236,6 +236,9 @@ async fn apply_client_message(
             let action = if down { "keydown" } else { "keyup" };
             run_xdotool(display, [action, &key]).await?;
         }
+        ClientMessage::TextInput { text } => {
+            type_remote_text(display, &text).await?;
+        }
         ClientMessage::Paste => {
             reset_input_state(display, pressed_keys).await?;
             run_xdotool(display, ["key", "ctrl+v"]).await?;
@@ -301,6 +304,34 @@ async fn reset_input_state(display: &str, pressed_keys: &mut HashSet<String>) ->
         "Super_R",
     ] {
         run_xdotool(display, ["keyup", key]).await?;
+    }
+    Ok(())
+}
+
+async fn type_remote_text(display: &str, text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let segments: Vec<&str> = normalized.split('\n').collect();
+    for (index, segment) in segments.iter().enumerate() {
+        if !segment.is_empty() {
+            run_xdotool(
+                display,
+                [
+                    "type",
+                    "--delay",
+                    "0",
+                    "--clearmodifiers",
+                    "--",
+                    *segment,
+                ],
+            )
+            .await?;
+        }
+        if index + 1 < segments.len() {
+            run_xdotool(display, ["key", "Return"]).await?;
+        }
     }
     Ok(())
 }

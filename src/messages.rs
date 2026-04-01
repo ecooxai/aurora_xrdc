@@ -51,6 +51,7 @@ pub enum ClientMessage {
     PointerWheel { delta_y: i32 },
     TouchTap,
     Key { key: String, down: bool },
+    TextInput { text: String },
     Paste,
     PasteClipboard { payload: ClipboardPayload },
     ResetInput,

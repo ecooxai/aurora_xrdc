@@ -8,8 +8,10 @@
   </head>
   <body>
     <main class="shell">
-      <section class="viewport-card">
-        <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+      <section id="viewport-card" class="viewport-card">
+        <div id="viewport-stage" class="viewport-stage">
+          <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+        </div>
         <div id="status" class="status-pill">Connecting...</div>
       </section>
 
@@ -27,6 +29,7 @@
             <div class="control-card">
               <div class="tab-row" role="tablist" aria-label="Control sections">
                 <button id="tab-button-status" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-status" data-tab-target="status">Status</button>
+                <button id="tab-button-view" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-view" data-tab-target="view">View</button>
                 <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Settings</button>
                 <button id="tab-button-transfer" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-transfer" data-tab-target="transfer">Transfer</button>
               </div>
@@ -56,6 +59,35 @@
                     <span class="metric-label">Realtime Speed</span>
                     <strong id="status-speed" class="metric-value">--</strong>
                     <span id="status-updated-at" class="metric-meta">Updates every 3s</span>
+                  </article>
+                </div>
+              </section>
+              <section id="tab-panel-view" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-view" hidden>
+                <div class="view-grid">
+                  <article class="metric-card">
+                    <span class="metric-label">Current Video</span>
+                    <strong id="view-video-size" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Viewport</span>
+                    <strong id="view-viewport-size" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Window</span>
+                    <strong id="view-window-size" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Remote Screen</span>
+                    <strong id="view-remote-screen-size" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card metric-card-wide">
+                    <span class="metric-label">Zoom</span>
+                    <div class="zoom-controls">
+                      <button id="zoom-out" class="secondary" type="button">Zoom Out</button>
+                      <strong id="view-zoom-value" class="zoom-value">100%</strong>
+                      <button id="zoom-in" class="secondary" type="button">Zoom In</button>
+                    </div>
+                    <span class="metric-meta">10% step</span>
                   </article>
                 </div>
               </section>
@@ -146,6 +178,14 @@
               </section>
             </div>
           </details>
+          <button id="mobile-keyboard-trigger" class="tool-toggle mobile-keyboard-trigger" type="button" aria-label="Show keyboard">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3.5" y="6.5" width="17" height="11" rx="2.5" />
+              <path d="M6.5 10.5h.01M9.5 10.5h.01M12.5 10.5h.01M15.5 10.5h.01M18 10.5h.01" />
+              <path d="M7.5 13.5h.01M10.5 13.5h.01M13.5 13.5h.01M16.5 13.5h.01" />
+              <path d="M8 16.5h8" />
+            </svg>
+          </button>
         </div>
       </section>
     </main>
@@ -162,6 +202,17 @@
       </form>
     </div>
     <div id="toast" class="toast hidden"></div>
+    <textarea
+      id="mobile-keyboard-input"
+      class="mobile-keyboard-input"
+      aria-label="Mobile keyboard input"
+      autocapitalize="off"
+      autocomplete="off"
+      autocorrect="off"
+      spellcheck="false"
+      enterkeyhint="enter"
+      rows="1"
+    ></textarea>
     <script src="/app.js" type="module"></script>
   </body>
 </html>

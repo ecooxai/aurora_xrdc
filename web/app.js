@@ -5,6 +5,9 @@ const TOUCH_LONG_PRESS_MS = 1000;
 const TOUCH_MOVE_CANCEL_PX = 14;
 const DIRECT_TOUCH_SCROLL_MULTIPLIER = 3;
 const CLIPBOARD_HISTORY_LIMIT = 100;
+const VIEW_ZOOM_STEP_PERCENT = 10;
+const VIEW_ZOOM_MIN_PERCENT = 10;
+const VIEW_ZOOM_MAX_PERCENT = 300;
 const state = {
   socket: null,
   decoder: null,
@@ -48,9 +51,13 @@ const state = {
   clipboardHistory: [],
   passwd: "",
   connecting: false,
+  remoteScreenWidth: null,
+  remoteScreenHeight: null,
+  viewZoomPercent: 100,
 };
 
 const status = $("status");
+const viewportCard = $("viewport-card");
 const canvas = $("screen");
 const ctx = canvas.getContext("2d", { alpha: false });
 const toast = $("toast");
@@ -59,6 +66,8 @@ const authForm = $("auth-form");
 const authInput = $("auth-passwd");
 const authError = $("auth-error");
 const controlPanel = $("control-panel");
+const mobileKeyboardTrigger = $("mobile-keyboard-trigger");
+const mobileKeyboardInput = $("mobile-keyboard-input");
 const encoderStatus = $("encoder-status");
 const codecSelect = $("codec");
 const bitrateInput = $("bitrate");
@@ -84,6 +93,13 @@ const localClipboardSyncBtn = $("local-clipboard-sync-btn");
 const remoteClipboardSyncBtn = $("remote-clipboard-sync-btn");
 const clipboardHistoryList = $("clipboard-history-list");
 const clipboardHistoryEmpty = $("clipboard-history-empty");
+const viewVideoSize = $("view-video-size");
+const viewViewportSize = $("view-viewport-size");
+const viewWindowSize = $("view-window-size");
+const viewRemoteScreenSize = $("view-remote-screen-size");
+const viewZoomValue = $("view-zoom-value");
+const zoomOutButton = $("zoom-out");
+const zoomInButton = $("zoom-in");
 const AAC_SAMPLE_RATES = [
   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
   16000, 12000, 11025, 8000, 7350,
@@ -91,6 +107,21 @@ const AAC_SAMPLE_RATES = [
 const AUDIO_TARGET_LEAD_SECONDS = 0.02;
 const AUDIO_MAX_QUEUE_SECONDS = 0.2;
 const AUDIO_RESET_GRACE_SECONDS = 0.05;
+const MOBILE_KEYBOARD_SPECIAL_KEYS = new Set([
+  "Backspace",
+  "Delete",
+  "Enter",
+  "ArrowUp",
+  "ArrowDown",
+  "ArrowLeft",
+  "ArrowRight",
+  "Tab",
+  "Escape",
+  "Home",
+  "End",
+  "PageUp",
+  "PageDown",
+]);
 
 function setStatus(text) {
   status.textContent = text;
@@ -142,6 +173,63 @@ function renderStatusMetrics({
 function resetStatusMetrics() {
   renderStatusMetrics({});
   statusUpdatedAt.textContent = "Updates every 3s";
+}
+
+function formatDimensions(width, height) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return "--";
+  }
+  return `${Math.round(width)} x ${Math.round(height)}`;
+}
+
+function clampZoomPercent(value) {
+  if (!Number.isFinite(value)) return 100;
+  return Math.min(VIEW_ZOOM_MAX_PERCENT, Math.max(VIEW_ZOOM_MIN_PERCENT, value));
+}
+
+function syncZoomButtons() {
+  zoomOutButton.disabled = state.viewZoomPercent <= VIEW_ZOOM_MIN_PERCENT;
+  zoomInButton.disabled = state.viewZoomPercent >= VIEW_ZOOM_MAX_PERCENT;
+}
+
+function renderViewMetrics() {
+  const rect = canvas.getBoundingClientRect();
+  viewVideoSize.textContent = formatDimensions(rect.width, rect.height);
+  viewViewportSize.textContent = formatDimensions(viewportCard.clientWidth, viewportCard.clientHeight);
+  viewWindowSize.textContent = formatDimensions(window.innerWidth, window.innerHeight);
+  viewRemoteScreenSize.textContent = formatDimensions(state.remoteScreenWidth, state.remoteScreenHeight);
+  viewZoomValue.textContent = `${state.viewZoomPercent}%`;
+  syncZoomButtons();
+}
+
+function applyCanvasZoom() {
+  const remoteWidth = state.remoteScreenWidth ?? canvas.width;
+  const remoteHeight = state.remoteScreenHeight ?? canvas.height;
+  if (!Number.isFinite(remoteWidth) || !Number.isFinite(remoteHeight) || remoteWidth <= 0 || remoteHeight <= 0) {
+    renderViewMetrics();
+    return;
+  }
+
+  const viewportWidth = Math.max(viewportCard.clientWidth, 1);
+  const viewportHeight = Math.max(viewportCard.clientHeight, 1);
+  const fitScale = Math.min(viewportWidth / remoteWidth, viewportHeight / remoteHeight);
+  const zoomScale = state.viewZoomPercent / 100;
+  const displayWidth = Math.max(1, Math.round(remoteWidth * fitScale * zoomScale));
+  const displayHeight = Math.max(1, Math.round(remoteHeight * fitScale * zoomScale));
+
+  canvas.style.width = `${displayWidth}px`;
+  canvas.style.height = `${displayHeight}px`;
+  renderViewMetrics();
+}
+
+function adjustZoom(deltaPercent) {
+  const nextZoom = clampZoomPercent(state.viewZoomPercent + deltaPercent);
+  if (nextZoom === state.viewZoomPercent) {
+    syncZoomButtons();
+    return;
+  }
+  state.viewZoomPercent = nextZoom;
+  applyCanvasZoom();
 }
 
 function setActiveTab(tabName) {
@@ -452,8 +540,12 @@ function releaseKeyboardLock() {
 }
 
 function captureInput() {
+  captureInputTarget(canvas);
+}
+
+function captureInputTarget(target) {
   state.inputCaptured = true;
-  canvas.focus({ preventScroll: true });
+  target.focus({ preventScroll: true });
   void requestKeyboardLock();
   void primeAudioPlayback();
 }
@@ -461,6 +553,12 @@ function captureInput() {
 function releaseInput() {
   resetTouchInteraction();
   state.inputCaptured = false;
+  if (document.activeElement === mobileKeyboardInput) {
+    mobileKeyboardInput.blur();
+  }
+  window.navigator.virtualKeyboard?.hide?.();
+  mobileKeyboardInput.value = "";
+  syncMobileKeyboardButton();
   releaseKeyboardLock();
   resetKeys();
   send({ type: "reset_input" });
@@ -529,9 +627,18 @@ function setupDecoder() {
 }
 
 async function drawFrame(frame) {
+  const remoteSizeChanged = (
+    state.remoteScreenWidth !== frame.displayWidth
+    || state.remoteScreenHeight !== frame.displayHeight
+  );
   if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
     canvas.width = frame.displayWidth;
     canvas.height = frame.displayHeight;
+  }
+  if (remoteSizeChanged) {
+    state.remoteScreenWidth = frame.displayWidth;
+    state.remoteScreenHeight = frame.displayHeight;
+    applyCanvasZoom();
   }
   const bitmap = await createImageBitmap(frame);
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
@@ -860,6 +967,25 @@ function normalizeKey(event) {
   };
   if (modifierKeyMap[event.key]) return modifierKeyMap[event.key];
 
+  const namedKeyMap = {
+    Backspace: "BackSpace",
+    Delete: "Delete",
+    Enter: event.location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD ? "KP_Enter" : "Return",
+    Escape: "Escape",
+    Tab: "Tab",
+    " ": "space",
+    Spacebar: "space",
+    ArrowUp: "Up",
+    ArrowDown: "Down",
+    ArrowLeft: "Left",
+    ArrowRight: "Right",
+    Home: "Home",
+    End: "End",
+    PageUp: "Page_Up",
+    PageDown: "Page_Down",
+  };
+  if (namedKeyMap[event.key]) return namedKeyMap[event.key];
+
   const codeMap = {
     Backquote: "grave",
     Backslash: "backslash",
@@ -913,10 +1039,83 @@ function shouldHandleKeyboard(event) {
   if (!state.inputCaptured) return false;
   const target = event.target;
   if (target instanceof HTMLElement) {
+    if (target === mobileKeyboardInput) return false;
     if (target.closest("#control-panel")) return false;
     if (target.matches("input, select, textarea, button")) return false;
   }
   return true;
+}
+
+function syncMobileKeyboardButton() {
+  mobileKeyboardTrigger.classList.toggle("is-active", document.activeElement === mobileKeyboardInput);
+}
+
+function tapRemoteKey(key) {
+  send({ type: "key", key, down: true });
+  send({ type: "key", key, down: false });
+}
+
+function sendRemoteText(text) {
+  if (!text) return;
+  send({ type: "text_input", text });
+}
+
+function focusMobileKeyboard() {
+  captureInputTarget(mobileKeyboardInput);
+  mobileKeyboardInput.value = "";
+  mobileKeyboardInput.setSelectionRange(0, 0);
+  window.navigator.virtualKeyboard?.show?.();
+  syncMobileKeyboardButton();
+}
+
+function handleMobileKeyboardBeforeInput(event) {
+  if (!state.inputCaptured || document.activeElement !== mobileKeyboardInput) {
+    captureInputTarget(mobileKeyboardInput);
+  }
+  let handled = false;
+  switch (event.inputType) {
+    case "insertText":
+    case "insertCompositionText":
+    case "insertFromPaste":
+    case "insertReplacementText":
+      if (event.data) {
+        sendRemoteText(event.data);
+        handled = true;
+      }
+      break;
+    case "insertLineBreak":
+    case "insertParagraph":
+      tapRemoteKey("Return");
+      handled = true;
+      break;
+    case "deleteContentBackward":
+      tapRemoteKey("BackSpace");
+      handled = true;
+      break;
+    case "deleteContentForward":
+      tapRemoteKey("Delete");
+      handled = true;
+      break;
+    default:
+      break;
+  }
+  if (handled) {
+    event.preventDefault();
+    mobileKeyboardInput.value = "";
+  }
+}
+
+function handleMobileKeyboardKeydown(event) {
+  if (isReleaseInputChord(event)) {
+    event.preventDefault();
+    releaseInput();
+    return;
+  }
+  if (!MOBILE_KEYBOARD_SPECIAL_KEYS.has(event.key)) return;
+  const key = normalizeKey(event);
+  if (!key) return;
+  event.preventDefault();
+  tapRemoteKey(key);
 }
 
 function flushWheel(direction) {
@@ -1491,6 +1690,13 @@ function base64ToBlob(base64, type) {
 }
 
 function initControls() {
+  try {
+    if (window.navigator.virtualKeyboard) {
+      window.navigator.virtualKeyboard.overlaysContent = true;
+    }
+  } catch {
+    // Some browsers expose a partial VirtualKeyboard API surface.
+  }
   authForm.addEventListener("submit", (event) => {
     event.preventDefault();
     void connect();
@@ -1525,6 +1731,40 @@ function initControls() {
   remoteClipboardSyncBtn.addEventListener("click", () => {
     void copyRemoteClipboardToLocal();
   });
+  zoomOutButton.addEventListener("click", () => {
+    adjustZoom(-VIEW_ZOOM_STEP_PERCENT);
+  });
+  zoomInButton.addEventListener("click", () => {
+    adjustZoom(VIEW_ZOOM_STEP_PERCENT);
+  });
+  mobileKeyboardTrigger.addEventListener("click", () => {
+    if (document.activeElement === mobileKeyboardInput) {
+      releaseInput();
+      return;
+    }
+    focusMobileKeyboard();
+  });
+  mobileKeyboardInput.addEventListener("beforeinput", handleMobileKeyboardBeforeInput);
+  mobileKeyboardInput.addEventListener("input", () => {
+    if (mobileKeyboardInput.value) {
+      sendRemoteText(mobileKeyboardInput.value);
+    }
+    mobileKeyboardInput.value = "";
+  });
+  mobileKeyboardInput.addEventListener("keydown", handleMobileKeyboardKeydown);
+  mobileKeyboardInput.addEventListener("focus", syncMobileKeyboardButton);
+  mobileKeyboardInput.addEventListener("blur", () => {
+    mobileKeyboardInput.value = "";
+    syncMobileKeyboardButton();
+  });
+  for (const element of [viewportCard, canvas]) {
+    element.addEventListener("selectstart", (event) => {
+      event.preventDefault();
+    });
+    element.addEventListener("dragstart", (event) => {
+      event.preventDefault();
+    });
+  }
   controlPanel.addEventListener("toggle", () => {
     if (controlPanel.open) {
       releaseInput();
@@ -1627,6 +1867,8 @@ function initControls() {
     void refreshLocalClipboard();
     requestRemoteClipboard();
   });
+  window.addEventListener("resize", applyCanvasZoom);
+  window.visualViewport?.addEventListener("resize", applyCanvasZoom);
   window.addEventListener("blur", releaseInput);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
@@ -1636,6 +1878,12 @@ function initControls() {
     void refreshLocalClipboard();
     requestRemoteClipboard();
   });
+  if ("ResizeObserver" in window) {
+    const observer = new ResizeObserver(() => {
+      applyCanvasZoom();
+    });
+    observer.observe(viewportCard);
+  }
 }
 
 async function removeServiceWorker() {
@@ -1659,8 +1907,10 @@ async function removeServiceWorker() {
 updateClipboardState("local", state.localClipboard);
 updateClipboardState("remote", state.remoteClipboard);
 renderClipboardHistory();
+syncMobileKeyboardButton();
 setActiveTab("status");
 applySettings(loadStoredSettings());
+applyCanvasZoom();
 resetStatusMetrics();
 initControls();
 void removeServiceWorker();
