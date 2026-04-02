@@ -137,7 +137,7 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 }
 .bottom-dock {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
   align-items: flex-end;
   gap: 12px;
   padding: 6px 12px;
@@ -148,6 +148,14 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   display: flex;
   align-items: flex-end;
   gap: 12px;
+}
+
+.tool-row-left {
+  justify-content: flex-start;
+}
+
+.tool-row-right {
+  justify-content: flex-end;
 }
 
 .control-panel {
@@ -547,6 +555,27 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   box-shadow: var(--shadow);
 }
 
+.tool-toggle-left {
+  position: fixed;
+  left: var(--dock-edge);
+  bottom: var(--dock-bottom);
+  z-index: 20;
+}
+
+#camera-toggle {
+  left: calc(var(--dock-edge) + var(--fab-size) + var(--dock-gap));
+}
+
+.tool-toggle.is-active {
+  background: rgba(18, 31, 35, 0.96);
+  border-color: rgba(141, 230, 255, 0.32);
+}
+
+.tool-toggle.is-pending {
+  border-color: rgba(245, 194, 107, 0.38);
+  box-shadow: 0 0 0 1px rgba(245, 194, 107, 0.18), var(--shadow);
+}
+
 .tool-toggle::-webkit-details-marker {
   display: none;
 }
@@ -559,6 +588,15 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   stroke-width: 1.8;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+.tool-toggle .mic-off-slash {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+#mic-toggle:not(.is-active) .mic-off-slash {
+  opacity: 1;
 }
 
 .control-panel[open] .tool-toggle {
@@ -606,10 +644,10 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
 @media (max-width: 900px) {
   .bottom-dock {
-    justify-content: flex-end;
+    justify-content: space-between;
   }
 
-  .tool-row {
+  .tool-row-right {
     justify-content: flex-end;
   }
 }
@@ -621,6 +659,10 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 
   .control-panel {
     right: calc(var(--fab-size) + var(--dock-gap));
+  }
+
+  #camera-toggle {
+    left: calc(var(--dock-edge) + var(--fab-size) + var(--dock-gap));
   }
 }
 

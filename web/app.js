@@ -18,8 +18,13 @@ const state = {
   micAudioContext: null,
   micStream: null,
   micSourceNode: null,
+  micHighpassNode: null,
+  micLowpassNode: null,
+  micCompressorNode: null,
   micProcessorNode: null,
   micSilenceNode: null,
+  micEnabled: false,
+  micStarting: false,
   activeCodec: "h264",
   codecString: "avc1.64001f",
   description: null,
@@ -76,6 +81,8 @@ const authInput = $("auth-passwd");
 const authError = $("auth-error");
 const controlPanel = $("control-panel");
 const mobileKeyboardTrigger = $("mobile-keyboard-trigger");
+const micToggle = $("mic-toggle");
+const cameraToggle = $("camera-toggle");
 const mobileKeyboardInput = $("mobile-keyboard-input");
 const encoderStatus = $("encoder-status");
 const codecSelect = $("codec");
@@ -120,7 +127,10 @@ const MIC_CHUNK_KIND = 3;
 const MIC_SAMPLE_RATE_HEADER_BYTES = 4;
 const MIC_CHANNEL_HEADER_BYTES = 1;
 const MIC_HEADER_BYTES = 1 + MIC_SAMPLE_RATE_HEADER_BYTES + MIC_CHANNEL_HEADER_BYTES;
-const MIC_BUFFER_SIZE = 2048;
+const MIC_BUFFER_SIZE = 512;
+const MIC_NOISE_FLOOR = 0.008;
+const MIC_GATE_ATTACK = 0.35;
+const MIC_GATE_RELEASE = 0.985;
 const MOBILE_KEYBOARD_SPECIAL_KEYS = new Set([
   "Backspace",
   "Delete",
@@ -320,6 +330,7 @@ function normalizeSettings(settings = {}) {
     scrollSpeed: clampControlValue(scrollSpeedInput, settings.scrollSpeed, defaultScrollSpeed),
     touchMode: allowedTouchModes.has(settings.touchMode) ? settings.touchMode : touchModeSelect.value,
     directTouchScroll: settings.directTouchScroll === true,
+    micEnabled: settings.micEnabled === true,
   };
 }
 
@@ -331,6 +342,7 @@ function readSettingsFromControls() {
     scrollSpeed: scrollSpeedInput.value,
     touchMode: touchModeSelect.value,
     directTouchScroll: directTouchScrollInput.checked,
+    micEnabled: state.micEnabled,
   });
 }
 
@@ -364,6 +376,13 @@ function syncTouchModeControls(settings = readSettingsFromControls()) {
   directTouchScrollLabel.classList.toggle("is-disabled", !isDirectTouch);
 }
 
+function renderMicToggle() {
+  micToggle.classList.toggle("is-active", state.micEnabled);
+  micToggle.classList.toggle("is-pending", state.micStarting);
+  micToggle.setAttribute("aria-pressed", state.micEnabled ? "true" : "false");
+  micToggle.setAttribute("aria-label", state.micEnabled ? "Disable microphone" : "Enable microphone");
+}
+
 function applySettings(settings) {
   const normalized = normalizeSettings(settings);
   codecSelect.value = normalized.codec;
@@ -372,8 +391,10 @@ function applySettings(settings) {
   scrollSpeedInput.value = String(normalized.scrollSpeed);
   touchModeSelect.value = normalized.touchMode;
   directTouchScrollInput.checked = normalized.directTouchScroll;
+  state.micEnabled = normalized.micEnabled;
   renderSettingsValues(normalized);
   syncTouchModeControls(normalized);
+  renderMicToggle();
 }
 
 function persistCurrentSettings() {
@@ -491,7 +512,9 @@ async function connect() {
       startPing();
       startRemoteClipboardPolling();
       void refreshLocalClipboard();
-      void startMicrophoneCapture();
+      if (state.micEnabled) {
+        void startMicrophoneCapture();
+      }
     };
     state.socket.onclose = () => {
       setStatus("Disconnected");
@@ -828,14 +851,19 @@ async function primeAudioPlayback() {
 
 async function startMicrophoneCapture() {
   if (!navigator.mediaDevices?.getUserMedia) return;
-  if (state.micProcessorNode) return;
+  if (state.micProcessorNode || state.micStarting || !state.micEnabled) return;
+  state.micStarting = true;
+  renderMicToggle();
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
+        sampleRate: 48000,
+        sampleSize: 16,
+        latency: 0.02,
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true,
+        autoGainControl: false,
       },
     });
     if (state.socket?.readyState !== WebSocket.OPEN) {
@@ -850,16 +878,41 @@ async function startMicrophoneCapture() {
       sampleRate: 48000,
     });
     const sourceNode = audioContext.createMediaStreamSource(stream);
+    const highpassNode = audioContext.createBiquadFilter();
+    highpassNode.type = "highpass";
+    highpassNode.frequency.value = 120;
+    highpassNode.Q.value = 0.8;
+    const lowpassNode = audioContext.createBiquadFilter();
+    lowpassNode.type = "lowpass";
+    lowpassNode.frequency.value = 7200;
+    lowpassNode.Q.value = 0.7;
+    const compressorNode = audioContext.createDynamicsCompressor();
+    compressorNode.threshold.value = -24;
+    compressorNode.knee.value = 18;
+    compressorNode.ratio.value = 3;
+    compressorNode.attack.value = 0.003;
+    compressorNode.release.value = 0.14;
     const processorNode = audioContext.createScriptProcessor(MIC_BUFFER_SIZE, 1, 1);
     const silenceNode = audioContext.createGain();
     silenceNode.gain.value = 0;
+    let gateGain = 1;
     processorNode.onaudioprocess = (event) => {
       if (state.socket?.readyState !== WebSocket.OPEN) return;
       const input = event.inputBuffer.getChannelData(0);
+      let peak = 0;
+      for (let i = 0; i < input.length; i += 1) {
+        peak = Math.max(peak, Math.abs(input[i]));
+      }
+      const targetGate = peak < MIC_NOISE_FLOOR ? 0 : 1;
+      const gateSmoothing = targetGate > gateGain ? MIC_GATE_ATTACK : MIC_GATE_RELEASE;
+      gateGain += (targetGate - gateGain) * gateSmoothing;
+      if (gateGain < 0.002) {
+        gateGain = 0;
+      }
       const payload = new Uint8Array(input.length * 2);
       const view = new DataView(payload.buffer);
       for (let i = 0; i < input.length; i += 1) {
-        const sample = Math.max(-1, Math.min(1, input[i]));
+        const sample = Math.max(-1, Math.min(1, input[i] * gateGain));
         const pcm = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
         view.setInt16(i * 2, pcm, true);
       }
@@ -871,21 +924,33 @@ async function startMicrophoneCapture() {
       message.set(payload, MIC_HEADER_BYTES);
       sendBinary(message);
     };
-    sourceNode.connect(processorNode);
+    sourceNode.connect(highpassNode);
+    highpassNode.connect(lowpassNode);
+    lowpassNode.connect(compressorNode);
+    compressorNode.connect(processorNode);
     processorNode.connect(silenceNode);
     silenceNode.connect(audioContext.destination);
     await audioContext.resume();
     state.micAudioContext = audioContext;
     state.micStream = stream;
     state.micSourceNode = sourceNode;
+    state.micHighpassNode = highpassNode;
+    state.micLowpassNode = lowpassNode;
+    state.micCompressorNode = compressorNode;
     state.micProcessorNode = processorNode;
     state.micSilenceNode = silenceNode;
   } catch (error) {
     showToast("mic_access_failed", error.message || String(error));
+    state.micEnabled = false;
+    persistCurrentSettings();
+  } finally {
+    state.micStarting = false;
+    renderMicToggle();
   }
 }
 
 function stopMicrophoneCapture() {
+  state.micStarting = false;
   if (state.micProcessorNode) {
     state.micProcessorNode.onaudioprocess = null;
     try {
@@ -902,6 +967,30 @@ function stopMicrophoneCapture() {
       // Ignore graph teardown errors during reconnect/close.
     }
     state.micSourceNode = null;
+  }
+  if (state.micHighpassNode) {
+    try {
+      state.micHighpassNode.disconnect();
+    } catch {
+      // Ignore graph teardown errors during reconnect/close.
+    }
+    state.micHighpassNode = null;
+  }
+  if (state.micLowpassNode) {
+    try {
+      state.micLowpassNode.disconnect();
+    } catch {
+      // Ignore graph teardown errors during reconnect/close.
+    }
+    state.micLowpassNode = null;
+  }
+  if (state.micCompressorNode) {
+    try {
+      state.micCompressorNode.disconnect();
+    } catch {
+      // Ignore graph teardown errors during reconnect/close.
+    }
+    state.micCompressorNode = null;
   }
   if (state.micSilenceNode) {
     try {
@@ -922,6 +1011,7 @@ function stopMicrophoneCapture() {
     state.micAudioContext = null;
     void micAudioContext.close().catch(() => {});
   }
+  renderMicToggle();
 }
 
 async function playAudioData(audioData) {
@@ -971,6 +1061,20 @@ function send(message) {
 function sendBinary(bytes) {
   if (state.socket?.readyState === WebSocket.OPEN) {
     state.socket.send(bytes);
+  }
+}
+
+function toggleMicrophone() {
+  state.micEnabled = !state.micEnabled;
+  persistCurrentSettings();
+  if (!state.micEnabled) {
+    stopMicrophoneCapture();
+    return;
+  }
+  if (state.socket?.readyState === WebSocket.OPEN) {
+    void startMicrophoneCapture();
+  } else {
+    renderMicToggle();
   }
 }
 
@@ -1875,6 +1979,10 @@ function initControls() {
   }
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
+  micToggle.addEventListener("click", toggleMicrophone);
+  cameraToggle.addEventListener("click", () => {
+    showToast("camera_pending", "Camera uplink is not implemented yet");
+  });
   uploadAction.addEventListener("click", () => uploadInput.click());
   uploadInput.addEventListener("change", () => {
     void uploadSelectedFile();
@@ -2070,6 +2178,7 @@ initControls();
 void removeServiceWorker();
 state.passwd = loadStoredPassword();
 authInput.value = state.passwd;
+renderMicToggle();
 if (state.passwd) {
   clearAuthPrompt();
   void connect();

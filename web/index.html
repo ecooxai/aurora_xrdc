@@ -16,7 +16,24 @@
       </section>
 
       <section class="bottom-dock">
-        <div class="tool-row">
+        <div class="tool-row tool-row-left">
+          <button id="mic-toggle" class="tool-toggle tool-toggle-left" type="button" aria-label="Enable microphone" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path class="mic-off-slash" d="M5 5l14 14" />
+              <rect x="9" y="3.5" width="6" height="10" rx="3" />
+              <path d="M6.5 10.5a5.5 5.5 0 0 0 11 0" />
+              <path d="M12 16v4.5" />
+              <path d="M8.5 20.5h7" />
+            </svg>
+          </button>
+          <button id="camera-toggle" class="tool-toggle tool-toggle-left" type="button" aria-label="Camera coming soon">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3.5" y="6.5" width="13" height="11" rx="2.5" />
+              <path d="M16.5 10l4-2.5v9l-4-2.5" />
+            </svg>
+          </button>
+        </div>
+        <div class="tool-row tool-row-right">
           <details id="control-panel" class="control-panel">
             <summary id="control-trigger" class="tool-toggle control-toggle" aria-label="Controls">
               <svg viewBox="0 0 24 24" aria-hidden="true">
