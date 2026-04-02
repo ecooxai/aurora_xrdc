@@ -76,9 +76,7 @@ mod tests {
 
     #[test]
     fn parses_split_adts_frames() {
-        let frame = [
-            0xff, 0xf1, 0x50, 0x80, 0x01, 0x1f, 0xfc, 0x11,
-        ];
+        let frame = [0xff, 0xf1, 0x50, 0x80, 0x01, 0x1f, 0xfc, 0x11];
         let mut parser = AdtsParser::new();
         assert!(parser.push(&frame[..4]).is_empty());
         let out = parser.push(&frame[4..]);

@@ -1,9 +1,5 @@
 use anyhow::Result;
-use tokio::{
-    io::AsyncReadExt,
-    process::Child,
-    sync::mpsc,
-};
+use tokio::{io::AsyncReadExt, process::Child, sync::mpsc};
 
 use crate::{
     audio::{AdtsParser, AudioFrame},

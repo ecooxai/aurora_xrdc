@@ -1,14 +1,10 @@
 use anyhow::Result;
 use axum::{
-    Router,
-    extract::{
-        Multipart, Query, State,
-        ws::{WebSocketUpgrade},
-    },
+    Json, Router,
+    extract::{Multipart, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,16 +12,15 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::{info, warn};
 use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use crate::{
     clipboard::{
         ClipboardHistoryEntry, ClipboardPayload, ensure_upload_dir, read_clipboard_history,
         read_remote_clipboard, write_clipboard_history, write_remote_clipboard,
     },
-    ffmpeg,
-    session,
+    ffmpeg, session,
     settings::{CodecKind, ServerConfig, StreamConfig},
 };
 
@@ -146,8 +141,14 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/api/auth", get(auth))
         .route("/ws", get(ws))
         .route("/api/upload", post(upload))
-        .route("/api/clipboard/history", get(get_clipboard_history).post(set_clipboard_history))
-        .route("/api/clipboard/remote", get(get_remote_clipboard).post(set_remote_clipboard))
+        .route(
+            "/api/clipboard/history",
+            get(get_clipboard_history).post(set_clipboard_history),
+        )
+        .route(
+            "/api/clipboard/remote",
+            get(get_remote_clipboard).post(set_remote_clipboard),
+        )
         .with_state(Arc::new(AppState {
             server,
             auth: Arc::new(AuthTracker::new()),
@@ -225,14 +226,24 @@ async fn upload(
         .require_passwd(&state.server.passwd, auth.passwd.as_deref())
         .await?;
     let dir = PathBuf::from(&state.server.upload_dir);
-    ensure_upload_dir(&dir)
+    ensure_upload_dir(&dir).await.map_err(internal_error)?;
+    while let Some(field) = multipart
+        .next_field()
         .await
-        .map_err(internal_error)?;
-    while let Some(field) = multipart.next_field().await.map_err(|err| internal_error(err.into()))? {
-        let file_name = field.file_name().map(sanitize_file_name).unwrap_or_else(|| default_upload_name("upload.bin"));
-        let bytes = field.bytes().await.map_err(|err| internal_error(err.into()))?;
+        .map_err(|err| internal_error(err.into()))?
+    {
+        let file_name = field
+            .file_name()
+            .map(sanitize_file_name)
+            .unwrap_or_else(|| default_upload_name("upload.bin"));
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|err| internal_error(err.into()))?;
         let path = unique_upload_path(&dir, &file_name);
-        tokio::fs::write(&path, &bytes).await.map_err(|err| internal_error(err.into()))?;
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|err| internal_error(err.into()))?;
         return Ok(Json(UploadResponse {
             saved_as: path.to_string_lossy().into_owned(),
         }));
@@ -358,7 +369,9 @@ fn unique_upload_path(dir: &Path, file_name: &str) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("upload");
-    let ext = Path::new(file_name).extension().and_then(|value| value.to_str());
+    let ext = Path::new(file_name)
+        .extension()
+        .and_then(|value| value.to_str());
     for index in 1..10_000 {
         let candidate = match ext {
             Some(ext) if !ext.is_empty() => dir.join(format!("{stem}_{index}.{ext}")),
@@ -389,11 +402,17 @@ mod tests {
         let tracker = AuthTracker::new_with_lockout(Duration::from_millis(50));
 
         for _ in 0..19 {
-            let err = tracker.require_passwd("secret", Some("wrong")).await.unwrap_err();
+            let err = tracker
+                .require_passwd("secret", Some("wrong"))
+                .await
+                .unwrap_err();
             assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
         }
 
-        let err = tracker.require_passwd("secret", Some("wrong")).await.unwrap_err();
+        let err = tracker
+            .require_passwd("secret", Some("wrong"))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
         assert!(err.1.contains("locked for 1 hour"));
     }
@@ -408,8 +427,14 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        tracker.require_passwd("secret", Some("secret")).await.unwrap();
-        let err = tracker.require_passwd("secret", Some("wrong")).await.unwrap_err();
+        tracker
+            .require_passwd("secret", Some("secret"))
+            .await
+            .unwrap();
+        let err = tracker
+            .require_passwd("secret", Some("wrong"))
+            .await
+            .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
     }
 }

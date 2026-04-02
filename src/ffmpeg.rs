@@ -1,7 +1,11 @@
 use std::{ffi::OsStr, process::Stdio};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::{io::AsyncReadExt, process::Command, time::{Duration, sleep}};
+use tokio::{
+    io::AsyncReadExt,
+    process::Command,
+    time::{Duration, sleep},
+};
 
 use crate::settings::{CodecKind, ServerConfig, StreamConfig};
 
@@ -115,7 +119,11 @@ pub fn spawn_capture(
             "-pix_fmt",
             "yuv420p",
             "-preset",
-            if encoder.mode == "gpu" { "p1" } else { "ultrafast" },
+            if encoder.mode == "gpu" {
+                "p1"
+            } else {
+                "ultrafast"
+            },
             "-tune",
             "zerolatency",
             "-b:v",
@@ -296,7 +304,17 @@ async fn ensure_pulse_server() -> Result<()> {
     if wait_for_pulse_server().await {
         return Ok(());
     }
-    let _ = run_best_effort("systemctl", &["--user", "start", "pipewire", "pipewire-pulse", "wireplumber"]).await;
+    let _ = run_best_effort(
+        "systemctl",
+        &[
+            "--user",
+            "start",
+            "pipewire",
+            "pipewire-pulse",
+            "wireplumber",
+        ],
+    )
+    .await;
     if wait_for_pulse_server().await {
         return Ok(());
     }
@@ -315,7 +333,9 @@ async fn ensure_pulse_server() -> Result<()> {
     if wait_for_pulse_server().await {
         return Ok(());
     }
-    Err(anyhow!("PulseAudio/PipeWire server is not running and could not be started"))
+    Err(anyhow!(
+        "PulseAudio/PipeWire server is not running and could not be started"
+    ))
 }
 
 async fn wait_for_pulse_server() -> bool {
@@ -330,7 +350,9 @@ async fn wait_for_pulse_server() -> bool {
 
 async fn sink_exists(sink_name: &str) -> Result<bool> {
     let sinks = pactl(["list", "short", "sinks"]).await?;
-    Ok(sinks.lines().any(|line| line.split_whitespace().nth(1) == Some(sink_name)))
+    Ok(sinks
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(sink_name)))
 }
 
 async fn wait_for_sink(sink_name: &str) -> Result<()> {
@@ -344,7 +366,9 @@ async fn wait_for_sink(sink_name: &str) -> Result<()> {
 }
 
 async fn move_sink_inputs(sink_name: &str) -> Result<()> {
-    let sink_inputs = pactl(["list", "short", "sink-inputs"]).await.unwrap_or_default();
+    let sink_inputs = pactl(["list", "short", "sink-inputs"])
+        .await
+        .unwrap_or_default();
     for line in sink_inputs.lines() {
         let Some(input_id) = line.split_whitespace().next() else {
             continue;
@@ -364,7 +388,11 @@ async fn pactl<const N: usize>(args: [&str; N]) -> Result<String> {
         .context("failed to run pactl")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("pactl exited with {}: {}", output.status, stderr.trim()));
+        return Err(anyhow!(
+            "pactl exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
     }
     String::from_utf8(output.stdout).context("pactl output was not utf-8")
 }

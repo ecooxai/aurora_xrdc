@@ -1,11 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::{
-    io::AsyncReadExt,
-    process::Child,
-    sync::mpsc,
-};
+use tokio::{io::AsyncReadExt, process::Child, sync::mpsc};
 
 use crate::{
     annexb::{AnnexBParser, EncodedFrame, IvfParser},

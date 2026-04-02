@@ -208,7 +208,10 @@ fn nal_type(codec: CodecKind, data: &[u8]) -> Option<u8> {
 }
 
 fn is_aud(codec: CodecKind, nal_type: u8) -> bool {
-    matches!((codec, nal_type), (CodecKind::H264, 9) | (CodecKind::H265, 35))
+    matches!(
+        (codec, nal_type),
+        (CodecKind::H264, 9) | (CodecKind::H265, 35)
+    )
 }
 
 fn contains_keyframe(codec: CodecKind, data: &[u8]) -> bool {

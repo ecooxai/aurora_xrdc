@@ -27,7 +27,12 @@ pub async fn read_remote_clipboard(display: &str) -> Result<ClipboardPayload> {
         .unwrap_or_default();
     let has_png = targets.lines().any(|line| line.trim() == "image/png");
     let image_png_b64 = if has_png {
-        match xclip_output_bytes(display, &["-selection", "clipboard", "-t", "image/png", "-o"]).await {
+        match xclip_output_bytes(
+            display,
+            &["-selection", "clipboard", "-t", "image/png", "-o"],
+        )
+        .await
+        {
             Ok(bytes) if !bytes.is_empty() => Some(STANDARD.encode(bytes)),
             _ => None,
         }
@@ -38,7 +43,10 @@ pub async fn read_remote_clipboard(display: &str) -> Result<ClipboardPayload> {
         Ok(text) if !text.trim().is_empty() => Some(text),
         _ => None,
     };
-    Ok(ClipboardPayload { text, image_png_b64 })
+    Ok(ClipboardPayload {
+        text,
+        image_png_b64,
+    })
 }
 
 pub async fn write_remote_clipboard(display: &str, payload: &ClipboardPayload) -> Result<()> {
@@ -46,7 +54,12 @@ pub async fn write_remote_clipboard(display: &str, payload: &ClipboardPayload) -
         let bytes = STANDARD
             .decode(image_png_b64)
             .context("clipboard image was not valid base64")?;
-        xclip_input_bytes(display, &["-selection", "clipboard", "-t", "image/png", "-i"], &bytes).await?;
+        xclip_input_bytes(
+            display,
+            &["-selection", "clipboard", "-t", "image/png", "-i"],
+            &bytes,
+        )
+        .await?;
         return Ok(());
     }
     let text = payload.text.clone().unwrap_or_default();
@@ -64,12 +77,20 @@ pub async fn read_clipboard_history() -> Result<Vec<ClipboardHistoryEntry>> {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("failed to read clipboard history {}", CLIPBOARD_HISTORY_PATH));
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to read clipboard history {}",
+                    CLIPBOARD_HISTORY_PATH
+                )
+            });
         }
     };
-    serde_json::from_slice(&bytes)
-        .with_context(|| format!("failed to parse clipboard history {}", CLIPBOARD_HISTORY_PATH))
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed to parse clipboard history {}",
+            CLIPBOARD_HISTORY_PATH
+        )
+    })
 }
 
 pub async fn write_clipboard_history(entries: &[ClipboardHistoryEntry]) -> Result<()> {
@@ -81,7 +102,12 @@ pub async fn write_clipboard_history(entries: &[ClipboardHistoryEntry]) -> Resul
     let bytes = serde_json::to_vec(&trimmed).context("failed to serialize clipboard history")?;
     fs::write(CLIPBOARD_HISTORY_PATH, bytes)
         .await
-        .with_context(|| format!("failed to write clipboard history {}", CLIPBOARD_HISTORY_PATH))
+        .with_context(|| {
+            format!(
+                "failed to write clipboard history {}",
+                CLIPBOARD_HISTORY_PATH
+            )
+        })
 }
 
 async fn xclip_output(display: &str, args: &[&str]) -> Result<String> {
@@ -100,7 +126,11 @@ async fn xclip_output_bytes(display: &str, args: &[&str]) -> Result<Vec<u8>> {
         .context("failed to run xclip")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("xclip exited with {}: {}", output.status, stderr.trim()));
+        return Err(anyhow!(
+            "xclip exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
     }
     Ok(output.stdout)
 }

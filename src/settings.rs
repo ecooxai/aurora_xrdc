@@ -102,16 +102,12 @@ impl ServerConfig {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "-p" | "--port" => {
-                    let value = args
-                        .next()
-                        .context("missing value for -p/--port")?;
+                    let value = args.next().context("missing value for -p/--port")?;
                     let port = parse_port(&value)?;
                     server.bind = bind_with_port(&server.bind, port);
                 }
                 "--passwd" => {
-                    let value = args
-                        .next()
-                        .context("missing value for --passwd")?;
+                    let value = args.next().context("missing value for --passwd")?;
                     if value.trim().is_empty() {
                         anyhow::bail!("--passwd cannot be empty");
                     }
@@ -120,7 +116,8 @@ impl ServerConfig {
                 _ => {}
             }
         }
-        server.passwd = passwd.context("missing required --passwd; start the server with --passwd <password>")?;
+        server.passwd = passwd
+            .context("missing required --passwd; start the server with --passwd <password>")?;
         Ok(server)
     }
 }
