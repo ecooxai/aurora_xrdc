@@ -1,17 +1,179 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-dbus-launch pulseaudio &
-
 WATCH_DIRS=(src web Cargo.toml)
 DEBOUNCE_SECONDS=5
 REBUILD_RETRY_SECONDS=10
+HEADLESS_DISPLAY_RAW="${VIBE_RDESK_HEADLESS_DISPLAY:-11}"
+XVFB_SCREEN="${VIBE_RDESK_XVFB_SCREEN:-1280x720x24}"
+WINDOW_MANAGER_DELAY_SECONDS=2
+XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
+XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
 APP_PID=""
+XVFB_PID=""
+JWM_PID=""
+XTERM_PID=""
+PULSE_PID=""
+
+normalize_display() {
+    local display="${1:-}"
+    if [[ -z "${display}" ]]; then
+        return 1
+    fi
+
+    if [[ "${display}" == :* ]]; then
+        printf '%s\n' "${display}"
+    else
+        printf ':%s\n' "${display}"
+    fi
+}
+
+is_display_available() {
+    local display="${1:-}"
+    if [[ -z "${display}" ]]; then
+        return 1
+    fi
+
+    if command -v xdpyinfo >/dev/null 2>&1; then
+        xdpyinfo -display "${display}" >/dev/null 2>&1
+        return $?
+    fi
+
+    DISPLAY="${display}" xdotool getmouselocation >/dev/null 2>&1
+}
+
+wait_for_display() {
+    local display="$1"
+    local attempts=20
+
+    while (( attempts > 0 )); do
+        if is_display_available "${display}"; then
+            return 0
+        fi
+        sleep 0.5
+        ((attempts--))
+    done
+
+    return 1
+}
+
+wait_for_process() {
+    local pid="$1"
+    local attempts="${2:-8}"
+
+    while (( attempts > 0 )); do
+        if kill -0 "${pid}" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.5
+        ((attempts--))
+    done
+
+    return 1
+}
+
+start_headless_display() {
+    export DISPLAY
+    DISPLAY="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
+
+    if is_display_available "${DISPLAY}"; then
+        echo "[dev] using existing X server on ${DISPLAY}"
+        return 0
+    fi
+
+    if ! command -v Xvfb >/dev/null 2>&1; then
+        echo "[dev] Xvfb is required for headless startup. Install it first." >&2
+        exit 1
+    fi
+
+    if ! command -v jwm >/dev/null 2>&1; then
+        echo "[dev] jwm is required for headless startup. Install it first." >&2
+        exit 1
+    fi
+
+    if ! command -v xterm >/dev/null 2>&1; then
+        echo "[dev] xterm is required for headless startup. Install it first." >&2
+        exit 1
+    fi
+
+    echo "[dev] starting Xvfb on ${DISPLAY}"
+    Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp >/tmp/vibe_rdesk-xvfb.log 2>&1 &
+    XVFB_PID=$!
+
+    if ! wait_for_display "${DISPLAY}"; then
+        echo "[dev] Xvfb on ${DISPLAY} did not become ready; see /tmp/vibe_rdesk-xvfb.log" >&2
+        exit 1
+    fi
+
+    sleep "${WINDOW_MANAGER_DELAY_SECONDS}"
+
+    echo "[dev] starting jwm on ${DISPLAY}"
+    DISPLAY="${DISPLAY}" jwm >/tmp/vibe_rdesk-jwm.log 2>&1 &
+    JWM_PID=$!
+
+    if ! wait_for_process "${JWM_PID}" 4; then
+        echo "[dev] jwm exited during startup; see /tmp/vibe_rdesk-jwm.log" >&2
+        exit 1
+    fi
+
+    echo "[dev] starting xterm on ${DISPLAY}"
+    DISPLAY="${DISPLAY}" xterm \
+        -display "${DISPLAY}" \
+        -title "vibe_rdesk" \
+        -fa "${XTERM_FONT_FAMILY}" \
+        -fs "${XTERM_FONT_SIZE}" \
+        -geometry 120x30+40+40 \
+        >/tmp/vibe_rdesk-xterm.log 2>&1 &
+    XTERM_PID=$!
+
+    if ! wait_for_process "${XTERM_PID}" 4; then
+        echo "[dev] xterm exited during startup; see /tmp/vibe_rdesk-xterm.log" >&2
+        exit 1
+    fi
+}
+
+ensure_display() {
+    local fallback_display
+    fallback_display="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
+
+    if [[ -n "${DISPLAY:-}" ]]; then
+        if is_display_available "${DISPLAY}"; then
+            echo "[dev] using existing X server on ${DISPLAY}"
+            return 0
+        fi
+
+        echo "[dev] DISPLAY=${DISPLAY} is set but unavailable; falling back to ${fallback_display}"
+    else
+        echo "[dev] DISPLAY is not set; starting headless X11 on ${fallback_display}"
+    fi
+
+    start_headless_display
+}
 
 cleanup() {
     if [[ -n "${APP_PID}" ]] && kill -0 "${APP_PID}" 2>/dev/null; then
         kill "${APP_PID}" 2>/dev/null || true
         wait "${APP_PID}" 2>/dev/null || true
+    fi
+
+    if [[ -n "${XTERM_PID}" ]] && kill -0 "${XTERM_PID}" 2>/dev/null; then
+        kill "${XTERM_PID}" 2>/dev/null || true
+        wait "${XTERM_PID}" 2>/dev/null || true
+    fi
+
+    if [[ -n "${JWM_PID}" ]] && kill -0 "${JWM_PID}" 2>/dev/null; then
+        kill "${JWM_PID}" 2>/dev/null || true
+        wait "${JWM_PID}" 2>/dev/null || true
+    fi
+
+    if [[ -n "${XVFB_PID}" ]] && kill -0 "${XVFB_PID}" 2>/dev/null; then
+        kill "${XVFB_PID}" 2>/dev/null || true
+        wait "${XVFB_PID}" 2>/dev/null || true
+    fi
+
+    if [[ -n "${PULSE_PID}" ]] && kill -0 "${PULSE_PID}" 2>/dev/null; then
+        kill "${PULSE_PID}" 2>/dev/null || true
+        wait "${PULSE_PID}" 2>/dev/null || true
     fi
 }
 
@@ -53,6 +215,10 @@ wait_for_change_polling() {
 }
 
 trap cleanup EXIT INT TERM
+
+ensure_display
+dbus-launch pulseaudio &
+PULSE_PID=$!
 
 build_and_run "$@"
 
