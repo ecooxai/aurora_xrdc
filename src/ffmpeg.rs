@@ -3,7 +3,7 @@ use std::{ffi::OsStr, process::Stdio};
 use anyhow::{Context, Result, anyhow};
 use tokio::{
     io::AsyncReadExt,
-    process::Command,
+    process::{ChildStdin, Command},
     time::{Duration, sleep},
 };
 
@@ -15,6 +15,14 @@ pub struct EncoderChoice {
     pub mode: &'static str,
     pub output_format: &'static str,
 }
+
+pub struct MicInputHandle {
+    pub child: tokio::process::Child,
+    pub stdin: ChildStdin,
+}
+
+const VIRTUAL_MIC_SOURCE_NAME: &str = "Viberdeskmic";
+const VIRTUAL_MIC_SINK_NAME: &str = "vibe_rdesk_virtual_mic_sink";
 
 pub async fn choose_encoder(codec: CodecKind) -> Result<EncoderChoice> {
     let encoders = ffmpeg_list_encoders().await?;
@@ -210,7 +218,59 @@ pub async fn spawn_audio_capture(server: &ServerConfig) -> Result<tokio::process
 }
 
 pub async fn warm_audio_stack() -> Result<()> {
-    ensure_pulse_server().await
+    ensure_pulse_server().await?;
+    ensure_virtual_mic_source().await?;
+    Ok(())
+}
+
+pub async fn spawn_mic_input_injector(
+    server: &ServerConfig,
+    sample_rate: u32,
+    channels: u8,
+) -> Result<MicInputHandle> {
+    ensure_virtual_mic_source().await?;
+    let mut cmd = Command::new("ffmpeg");
+    let input_sample_rate = sample_rate.max(8_000).to_string();
+    let input_channels = channels.clamp(1, 2).to_string();
+    cmd.env("DISPLAY", &server.display)
+        .args([
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            &input_sample_rate,
+            "-ac",
+            &input_channels,
+            "-i",
+            "pipe:0",
+            "-vn",
+            "-sn",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "pulse",
+            "-device",
+            VIRTUAL_MIC_SINK_NAME,
+            "-stream_name",
+            "VibeRDesk Mic Input",
+            "vibe_rdesk_mic_input",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn ffmpeg microphone injector")?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg microphone injector stdin missing"))?;
+    Ok(MicInputHandle { child, stdin })
 }
 
 async fn ffmpeg_list_encoders() -> Result<String> {
@@ -300,6 +360,35 @@ async fn ensure_virtual_sink(server: &ServerConfig) -> Result<String> {
     Ok(format!("{sink_name}.monitor"))
 }
 
+async fn ensure_virtual_mic_source() -> Result<String> {
+    let _ = ensure_pulse_server().await;
+    if source_exists(VIRTUAL_MIC_SOURCE_NAME).await? {
+        return Ok(VIRTUAL_MIC_SOURCE_NAME.into());
+    }
+    if !sink_exists(VIRTUAL_MIC_SINK_NAME).await? {
+        pactl([
+            "load-module",
+            "module-null-sink",
+            &format!("sink_name={VIRTUAL_MIC_SINK_NAME}"),
+            "sink_properties=device.description=VibeRDeskVirtualMicSink",
+        ])
+        .await?;
+        wait_for_sink(VIRTUAL_MIC_SINK_NAME).await?;
+    }
+    if !source_exists(VIRTUAL_MIC_SOURCE_NAME).await? {
+        pactl([
+            "load-module",
+            "module-remap-source",
+            &format!("source_name={VIRTUAL_MIC_SOURCE_NAME}"),
+            &format!("master={VIRTUAL_MIC_SINK_NAME}.monitor"),
+            &format!("source_properties=device.description={VIRTUAL_MIC_SOURCE_NAME}"),
+        ])
+        .await?;
+        wait_for_source(VIRTUAL_MIC_SOURCE_NAME).await?;
+    }
+    Ok(VIRTUAL_MIC_SOURCE_NAME.into())
+}
+
 async fn ensure_pulse_server() -> Result<()> {
     if wait_for_pulse_server().await {
         return Ok(());
@@ -355,6 +444,13 @@ async fn sink_exists(sink_name: &str) -> Result<bool> {
         .any(|line| line.split_whitespace().nth(1) == Some(sink_name)))
 }
 
+async fn source_exists(source_name: &str) -> Result<bool> {
+    let sources = pactl(["list", "short", "sources"]).await?;
+    Ok(sources
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(source_name)))
+}
+
 async fn wait_for_sink(sink_name: &str) -> Result<()> {
     for _ in 0..10 {
         if sink_exists(sink_name).await? {
@@ -363,6 +459,16 @@ async fn wait_for_sink(sink_name: &str) -> Result<()> {
         sleep(Duration::from_millis(150)).await;
     }
     Err(anyhow!("virtual sink {sink_name} did not appear"))
+}
+
+async fn wait_for_source(source_name: &str) -> Result<()> {
+    for _ in 0..10 {
+        if source_exists(source_name).await? {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+    Err(anyhow!("virtual source {source_name} did not appear"))
 }
 
 async fn move_sink_inputs(sink_name: &str) -> Result<()> {

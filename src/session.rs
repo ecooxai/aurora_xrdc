@@ -8,6 +8,7 @@ use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::StreamExt;
 use tokio::{
+    io::AsyncWriteExt,
     process::Child,
     sync::{Mutex, mpsc},
 };
@@ -17,7 +18,7 @@ use crate::{
     audio::AudioFrame,
     audio_streamer,
     clipboard::{read_remote_clipboard, write_remote_clipboard},
-    ffmpeg::{read_stderr, run_xdotool},
+    ffmpeg::{MicInputHandle, read_stderr, run_xdotool, spawn_mic_input_injector},
     messages::{ClientMessage, ServerMessage},
     settings::{ServerConfig, StreamConfig},
     streamer::{StreamFrame, start},
@@ -91,11 +92,7 @@ pub async fn handle_socket(
     ));
     let audio_task =
         audio_stream.map(|stream| tokio::spawn(forward_audio(out_tx.clone(), stream.rx)));
-    let recv_task = tokio::spawn(handle_client(
-        receiver,
-        out_tx.clone(),
-        server.display.clone(),
-    ));
+    let recv_task = tokio::spawn(handle_client(receiver, out_tx.clone(), server.clone()));
     let _ = tokio::try_join!(send_task, recv_task);
     stats_task.abort();
     if let Some(task) = audio_task {
@@ -198,22 +195,28 @@ fn spawn_stats(
 async fn handle_client(
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
     sender: mpsc::Sender<Message>,
-    display: String,
+    server: ServerConfig,
 ) -> Result<()> {
     let mut pressed_keys = HashSet::new();
+    let mut mic_input = MicInputState::Idle;
     while let Some(message) = receiver.next().await {
         match message? {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                 Ok(client) => {
-                    apply_client_message(&display, &sender, client, &mut pressed_keys).await?
+                    apply_client_message(&server.display, &sender, client, &mut pressed_keys)
+                        .await?
                 }
                 Err(err) => warn!("invalid client message: {err}"),
             },
+            Message::Binary(bytes) => {
+                forward_client_binary(&server, &sender, bytes.as_ref(), &mut mic_input).await;
+            }
             Message::Close(_) => break,
             _ => {}
         }
     }
-    reset_input_state(&display, &mut pressed_keys).await?;
+    reset_input_state(&server.display, &mut pressed_keys).await?;
+    shutdown_mic_input(&mut mic_input).await;
     Ok(())
 }
 
@@ -407,4 +410,126 @@ fn current_ms() -> u64 {
 
 fn rand_id() -> u64 {
     current_ms() ^ Instant::now().elapsed().as_nanos() as u64
+}
+
+enum MicInputState {
+    Idle,
+    Active {
+        handle: MicInputHandle,
+        sample_rate: u32,
+        channels: u8,
+    },
+    Failed,
+}
+
+async fn forward_client_binary(
+    server: &ServerConfig,
+    sender: &mpsc::Sender<Message>,
+    bytes: &[u8],
+    mic_input: &mut MicInputState,
+) {
+    let Some((&kind, payload)) = bytes.split_first() else {
+        return;
+    };
+    if kind != 3 || payload.len() <= 5 {
+        return;
+    }
+    let sample_rate = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let channels = payload[4].clamp(1, 2);
+    let pcm = &payload[5..];
+    if pcm.is_empty() || pcm.len() % 2 != 0 {
+        return;
+    }
+
+    if matches!(mic_input, MicInputState::Failed) {
+        return;
+    }
+
+    if let MicInputState::Active {
+        handle,
+        sample_rate: active_sample_rate,
+        channels: active_channels,
+    } = mic_input
+    {
+        if *active_sample_rate != sample_rate || *active_channels != channels {
+            let _ = handle.stdin.shutdown().await;
+            if let Err(err) = shutdown_mic_child(&mut handle.child).await {
+                warn!("mic injector restart shutdown failed: {err}");
+            }
+            *mic_input = MicInputState::Idle;
+        }
+    }
+
+    if matches!(mic_input, MicInputState::Idle) {
+        match spawn_mic_input_injector(server, sample_rate, channels).await {
+            Ok(handle) => {
+                *mic_input = MicInputState::Active {
+                    handle,
+                    sample_rate,
+                    channels,
+                }
+            }
+            Err(err) => {
+                warn!("mic injector startup failed: {err}");
+                send_runtime_error(
+                    sender,
+                    "mic_unavailable",
+                    format!("Microphone uplink is unavailable on the server: {err}"),
+                )
+                .await;
+                *mic_input = MicInputState::Failed;
+                return;
+            }
+        }
+    }
+
+    let MicInputState::Active { handle, .. } = mic_input else {
+        return;
+    };
+
+    if let Err(err) = handle.stdin.write_all(pcm).await {
+        warn!("mic injector write failed: {err}");
+        send_runtime_error(
+            sender,
+            "mic_uplink_failed",
+            "Microphone uplink stopped on the server.".into(),
+        )
+        .await;
+        if let Err(stop_err) = shutdown_mic_child(&mut handle.child).await {
+            warn!("mic injector shutdown failed: {stop_err}");
+        }
+        *mic_input = MicInputState::Failed;
+    }
+}
+
+async fn shutdown_mic_input(mic_input: &mut MicInputState) {
+    if let MicInputState::Active { handle, .. } = mic_input {
+        let _ = handle.stdin.shutdown().await;
+        if let Err(err) = shutdown_mic_child(&mut handle.child).await {
+            warn!("mic injector shutdown failed: {err}");
+        }
+    }
+    *mic_input = MicInputState::Idle;
+}
+
+async fn shutdown_mic_child(child: &mut Child) -> Result<()> {
+    if let Err(err) = child.kill().await {
+        warn!("mic ffmpeg kill failed: {err}");
+    }
+    let stderr = read_stderr(child).await;
+    if !stderr.trim().is_empty() {
+        warn!("mic ffmpeg stderr: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+async fn send_runtime_error(sender: &mpsc::Sender<Message>, code: &'static str, message: String) {
+    let payload = match serde_json::to_string(&ServerMessage::Error { code, message }) {
+        Ok(payload) => payload,
+        Err(err) => {
+            warn!("failed to serialize runtime error: {err}");
+            return;
+        }
+    };
+    let _ = sender.send(Message::Text(payload.into())).await;
 }

@@ -15,6 +15,11 @@ const state = {
   audioDecoder: null,
   audioContext: null,
   audioSources: new Set(),
+  micAudioContext: null,
+  micStream: null,
+  micSourceNode: null,
+  micProcessorNode: null,
+  micSilenceNode: null,
   activeCodec: "h264",
   codecString: "avc1.64001f",
   description: null,
@@ -111,6 +116,11 @@ const AAC_SAMPLE_RATES = [
 const AUDIO_TARGET_LEAD_SECONDS = 0.02;
 const AUDIO_MAX_QUEUE_SECONDS = 0.2;
 const AUDIO_RESET_GRACE_SECONDS = 0.05;
+const MIC_CHUNK_KIND = 3;
+const MIC_SAMPLE_RATE_HEADER_BYTES = 4;
+const MIC_CHANNEL_HEADER_BYTES = 1;
+const MIC_HEADER_BYTES = 1 + MIC_SAMPLE_RATE_HEADER_BYTES + MIC_CHANNEL_HEADER_BYTES;
+const MIC_BUFFER_SIZE = 2048;
 const MOBILE_KEYBOARD_SPECIAL_KEYS = new Set([
   "Backspace",
   "Delete",
@@ -481,6 +491,7 @@ async function connect() {
       startPing();
       startRemoteClipboardPolling();
       void refreshLocalClipboard();
+      void startMicrophoneCapture();
     };
     state.socket.onclose = () => {
       setStatus("Disconnected");
@@ -515,6 +526,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
     renderLatencyMetric();
   }
   stopRemoteClipboardPolling();
+  stopMicrophoneCapture();
   state.decoder?.close();
   state.decoder = null;
   state.audioDecoder?.close();
@@ -814,6 +826,104 @@ async function primeAudioPlayback() {
   }
 }
 
+async function startMicrophoneCapture() {
+  if (!navigator.mediaDevices?.getUserMedia) return;
+  if (state.micProcessorNode) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    if (state.socket?.readyState !== WebSocket.OPEN) {
+      for (const track of stream.getTracks()) {
+        track.stop();
+      }
+      return;
+    }
+    stopMicrophoneCapture();
+    const audioContext = new AudioContext({
+      latencyHint: "interactive",
+      sampleRate: 48000,
+    });
+    const sourceNode = audioContext.createMediaStreamSource(stream);
+    const processorNode = audioContext.createScriptProcessor(MIC_BUFFER_SIZE, 1, 1);
+    const silenceNode = audioContext.createGain();
+    silenceNode.gain.value = 0;
+    processorNode.onaudioprocess = (event) => {
+      if (state.socket?.readyState !== WebSocket.OPEN) return;
+      const input = event.inputBuffer.getChannelData(0);
+      const payload = new Uint8Array(input.length * 2);
+      const view = new DataView(payload.buffer);
+      for (let i = 0; i < input.length; i += 1) {
+        const sample = Math.max(-1, Math.min(1, input[i]));
+        const pcm = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+        view.setInt16(i * 2, pcm, true);
+      }
+      const message = new Uint8Array(MIC_HEADER_BYTES + payload.byteLength);
+      const header = new DataView(message.buffer);
+      header.setUint8(0, MIC_CHUNK_KIND);
+      header.setUint32(1, audioContext.sampleRate, true);
+      header.setUint8(5, 1);
+      message.set(payload, MIC_HEADER_BYTES);
+      sendBinary(message);
+    };
+    sourceNode.connect(processorNode);
+    processorNode.connect(silenceNode);
+    silenceNode.connect(audioContext.destination);
+    await audioContext.resume();
+    state.micAudioContext = audioContext;
+    state.micStream = stream;
+    state.micSourceNode = sourceNode;
+    state.micProcessorNode = processorNode;
+    state.micSilenceNode = silenceNode;
+  } catch (error) {
+    showToast("mic_access_failed", error.message || String(error));
+  }
+}
+
+function stopMicrophoneCapture() {
+  if (state.micProcessorNode) {
+    state.micProcessorNode.onaudioprocess = null;
+    try {
+      state.micProcessorNode.disconnect();
+    } catch {
+      // Ignore graph teardown errors during reconnect/close.
+    }
+    state.micProcessorNode = null;
+  }
+  if (state.micSourceNode) {
+    try {
+      state.micSourceNode.disconnect();
+    } catch {
+      // Ignore graph teardown errors during reconnect/close.
+    }
+    state.micSourceNode = null;
+  }
+  if (state.micSilenceNode) {
+    try {
+      state.micSilenceNode.disconnect();
+    } catch {
+      // Ignore graph teardown errors during reconnect/close.
+    }
+    state.micSilenceNode = null;
+  }
+  if (state.micStream) {
+    for (const track of state.micStream.getTracks()) {
+      track.stop();
+    }
+    state.micStream = null;
+  }
+  if (state.micAudioContext) {
+    const micAudioContext = state.micAudioContext;
+    state.micAudioContext = null;
+    void micAudioContext.close().catch(() => {});
+  }
+}
+
 async function playAudioData(audioData) {
   const audioContext = await ensureAudioContext().catch(() => null);
   if (!audioContext) {
@@ -855,6 +965,12 @@ async function playAudioData(audioData) {
 function send(message) {
   if (state.socket?.readyState === WebSocket.OPEN) {
     state.socket.send(JSON.stringify(message));
+  }
+}
+
+function sendBinary(bytes) {
+  if (state.socket?.readyState === WebSocket.OPEN) {
+    state.socket.send(bytes);
   }
 }
 

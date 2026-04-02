@@ -9,6 +9,8 @@ XVFB_SCREEN="${VIBE_RDESK_XVFB_SCREEN:-1280x720x24}"
 WINDOW_MANAGER_DELAY_SECONDS=2
 XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
 XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
+VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
+VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
 APP_PID=""
 XVFB_PID=""
 JWM_PID=""
@@ -70,6 +72,87 @@ wait_for_process() {
     done
 
     return 1
+}
+
+source_exists() {
+    local source_name="${1:-}"
+    if [[ -z "${source_name}" ]]; then
+        return 1
+    fi
+
+    pactl list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "${source_name}"
+}
+
+sink_exists() {
+    local sink_name="${1:-}"
+    if [[ -z "${sink_name}" ]]; then
+        return 1
+    fi
+
+    pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "${sink_name}"
+}
+
+wait_for_source() {
+    local source_name="$1"
+    local attempts=10
+
+    while (( attempts > 0 )); do
+        if source_exists "${source_name}"; then
+            return 0
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
+}
+
+wait_for_pulse_server() {
+    local attempts=20
+
+    while (( attempts > 0 )); do
+        if pactl info >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
+}
+
+ensure_virtual_mic() {
+    if ! command -v pactl >/dev/null 2>&1; then
+        echo "[dev] pactl is required to provision the virtual microphone" >&2
+        return 1
+    fi
+
+    if source_exists "${VIRTUAL_MIC_SOURCE_NAME}"; then
+        echo "[dev] using existing virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
+        return 0
+    fi
+
+    if ! sink_exists "${VIRTUAL_MIC_SINK_NAME}"; then
+        echo "[dev] creating virtual mic sink ${VIRTUAL_MIC_SINK_NAME}"
+        pactl load-module \
+            module-null-sink \
+            "sink_name=${VIRTUAL_MIC_SINK_NAME}" \
+            "sink_properties=device.description=VibeRDeskVirtualMicSink" \
+            >/dev/null
+    fi
+
+    echo "[dev] creating virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
+    pactl load-module \
+        module-remap-source \
+        "source_name=${VIRTUAL_MIC_SOURCE_NAME}" \
+        "master=${VIRTUAL_MIC_SINK_NAME}.monitor" \
+        "source_properties=device.description=${VIRTUAL_MIC_SOURCE_NAME}" \
+        >/dev/null
+
+    if ! wait_for_source "${VIRTUAL_MIC_SOURCE_NAME}"; then
+        echo "[dev] virtual mic source ${VIRTUAL_MIC_SOURCE_NAME} did not appear" >&2
+        return 1
+    fi
 }
 
 start_headless_display() {
@@ -219,6 +302,8 @@ trap cleanup EXIT INT TERM
 ensure_display
 dbus-launch pulseaudio &
 PULSE_PID=$!
+wait_for_pulse_server
+ensure_virtual_mic
 
 build_and_run "$@"
 
