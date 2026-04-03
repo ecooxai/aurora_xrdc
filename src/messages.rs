@@ -30,6 +30,7 @@ pub enum ServerMessage {
         swap_used_mb: u64,
         swap_total_mb: u64,
         net_tx_kbps: f32,
+        net_rx_kbps: f32,
     },
     Pong {
         seq: u64,

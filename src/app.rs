@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::{
+    camera::CameraRelay,
     clipboard::{
         ClipboardHistoryEntry, ClipboardPayload, ensure_upload_dir, read_clipboard_history,
         read_remote_clipboard, write_clipboard_history, write_remote_clipboard,
@@ -32,6 +33,7 @@ const APP_CSS: &str = include_str!("../web/app.css");
 struct AppState {
     server: ServerConfig,
     auth: Arc<AuthTracker>,
+    camera: CameraRelay,
 }
 
 #[derive(Debug)]
@@ -128,8 +130,14 @@ struct WsQuery {
     passwd: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CameraStopRequest {
+    session_id: String,
+}
+
 pub async fn run(server: ServerConfig) -> Result<()> {
     let bind = server.bind.clone();
+    let camera = CameraRelay::new(PathBuf::from(&server.upload_dir));
     if let Err(err) = ffmpeg::warm_audio_stack().await {
         warn!("audio bootstrap failed during startup: {err}");
     }
@@ -141,6 +149,8 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/api/auth", get(auth))
         .route("/ws", get(ws))
         .route("/api/upload", post(upload))
+        .route("/api/camera/chunk", post(upload_camera_chunk))
+        .route("/api/camera/stop", post(stop_camera))
         .route(
             "/api/clipboard/history",
             get(get_clipboard_history).post(set_clipboard_history),
@@ -152,6 +162,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .with_state(Arc::new(AppState {
             server,
             auth: Arc::new(AuthTracker::new()),
+            camera,
         }));
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("listening on http://{bind}");
@@ -216,6 +227,17 @@ struct UploadResponse {
     saved_as: String,
 }
 
+#[derive(Debug, Serialize)]
+struct CameraChunkResponse {
+    device: String,
+    queued_chunks: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct CameraStopResponse {
+    stopped: bool,
+}
+
 async fn upload(
     Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
@@ -249,6 +271,92 @@ async fn upload(
         }));
     }
     Err((StatusCode::BAD_REQUEST, "missing file field".into()))
+}
+
+async fn upload_camera_chunk(
+    Query(auth): Query<AuthQuery>,
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> Result<Json<CameraChunkResponse>, (StatusCode, String)> {
+    state
+        .auth
+        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .await?;
+
+    let mut session_id = None;
+    let mut seq = None;
+    let mut file_bytes = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|err| internal_error(err.into()))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        match name.as_str() {
+            "session_id" => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|err| internal_error(err.into()))?;
+                if !value.trim().is_empty() {
+                    session_id = Some(value);
+                }
+            }
+            "seq" => {
+                let value = field
+                    .text()
+                    .await
+                    .map_err(|err| internal_error(err.into()))?;
+                seq = value.trim().parse::<u64>().ok();
+            }
+            "file" => {
+                file_bytes = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|err| internal_error(err.into()))?
+                        .to_vec(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let session_id =
+        session_id.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing session_id".into()))?;
+    let seq = seq.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing seq".into()))?;
+    let bytes = file_bytes.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing file".into()))?;
+
+    let status = state
+        .camera
+        .enqueue_mp4_chunk(&session_id, seq, bytes)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(CameraChunkResponse {
+        device: status.device,
+        queued_chunks: status.queued_chunks,
+    }))
+}
+
+async fn stop_camera(
+    Query(auth): Query<AuthQuery>,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CameraStopRequest>,
+) -> Result<Json<CameraStopResponse>, (StatusCode, String)> {
+    state
+        .auth
+        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .await?;
+
+    state
+        .camera
+        .stop_session(&request.session_id)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(CameraStopResponse { stopped: true }))
 }
 
 async fn get_remote_clipboard(

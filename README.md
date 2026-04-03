@@ -8,6 +8,7 @@
 - Best-effort H.265 and VP8 streaming.
 - Browser-side pointer, click, wheel, and keyboard input.
 - Remote and local clipboard sync.
+- Browser camera uplink as MP4 chunks, replayed into a server-side virtual camera named `viberdeskcamera`.
 - Browser debug overlay with latency, FPS, codec, encoder mode, CPU, memory, and network stats.
 - Service worker caching for the web client.
 
@@ -18,6 +19,7 @@
 - `xdotool` installed and available on `PATH`.
 - An X11 session on the host machine.
 - A server password passed at startup.
+- `v4l2loopback` installed on the server host if you want camera uplink.
 
 ## Run
 
@@ -39,6 +41,12 @@ The server listens on `0.0.0.0:8001` by default.
 - `VIBE_RDESK_BIND`: bind address, defaults to `0.0.0.0:8001`.
 - `DISPLAY`: X11 display, defaults to `:0.0`.
 - `VIBE_RDESK_UPLOAD_DIR`: upload directory, defaults to `~/Desktop`. A leading `~/` is expanded against the server user's home directory.
+
+## Camera Uplink
+
+The camera toggle records browser camera plus microphone into 1-second MP4 chunks and uploads them to the server. The server checks for an existing virtual camera named `viberdeskcamera`, creates it with `modprobe v4l2loopback ...` when needed, then replays the uploaded MP4 video into that device with FFmpeg.
+
+If the host cannot create `/dev/video*` automatically, install `v4l2loopback` and ensure the server process has permission to run `modprobe`.
 
 ## Browser UI
 

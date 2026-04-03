@@ -176,6 +176,7 @@ fn spawn_stats(
                 swap_used_mb: sample.swap_used_mb,
                 swap_total_mb: sample.swap_total_mb,
                 net_tx_kbps: sample.net_tx_kbps,
+                net_rx_kbps: sample.net_rx_kbps,
             };
             match serde_json::to_string(&msg) {
                 Ok(text) => {

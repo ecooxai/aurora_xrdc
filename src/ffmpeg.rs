@@ -1,4 +1,8 @@
-use std::{ffi::OsStr, process::Stdio};
+use std::{
+    ffi::OsStr,
+    path::Path,
+    process::Stdio,
+};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::{
@@ -23,6 +27,8 @@ pub struct MicInputHandle {
 
 const VIRTUAL_MIC_SOURCE_NAME: &str = "Viberdeskmic";
 const VIRTUAL_MIC_SINK_NAME: &str = "vibe_rdesk_virtual_mic_sink";
+const VIRTUAL_CAMERA_LABEL: &str = "viberdeskcamera";
+const VIRTUAL_CAMERA_NR: &str = "42";
 
 pub async fn choose_encoder(codec: CodecKind) -> Result<EncoderChoice> {
     let encoders = ffmpeg_list_encoders().await?;
@@ -223,6 +229,74 @@ pub async fn warm_audio_stack() -> Result<()> {
     Ok(())
 }
 
+pub async fn ensure_virtual_camera_device() -> Result<String> {
+    if let Some(device) = find_virtual_camera_device()? {
+        return Ok(device);
+    }
+
+    let output = Command::new("modprobe")
+        .args([
+            "v4l2loopback",
+            "devices=1",
+            "exclusive_caps=1",
+            &format!("card_label={VIRTUAL_CAMERA_LABEL}"),
+            &format!("video_nr={VIRTUAL_CAMERA_NR}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to run modprobe for v4l2loopback")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "failed to create virtual camera {VIRTUAL_CAMERA_LABEL}: {}",
+            stderr.trim()
+        ));
+    }
+
+    wait_for_virtual_camera_device().await
+}
+
+pub async fn replay_mp4_to_virtual_camera(path: &Path, device: &str) -> Result<()> {
+    let output = Command::new("ffmpeg")
+        .args([
+            "-loglevel",
+            "error",
+            "-re",
+            "-i",
+        ])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "v4l2",
+            device,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("failed to relay {} into {device}", path.display()))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "ffmpeg virtual camera relay exited with {}: {}",
+        output.status,
+        stderr.trim()
+    ))
+}
+
 pub async fn spawn_mic_input_injector(
     server: &ServerConfig,
     sample_rate: u32,
@@ -337,6 +411,38 @@ async fn ensure_pulse_monitor_source(server: &ServerConfig) -> Result<String> {
         return Ok(source);
     }
     ensure_virtual_sink(server).await
+}
+
+fn find_virtual_camera_device() -> Result<Option<String>> {
+    let dir = match std::fs::read_dir("/sys/class/video4linux") {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect /sys/class/video4linux"),
+    };
+
+    for entry in dir {
+        let entry = entry.context("failed to read video4linux entry")?;
+        let name = std::fs::read_to_string(entry.path().join("name")).unwrap_or_default();
+        if name.trim() != VIRTUAL_CAMERA_LABEL {
+            continue;
+        }
+        let device_name = entry.file_name();
+        return Ok(Some(format!("/dev/{}", device_name.to_string_lossy())));
+    }
+
+    Ok(None)
+}
+
+async fn wait_for_virtual_camera_device() -> Result<String> {
+    for _ in 0..20 {
+        if let Some(device) = find_virtual_camera_device()? {
+            return Ok(device);
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+    Err(anyhow!(
+        "virtual camera {VIRTUAL_CAMERA_LABEL} did not appear; ensure v4l2loopback is installed"
+    ))
 }
 
 async fn default_monitor_source() -> Result<Option<String>> {

@@ -25,6 +25,13 @@ const state = {
   micSilenceNode: null,
   micEnabled: false,
   micStarting: false,
+  cameraRecorder: null,
+  cameraStream: null,
+  cameraEnabled: false,
+  cameraStarting: false,
+  cameraUploadTail: Promise.resolve(),
+  cameraSeq: 0,
+  sessionId: "",
   activeCodec: "h264",
   codecString: "avc1.64001f",
   description: null,
@@ -92,6 +99,8 @@ const fpsInput = $("fps");
 const fpsValue = $("fps-value");
 const scrollSpeedInput = $("scroll-speed");
 const scrollSpeedValue = $("scroll-speed-value");
+const audioLatencyInput = $("audio-latency");
+const audioLatencyValue = $("audio-latency-value");
 const touchModeSelect = $("touch-mode");
 const directTouchScrollInput = $("direct-touch-scroll");
 const directTouchScrollLabel = $("direct-touch-scroll-label");
@@ -103,7 +112,8 @@ const statusCpu = $("status-cpu");
 const statusRam = $("status-ram");
 const statusSwap = $("status-swap");
 const statusLatency = $("status-latency");
-const statusSpeed = $("status-speed");
+const statusSpeedDownload = $("status-speed-download");
+const statusSpeedUpload = $("status-speed-upload");
 const statusUpdatedAt = $("status-updated-at");
 const localClipboardSyncBtn = $("local-clipboard-sync-btn");
 const remoteClipboardSyncBtn = $("remote-clipboard-sync-btn");
@@ -120,9 +130,12 @@ const AAC_SAMPLE_RATES = [
   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
   16000, 12000, 11025, 8000, 7350,
 ];
-const AUDIO_TARGET_LEAD_SECONDS = 0.02;
-const AUDIO_MAX_QUEUE_SECONDS = 0.2;
-const AUDIO_RESET_GRACE_SECONDS = 0.05;
+const AUDIO_BUFFER_PROFILES = [
+  { minLatencyMs: 200, targetLeadSeconds: 0.32, maxQueueSeconds: 0.6, resetGraceSeconds: 0.1 },
+  { minLatencyMs: 100, targetLeadSeconds: 0.2, maxQueueSeconds: 0.42, resetGraceSeconds: 0.08 },
+  { minLatencyMs: 50, targetLeadSeconds: 0.12, maxQueueSeconds: 0.28, resetGraceSeconds: 0.07 },
+  { minLatencyMs: 0, targetLeadSeconds: 0.05, maxQueueSeconds: 0.16, resetGraceSeconds: 0.05 },
+];
 const MIC_CHUNK_KIND = 3;
 const MIC_SAMPLE_RATE_HEADER_BYTES = 4;
 const MIC_CHANNEL_HEADER_BYTES = 1;
@@ -131,6 +144,12 @@ const MIC_BUFFER_SIZE = 512;
 const MIC_NOISE_FLOOR = 0.008;
 const MIC_GATE_ATTACK = 0.35;
 const MIC_GATE_RELEASE = 0.985;
+const CAMERA_CHUNK_MS = 1000;
+const CAMERA_MIME_CANDIDATES = [
+  "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
+  "video/mp4;codecs=avc1,mp4a.40.2",
+  "video/mp4",
+];
 const MOBILE_KEYBOARD_SPECIAL_KEYS = new Set([
   "Backspace",
   "Delete",
@@ -184,12 +203,14 @@ function renderStatusMetrics({
   swap_used_mb,
   swap_total_mb,
   net_tx_kbps,
+  net_rx_kbps,
 } = {}) {
   statusCpu.textContent = formatPercent(cpu_usage);
   statusRam.textContent = formatMemoryUsage(memory_used_mb, memory_total_mb);
   statusSwap.textContent = formatMemoryUsage(swap_used_mb, swap_total_mb);
   renderLatencyMetric();
-  statusSpeed.textContent = formatMbPerSecond(net_tx_kbps);
+  statusSpeedDownload.textContent = `Down ${formatMbPerSecond(net_rx_kbps)}`;
+  statusSpeedUpload.textContent = `Up ${formatMbPerSecond(net_tx_kbps)}`;
   statusUpdatedAt.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
 }
 
@@ -261,6 +282,7 @@ function adjustZoom(deltaPercent) {
   }
   state.viewZoomPercent = nextZoom;
   applyCanvasZoom();
+  saveSettings();
 }
 
 function setActiveTab(tabName) {
@@ -331,6 +353,8 @@ function normalizeSettings(settings = {}) {
     touchMode: allowedTouchModes.has(settings.touchMode) ? settings.touchMode : touchModeSelect.value,
     directTouchScroll: settings.directTouchScroll === true,
     micEnabled: settings.micEnabled === true,
+    audioLatencyMs: clampControlValue(audioLatencyInput, settings.audioLatencyMs, Number(audioLatencyInput.value)),
+    viewZoomPercent: clampZoomPercent(settings.viewZoomPercent),
   };
 }
 
@@ -340,9 +364,11 @@ function readSettingsFromControls() {
     bitrate: bitrateInput.value,
     fps: fpsInput.value,
     scrollSpeed: scrollSpeedInput.value,
+    audioLatencyMs: audioLatencyInput.value,
     touchMode: touchModeSelect.value,
     directTouchScroll: directTouchScrollInput.checked,
     micEnabled: state.micEnabled,
+    viewZoomPercent: state.viewZoomPercent,
   });
 }
 
@@ -368,6 +394,7 @@ function renderSettingsValues(settings = readSettingsFromControls()) {
   bitrateValue.textContent = `${settings.bitrate} kbps`;
   fpsValue.textContent = `${settings.fps} fps`;
   scrollSpeedValue.textContent = `${settings.scrollSpeed} / 10`;
+  audioLatencyValue.textContent = `${settings.audioLatencyMs} ms`;
 }
 
 function syncTouchModeControls(settings = readSettingsFromControls()) {
@@ -383,18 +410,28 @@ function renderMicToggle() {
   micToggle.setAttribute("aria-label", state.micEnabled ? "Disable microphone" : "Enable microphone");
 }
 
+function renderCameraToggle() {
+  cameraToggle.classList.toggle("is-active", state.cameraEnabled);
+  cameraToggle.classList.toggle("is-pending", state.cameraStarting);
+  cameraToggle.setAttribute("aria-pressed", state.cameraEnabled ? "true" : "false");
+  cameraToggle.setAttribute("aria-label", state.cameraEnabled ? "Disable camera uplink" : "Enable camera uplink");
+}
+
 function applySettings(settings) {
   const normalized = normalizeSettings(settings);
   codecSelect.value = normalized.codec;
   bitrateInput.value = String(normalized.bitrate);
   fpsInput.value = String(normalized.fps);
   scrollSpeedInput.value = String(normalized.scrollSpeed);
+  audioLatencyInput.value = String(normalized.audioLatencyMs);
   touchModeSelect.value = normalized.touchMode;
   directTouchScrollInput.checked = normalized.directTouchScroll;
   state.micEnabled = normalized.micEnabled;
+  state.viewZoomPercent = normalized.viewZoomPercent;
   renderSettingsValues(normalized);
   syncTouchModeControls(normalized);
   renderMicToggle();
+  applyCanvasZoom();
 }
 
 function persistCurrentSettings() {
@@ -550,6 +587,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   }
   stopRemoteClipboardPolling();
   stopMicrophoneCapture();
+  void stopCameraCapture({ notifyServer: true, keepEnabled: false });
   state.decoder?.close();
   state.decoder = null;
   state.audioDecoder?.close();
@@ -558,6 +596,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.decoderConfigKey = "";
   state.audioConfigKey = "";
   state.audioEnabled = false;
+  state.sessionId = "";
   state.waitingForKeyframe = true;
   state.netWindowBytes = 0;
   state.netKbps = 0;
@@ -628,6 +667,9 @@ function scheduleReconnect() {
 
 function handleServerMessage(message) {
   if (message.type === "hello") {
+    if (message.session_id) {
+      state.sessionId = message.session_id;
+    }
     if (message.codec_string) {
       state.codecString = message.codec_string;
     }
@@ -830,6 +872,23 @@ function resetAudioPlayback() {
   state.audioNextTime = 0;
 }
 
+function currentAudioBufferProfile() {
+  const latencyMs = Number.isFinite(state.wsLatencyMs) ? state.wsLatencyMs : 0;
+  const profile = AUDIO_BUFFER_PROFILES.find((entry) => latencyMs >= entry.minLatencyMs)
+    || AUDIO_BUFFER_PROFILES[AUDIO_BUFFER_PROFILES.length - 1];
+  const extraLatencyMs = clampControlValue(
+    audioLatencyInput,
+    audioLatencyInput.value,
+    Number(audioLatencyInput.value),
+  );
+  const extraSeconds = extraLatencyMs / 1000;
+  return {
+    targetLeadSeconds: profile.targetLeadSeconds + extraSeconds,
+    maxQueueSeconds: profile.maxQueueSeconds + extraSeconds,
+    resetGraceSeconds: Math.max(profile.resetGraceSeconds, 0.05),
+  };
+}
+
 async function ensureAudioContext() {
   if (!window.AudioContext) return null;
   if (!state.audioContext || state.audioContext.state === "closed") {
@@ -1014,6 +1073,191 @@ function stopMicrophoneCapture() {
   renderMicToggle();
 }
 
+function pickCameraMimeType() {
+  if (!window.MediaRecorder) return "";
+  if (typeof MediaRecorder.isTypeSupported !== "function") {
+    return CAMERA_MIME_CANDIDATES[0];
+  }
+  return CAMERA_MIME_CANDIDATES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || "";
+}
+
+async function uploadCameraChunk(blob, seq) {
+  const formData = new FormData();
+  formData.append("session_id", state.sessionId);
+  formData.append("seq", String(seq));
+  formData.append("file", blob, `camera_${seq}.mp4`);
+  const response = await fetch(authUrl("/api/camera/chunk"), {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(await response.text().catch(() => "Camera upload failed"));
+  }
+  return response.json().catch(() => null);
+}
+
+function queueCameraChunkUpload(blob) {
+  if (!(blob instanceof Blob) || blob.size === 0) {
+    return;
+  }
+  state.cameraSeq += 1;
+  const seq = state.cameraSeq;
+  state.cameraUploadTail = state.cameraUploadTail
+    .catch(() => {})
+    .then(() => uploadCameraChunk(blob, seq))
+    .catch((error) => {
+      showToast("camera_upload_failed", error.message || String(error));
+      state.cameraEnabled = false;
+      renderCameraToggle();
+      const recorder = state.cameraRecorder;
+      state.cameraRecorder = null;
+      if (recorder && recorder.state !== "inactive") {
+        try {
+          recorder.stop();
+        } catch {
+          // Ignore recorder shutdown races after upload failure.
+        }
+      }
+      if (state.cameraStream) {
+        for (const track of state.cameraStream.getTracks()) {
+          track.stop();
+        }
+        state.cameraStream = null;
+      }
+      void notifyCameraStop().catch((stopError) => {
+        showToast("camera_stop_failed", stopError.message || String(stopError));
+      });
+      throw error;
+    });
+}
+
+async function notifyCameraStop() {
+  if (!state.sessionId) return;
+  const response = await fetch(authUrl("/api/camera/stop"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: state.sessionId }),
+  });
+  if (!response.ok) {
+    throw new Error(await response.text().catch(() => "Failed to stop camera uplink"));
+  }
+}
+
+async function startCameraCapture() {
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    showToast("camera_unavailable", "Camera recording is unavailable in this browser");
+    state.cameraEnabled = false;
+    renderCameraToggle();
+    return;
+  }
+  if (!state.sessionId) {
+    showToast("camera_session_missing", "Wait for the remote session to connect first");
+    state.cameraEnabled = false;
+    renderCameraToggle();
+    return;
+  }
+  if (state.cameraRecorder || state.cameraStarting || !state.cameraEnabled) {
+    return;
+  }
+
+  const mimeType = pickCameraMimeType();
+  if (!mimeType) {
+    showToast("camera_mp4_unsupported", "This browser cannot record camera uplink as MP4");
+    state.cameraEnabled = false;
+    renderCameraToggle();
+    return;
+  }
+
+  state.cameraStarting = true;
+  renderCameraToggle();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30, max: 30 },
+      },
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+
+    if (!state.cameraEnabled) {
+      for (const track of stream.getTracks()) {
+        track.stop();
+      }
+      return;
+    }
+
+    const recorder = new MediaRecorder(stream, {
+      mimeType,
+      videoBitsPerSecond: 2_500_000,
+      audioBitsPerSecond: 128_000,
+    });
+
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        queueCameraChunkUpload(event.data);
+      }
+    };
+    recorder.onerror = () => {
+      showToast("camera_record_failed", "Camera recorder stopped unexpectedly");
+      state.cameraEnabled = false;
+      renderCameraToggle();
+      void stopCameraCapture({ notifyServer: true, keepEnabled: false });
+    };
+
+    state.cameraSeq = 0;
+    state.cameraUploadTail = Promise.resolve();
+    state.cameraRecorder = recorder;
+    state.cameraStream = stream;
+    recorder.start(CAMERA_CHUNK_MS);
+  } catch (error) {
+    showToast("camera_access_failed", error.message || String(error));
+    state.cameraEnabled = false;
+  } finally {
+    state.cameraStarting = false;
+    renderCameraToggle();
+  }
+}
+
+async function stopCameraCapture({ notifyServer = true, keepEnabled = false } = {}) {
+  state.cameraStarting = false;
+  const recorder = state.cameraRecorder;
+  state.cameraRecorder = null;
+  if (recorder && recorder.state !== "inactive") {
+    await new Promise((resolve) => {
+      recorder.addEventListener("stop", resolve, { once: true });
+      try {
+        recorder.stop();
+      } catch {
+        resolve();
+      }
+    });
+  }
+  if (state.cameraStream) {
+    for (const track of state.cameraStream.getTracks()) {
+      track.stop();
+    }
+    state.cameraStream = null;
+  }
+  const uploadTail = state.cameraUploadTail.catch(() => {});
+  state.cameraUploadTail = Promise.resolve();
+  await uploadTail;
+  if (notifyServer) {
+    try {
+      await notifyCameraStop();
+    } catch (error) {
+      showToast("camera_stop_failed", error.message || String(error));
+    }
+  }
+  state.cameraEnabled = keepEnabled ? state.cameraEnabled : false;
+  renderCameraToggle();
+}
+
 async function playAudioData(audioData) {
   const audioContext = await ensureAudioContext().catch(() => null);
   if (!audioContext) {
@@ -1036,12 +1280,14 @@ async function playAudioData(audioData) {
   source.connect(audioContext.destination);
   const now = audioContext.currentTime;
   const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
-  if (!state.audioNextTime || state.audioNextTime < now - AUDIO_RESET_GRACE_SECONDS) {
-    state.audioNextTime = now + AUDIO_TARGET_LEAD_SECONDS;
-  } else if (queuedFor > AUDIO_MAX_QUEUE_SECONDS) {
+  const profile = currentAudioBufferProfile();
+  if (!state.audioNextTime || state.audioNextTime < now - profile.resetGraceSeconds) {
+    state.audioNextTime = now + profile.targetLeadSeconds;
+  } else if (queuedFor > profile.maxQueueSeconds) {
     resetAudioPlayback();
-    state.audioNextTime = now + AUDIO_TARGET_LEAD_SECONDS;
+    state.audioNextTime = now + profile.targetLeadSeconds;
   }
+  state.audioNextTime = Math.max(state.audioNextTime, now + profile.targetLeadSeconds);
   state.audioSources.add(source);
   source.start(state.audioNextTime);
   state.audioNextTime += audioBuffer.duration;
@@ -1076,6 +1322,16 @@ function toggleMicrophone() {
   } else {
     renderMicToggle();
   }
+}
+
+function toggleCamera() {
+  if (state.cameraEnabled) {
+    void stopCameraCapture({ notifyServer: true, keepEnabled: false });
+    return;
+  }
+  state.cameraEnabled = true;
+  renderCameraToggle();
+  void startCameraCapture();
 }
 
 function logInputState(kind, event, extra = {}) {
@@ -1970,6 +2226,8 @@ function initControls() {
   fpsInput.addEventListener("change", persistCurrentSettings);
   scrollSpeedInput.addEventListener("input", persistCurrentSettings);
   scrollSpeedInput.addEventListener("change", persistCurrentSettings);
+  audioLatencyInput.addEventListener("input", persistCurrentSettings);
+  audioLatencyInput.addEventListener("change", persistCurrentSettings);
   touchModeSelect.addEventListener("change", persistCurrentSettings);
   directTouchScrollInput.addEventListener("change", persistCurrentSettings);
   for (const button of tabButtons) {
@@ -1980,9 +2238,7 @@ function initControls() {
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
   micToggle.addEventListener("click", toggleMicrophone);
-  cameraToggle.addEventListener("click", () => {
-    showToast("camera_pending", "Camera uplink is not implemented yet");
-  });
+  cameraToggle.addEventListener("click", toggleCamera);
   uploadAction.addEventListener("click", () => uploadInput.click());
   uploadInput.addEventListener("change", () => {
     void uploadSelectedFile();
@@ -2179,6 +2435,7 @@ void removeServiceWorker();
 state.passwd = loadStoredPassword();
 authInput.value = state.passwd;
 renderMicToggle();
+renderCameraToggle();
 if (state.passwd) {
   clearAuthPrompt();
   void connect();

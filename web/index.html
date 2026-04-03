@@ -26,7 +26,7 @@
               <path d="M8.5 20.5h7" />
             </svg>
           </button>
-          <button id="camera-toggle" class="tool-toggle tool-toggle-left" type="button" aria-label="Camera coming soon">
+          <button id="camera-toggle" class="tool-toggle tool-toggle-left" type="button" aria-label="Enable camera uplink" aria-pressed="false">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <rect x="3.5" y="6.5" width="13" height="11" rx="2.5" />
               <path d="M16.5 10l4-2.5v9l-4-2.5" />
@@ -53,8 +53,8 @@
               <section id="tab-panel-status" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-button-status">
                 <div class="status-grid">
                   <article class="metric-card metric-card-wide">
-                    <span class="metric-label">Encoder</span>
-                    <strong id="encoder-status" class="metric-value">Not connected</strong>
+                    <span class="metric-label">Latency</span>
+                    <strong id="status-latency" class="metric-value">--</strong>
                   </article>
                   <article class="metric-card">
                     <span class="metric-label">CPU</span>
@@ -64,23 +64,44 @@
                     <span class="metric-label">RAM</span>
                     <strong id="status-ram" class="metric-value">--</strong>
                   </article>
+                  <article class="metric-card metric-card-wide">
+                    <span class="metric-label">Encoder</span>
+                    <strong id="encoder-status" class="metric-value">Not connected</strong>
+                  </article>
                   <article class="metric-card">
                     <span class="metric-label">Swap</span>
                     <strong id="status-swap" class="metric-value">--</strong>
                   </article>
-                  <article class="metric-card">
-                    <span class="metric-label">Latency</span>
-                    <strong id="status-latency" class="metric-value">--</strong>
-                  </article>
                   <article class="metric-card metric-card-wide">
-                    <span class="metric-label">Realtime Speed</span>
-                    <strong id="status-speed" class="metric-value">--</strong>
+                    <span class="metric-label">Network Speed</span>
+                    <strong class="metric-value metric-value-stack">
+                      <span id="status-speed-download">Down --</span>
+                      <span id="status-speed-upload">Up --</span>
+                    </strong>
                     <span id="status-updated-at" class="metric-meta">Updates every 3s</span>
                   </article>
                 </div>
               </section>
               <section id="tab-panel-view" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-view" hidden>
                 <div class="view-grid">
+                  <article class="metric-card metric-card-wide">
+                    <span class="metric-label">Zoom</span>
+                    <div class="zoom-controls">
+                      <button id="zoom-out" class="zoom-icon-button" type="button" aria-label="Zoom out">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M6 12h12" />
+                        </svg>
+                      </button>
+                      <strong id="view-zoom-value" class="zoom-value">100%</strong>
+                      <button id="zoom-in" class="zoom-icon-button" type="button" aria-label="Zoom in">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M12 6v12" />
+                          <path d="M6 12h12" />
+                        </svg>
+                      </button>
+                    </div>
+                    <span class="metric-meta">10% step</span>
+                  </article>
                   <article class="metric-card">
                     <span class="metric-label">Current Video</span>
                     <strong id="view-video-size" class="metric-value">--</strong>
@@ -96,15 +117,6 @@
                   <article class="metric-card">
                     <span class="metric-label">Remote Screen</span>
                     <strong id="view-remote-screen-size" class="metric-value">--</strong>
-                  </article>
-                  <article class="metric-card metric-card-wide">
-                    <span class="metric-label">Zoom</span>
-                    <div class="zoom-controls">
-                      <button id="zoom-out" class="secondary" type="button">Zoom Out</button>
-                      <strong id="view-zoom-value" class="zoom-value">100%</strong>
-                      <button id="zoom-in" class="secondary" type="button">Zoom In</button>
-                    </div>
-                    <span class="metric-meta">10% step</span>
                   </article>
                 </div>
               </section>
@@ -128,6 +140,10 @@
                   <label>Scroll speed
                     <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
                     <span id="scroll-speed-value">3 / 10</span>
+                  </label>
+                  <label>Audio latency
+                    <input id="audio-latency" type="range" min="0" max="250" step="10" value="80" />
+                    <span id="audio-latency-value">80 ms</span>
                   </label>
                   <label>Touch mode
                     <select id="touch-mode">

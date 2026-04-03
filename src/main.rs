@@ -2,6 +2,7 @@ mod annexb;
 mod app;
 mod audio;
 mod audio_streamer;
+mod camera;
 mod clipboard;
 mod ffmpeg;
 mod messages;
