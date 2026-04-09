@@ -21,7 +21,9 @@ use crate::{
         ClipboardHistoryEntry, ClipboardPayload, ensure_upload_dir, read_clipboard_history,
         read_remote_clipboard, write_clipboard_history, write_remote_clipboard,
     },
-    ffmpeg, session,
+    ffmpeg,
+    media::MediaHub,
+    session,
     settings::{CodecKind, ServerConfig, StreamConfig},
 };
 
@@ -34,6 +36,7 @@ struct AppState {
     server: ServerConfig,
     auth: Arc<AuthTracker>,
     camera: CameraRelay,
+    media: MediaHub,
 }
 
 #[derive(Debug)]
@@ -138,6 +141,7 @@ struct CameraStopRequest {
 pub async fn run(server: ServerConfig) -> Result<()> {
     let bind = server.bind.clone();
     let camera = CameraRelay::new(PathBuf::from(&server.upload_dir));
+    let media = MediaHub::new(server.clone());
     if let Err(err) = ffmpeg::warm_audio_stack().await {
         warn!("audio bootstrap failed during startup: {err}");
     }
@@ -163,6 +167,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
             server,
             auth: Arc::new(AuthTracker::new()),
             camera,
+            media,
         }));
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("listening on http://{bind}");
@@ -216,7 +221,9 @@ async fn ws(
     }
     .normalized();
     ws.on_upgrade(move |socket| async move {
-        if let Err(err) = session::handle_socket(socket, state.server.clone(), config).await {
+        if let Err(err) =
+            session::handle_socket(socket, state.server.clone(), state.media.clone(), config).await
+        {
             let _ = err;
         }
     })

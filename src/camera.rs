@@ -99,7 +99,9 @@ impl CameraRelay {
             }
             state.active_session = Some(session_id.clone());
             state.last_activity = Instant::now();
-            state.queue.push_back(QueuedCameraChunk { session_id, path });
+            state
+                .queue
+                .push_back(QueuedCameraChunk { session_id, path });
             state.queue.len()
         };
 
@@ -173,7 +175,8 @@ impl CameraRelay {
                 let _ = tokio::fs::remove_file(&chunk.path).await;
 
                 let mut state = inner.state.lock().await;
-                if state.queue.is_empty() && state.active_session.as_deref() == Some(&chunk.session_id)
+                if state.queue.is_empty()
+                    && state.active_session.as_deref() == Some(&chunk.session_id)
                 {
                     state.active_session = None;
                     state.last_activity = Instant::now();

@@ -6,6 +6,7 @@ mod camera;
 mod clipboard;
 mod ffmpeg;
 mod messages;
+mod media;
 mod session;
 mod settings;
 mod streamer;

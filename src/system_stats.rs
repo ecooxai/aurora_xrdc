@@ -48,11 +48,7 @@ impl StatsSampler {
             .values()
             .map(|net| net.total_transmitted())
             .sum();
-        let rx_bytes_now: u64 = self
-            .networks
-            .values()
-            .map(|net| net.total_received())
-            .sum();
+        let rx_bytes_now: u64 = self.networks.values().map(|net| net.total_received()).sum();
         let tx_delta = tx_bytes_now.saturating_sub(self.last_tx_bytes);
         let rx_delta = rx_bytes_now.saturating_sub(self.last_rx_bytes);
         self.last_at = now;

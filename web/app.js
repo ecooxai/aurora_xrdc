@@ -9,6 +9,15 @@ const VIEW_ZOOM_STEP_PERCENT = 10;
 const VIEW_ZOOM_MIN_PERCENT = 10;
 const VIEW_ZOOM_MAX_PERCENT = 300;
 const LATENCY_PROBE_INTERVAL_MS = 3000;
+const LIVE_MEDIA_MAX_AGE_MS = 1000;
+const MEDIA_STALL_RESET_MS = 1000;
+const HIGH_LATENCY_RECONNECT_MS = 1500;
+const HIGH_LATENCY_RECONNECT_GRACE_MS = 5000;
+const HEALTH_WATCHDOG_INTERVAL_MS = 250;
+const KEY_STATE_SYNC_INTERVAL_MS = 500;
+const MAX_VIDEO_DECODE_QUEUE = 4;
+const MAX_AUDIO_DECODE_QUEUE = 12;
+const AUTO_DISCONNECT_DISABLED_MINUTES = 0;
 const state = {
   socket: null,
   decoder: null,
@@ -38,6 +47,8 @@ const state = {
   decoderConfigKey: "",
   audioConfigKey: "",
   audioEnabled: false,
+  pendingVideoFrame: null,
+  renderingVideoFrame: false,
   audioNextTime: 0,
   waitingForKeyframe: true,
   frameCount: 0,
@@ -55,6 +66,7 @@ const state = {
   touchScrollLastY: null,
   inputCaptured: false,
   pressedKeys: new Set(),
+  keyStateSyncTimer: 0,
   pendingPointer: null,
   pointerRaf: 0,
   pendingRelativePointer: null,
@@ -75,6 +87,14 @@ const state = {
   wsLatencyMs: null,
   latencyProbeSeq: 0,
   latencyProbeSentAt: new Map(),
+  serverClockOffsetMs: 0,
+  lastVideoPacketAt: 0,
+  lastAudioPacketAt: 0,
+  streamWarning: "",
+  lastStaleDropAt: 0,
+  highLatencySinceAt: 0,
+  reconnectingForLatency: false,
+  autoDisconnectTimer: null,
 };
 
 const status = $("status");
@@ -82,6 +102,8 @@ const viewportCard = $("viewport-card");
 const canvas = $("screen");
 const ctx = canvas.getContext("2d", { alpha: false });
 const toast = $("toast");
+const streamWarning = $("stream-warning");
+const streamWarningText = $("stream-warning-text");
 const authModal = $("auth-modal");
 const authForm = $("auth-form");
 const authInput = $("auth-passwd");
@@ -101,6 +123,7 @@ const scrollSpeedInput = $("scroll-speed");
 const scrollSpeedValue = $("scroll-speed-value");
 const audioLatencyInput = $("audio-latency");
 const audioLatencyValue = $("audio-latency-value");
+const autoDisconnectMinutesInput = $("auto-disconnect-minutes");
 const touchModeSelect = $("touch-mode");
 const directTouchScrollInput = $("direct-touch-scroll");
 const directTouchScrollLabel = $("direct-touch-scroll-label");
@@ -171,6 +194,12 @@ function setStatus(text) {
   status.classList.toggle("hidden", text === "Connected");
 }
 
+function setStreamWarning(message = "") {
+  state.streamWarning = message;
+  streamWarning.classList.toggle("hidden", !message);
+  streamWarningText.textContent = message || "Stream delayed";
+}
+
 function setEncoderStatus(text) {
   encoderStatus.textContent = text;
 }
@@ -209,8 +238,8 @@ function renderStatusMetrics({
   statusRam.textContent = formatMemoryUsage(memory_used_mb, memory_total_mb);
   statusSwap.textContent = formatMemoryUsage(swap_used_mb, swap_total_mb);
   renderLatencyMetric();
-  statusSpeedDownload.textContent = `Down ${formatMbPerSecond(net_rx_kbps)}`;
-  statusSpeedUpload.textContent = `Up ${formatMbPerSecond(net_tx_kbps)}`;
+  statusSpeedDownload.textContent = `↓ ${formatMbPerSecond(net_rx_kbps)}`;
+  statusSpeedUpload.textContent = `↑ ${formatMbPerSecond(net_tx_kbps)}`;
   statusUpdatedAt.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
 }
 
@@ -225,6 +254,27 @@ function resetStatusMetrics() {
   state.latencyProbeSentAt.clear();
   renderStatusMetrics({});
   statusUpdatedAt.textContent = "Stats and latency every 3s";
+  state.highLatencySinceAt = 0;
+  state.lastStaleDropAt = 0;
+  setStreamWarning("");
+}
+
+function updateServerClockOffset(serverTimeMs, roundTripMs = 0) {
+  if (!Number.isFinite(serverTimeMs) || serverTimeMs <= 0) return;
+  const sample = Date.now() - serverTimeMs - Math.max(0, roundTripMs) / 2;
+  if (!Number.isFinite(state.serverClockOffsetMs) || state.serverClockOffsetMs === 0) {
+    state.serverClockOffsetMs = sample;
+    return;
+  }
+  state.serverClockOffsetMs = (state.serverClockOffsetMs * 0.8) + (sample * 0.2);
+}
+
+function estimateMediaAgeMs(sentAtMs) {
+  if (!Number.isFinite(sentAtMs) || sentAtMs <= 0) return 0;
+  if (!Number.isFinite(state.serverClockOffsetMs) || state.serverClockOffsetMs === 0) {
+    return 0;
+  }
+  return Math.max(0, Date.now() - state.serverClockOffsetMs - sentAtMs);
 }
 
 function formatDimensions(width, height) {
@@ -306,6 +356,56 @@ function showToast(code, message) {
   showToast.timer = setTimeout(() => toast.classList.add("hidden"), 10000);
 }
 
+function markStaleDrop(message) {
+  state.lastStaleDropAt = performance.now();
+  setStreamWarning(message);
+}
+
+function forceReconnect(reason) {
+  if (state.reconnectingForLatency || state.connecting) return;
+  state.reconnectingForLatency = true;
+  state.highLatencySinceAt = 0;
+  setStreamWarning(reason);
+  showToast("stream_reconnect", reason);
+  closeConnection({ manual: false, preserveStatus: true });
+  setStatus("Reconnecting...");
+  setTimeout(() => {
+    if (!state.reconnectingForLatency || state.connecting) return;
+    void connect();
+  }, 150);
+}
+
+function monitorConnectionHealth() {
+  const now = performance.now();
+  const socketOpen = state.socket?.readyState === WebSocket.OPEN;
+
+  let warning = "";
+  if (socketOpen && state.lastVideoPacketAt && now - state.lastVideoPacketAt > MEDIA_STALL_RESET_MS) {
+    warning = "Video stalled";
+  } else if (socketOpen && state.lastStaleDropAt && now - state.lastStaleDropAt < 3000) {
+    warning = state.streamWarning || "Dropping delayed frames";
+  }
+
+  if (warning) {
+    setStreamWarning(warning);
+  } else if (state.streamWarning) {
+    setStreamWarning("");
+  }
+
+  if (Number.isFinite(state.wsLatencyMs) && state.wsLatencyMs > HIGH_LATENCY_RECONNECT_MS) {
+    if (!state.highLatencySinceAt) {
+      state.highLatencySinceAt = now;
+    } else if (now - state.highLatencySinceAt >= HIGH_LATENCY_RECONNECT_GRACE_MS) {
+      forceReconnect("Latency stayed above 1500 ms, reconnecting");
+    }
+  } else {
+    state.highLatencySinceAt = 0;
+    if (!warning && state.reconnectingForLatency) {
+      state.reconnectingForLatency = false;
+    }
+  }
+}
+
 toast.addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(toast.dataset.copy || toast.textContent || "");
@@ -345,6 +445,7 @@ function normalizeSettings(settings = {}) {
   const defaultBitrate = Number(bitrateInput.value);
   const defaultFps = Number(fpsInput.value);
   const defaultScrollSpeed = Number(scrollSpeedInput.value);
+  const defaultAutoDisconnectMinutes = Number(autoDisconnectMinutesInput.value);
   return {
     codec: allowedCodecs.has(settings.codec) ? settings.codec : codecSelect.value,
     bitrate: clampControlValue(bitrateInput, settings.bitrate, defaultBitrate),
@@ -354,6 +455,11 @@ function normalizeSettings(settings = {}) {
     directTouchScroll: settings.directTouchScroll === true,
     micEnabled: settings.micEnabled === true,
     audioLatencyMs: clampControlValue(audioLatencyInput, settings.audioLatencyMs, Number(audioLatencyInput.value)),
+    autoDisconnectMinutes: clampControlValue(
+      autoDisconnectMinutesInput,
+      settings.autoDisconnectMinutes,
+      defaultAutoDisconnectMinutes,
+    ),
     viewZoomPercent: clampZoomPercent(settings.viewZoomPercent),
   };
 }
@@ -365,6 +471,7 @@ function readSettingsFromControls() {
     fps: fpsInput.value,
     scrollSpeed: scrollSpeedInput.value,
     audioLatencyMs: audioLatencyInput.value,
+    autoDisconnectMinutes: autoDisconnectMinutesInput.value,
     touchMode: touchModeSelect.value,
     directTouchScroll: directTouchScrollInput.checked,
     micEnabled: state.micEnabled,
@@ -424,6 +531,7 @@ function applySettings(settings) {
   fpsInput.value = String(normalized.fps);
   scrollSpeedInput.value = String(normalized.scrollSpeed);
   audioLatencyInput.value = String(normalized.audioLatencyMs);
+  autoDisconnectMinutesInput.value = String(normalized.autoDisconnectMinutes);
   touchModeSelect.value = normalized.touchMode;
   directTouchScrollInput.checked = normalized.directTouchScroll;
   state.micEnabled = normalized.micEnabled;
@@ -439,6 +547,24 @@ function persistCurrentSettings() {
   renderSettingsValues(settings);
   syncTouchModeControls(settings);
   saveSettings(settings);
+  syncAutoDisconnectTimer(settings);
+}
+
+function clearAutoDisconnectTimer() {
+  if (!state.autoDisconnectTimer) return;
+  clearTimeout(state.autoDisconnectTimer);
+  state.autoDisconnectTimer = null;
+}
+
+function syncAutoDisconnectTimer(settings = readSettingsFromControls()) {
+  clearAutoDisconnectTimer();
+  if (state.socket?.readyState !== WebSocket.OPEN) return;
+  if (settings.autoDisconnectMinutes <= AUTO_DISCONNECT_DISABLED_MINUTES) return;
+  state.autoDisconnectTimer = setTimeout(() => {
+    state.autoDisconnectTimer = null;
+    showToast("auto_disconnect", `Disconnected after ${settings.autoDisconnectMinutes} minutes`);
+    disconnect();
+  }, settings.autoDisconnectMinutes * 60 * 1000);
 }
 
 function getPassword() {
@@ -545,9 +671,14 @@ async function connect() {
     state.socket.binaryType = "arraybuffer";
     state.socket.onopen = () => {
       state.reconnectAttempt = 0;
+      state.reconnectingForLatency = false;
+      state.highLatencySinceAt = 0;
+      setStreamWarning("");
       setStatus("Connected");
+      startKeyStateSync();
       startPing();
       startRemoteClipboardPolling();
+      syncAutoDisconnectTimer();
       void refreshLocalClipboard();
       if (state.micEnabled) {
         void startMicrophoneCapture();
@@ -555,6 +686,7 @@ async function connect() {
     };
     state.socket.onclose = () => {
       setStatus("Disconnected");
+      stopKeyStateSync();
       clearInterval(startPing.timer);
       stopRemoteClipboardPolling();
       if (!state.manualDisconnect) scheduleReconnect();
@@ -579,15 +711,25 @@ async function connect() {
 function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.manualDisconnect = manual;
   clearTimeout(state.reconnectTimer);
+  clearAutoDisconnectTimer();
+  stopKeyStateSync();
   clearInterval(startPing.timer);
   state.latencyProbeSentAt.clear();
+  state.lastVideoPacketAt = 0;
+  state.lastAudioPacketAt = 0;
   if (!preserveStatus) {
     state.wsLatencyMs = null;
+    state.serverClockOffsetMs = 0;
     renderLatencyMetric();
+  }
+  if (manual) {
+    state.reconnectingForLatency = false;
   }
   stopRemoteClipboardPolling();
   stopMicrophoneCapture();
   void stopCameraCapture({ notifyServer: true, keepEnabled: false });
+  clearPendingVideoFrame();
+  state.renderingVideoFrame = false;
   state.decoder?.close();
   state.decoder = null;
   state.audioDecoder?.close();
@@ -614,6 +756,20 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
 
 function disconnect() {
   closeConnection({ manual: true });
+}
+
+function isConnectionOpen() {
+  return state.socket?.readyState === WebSocket.OPEN;
+}
+
+function isConnectionDisconnected() {
+  return !state.socket || state.socket.readyState === WebSocket.CLOSED;
+}
+
+function reconnectFromViewport() {
+  if (state.connecting || isConnectionOpen() || !isConnectionDisconnected()) return false;
+  void connect();
+  return true;
 }
 
 async function requestKeyboardLock() {
@@ -667,6 +823,7 @@ function scheduleReconnect() {
 
 function handleServerMessage(message) {
   if (message.type === "hello") {
+    updateServerClockOffset(message.server_time_ms);
     if (message.session_id) {
       state.sessionId = message.session_id;
     }
@@ -693,6 +850,7 @@ function handleServerMessage(message) {
     if (sentAt !== undefined) {
       state.latencyProbeSentAt.delete(message.seq);
       state.wsLatencyMs = performance.now() - sentAt;
+      updateServerClockOffset(message.server_time_ms, state.wsLatencyMs);
       renderLatencyMetric();
     }
   } else if (message.type === "error") {
@@ -713,9 +871,8 @@ function setupDecoder() {
   }
   state.decoder?.close();
   state.decoder = new VideoDecoder({
-    output: async (frame) => {
-      await drawFrame(frame);
-      frame.close();
+    output: (frame) => {
+      queueVideoFrameForRender(frame);
     },
     error: (err) => showToast("decoder_error", err.message || String(err)),
   });
@@ -724,6 +881,58 @@ function setupDecoder() {
   state.decoder.configure(config);
   state.decoderConfigKey = configKey;
   state.waitingForKeyframe = true;
+}
+
+function clearPendingVideoFrame() {
+  if (state.pendingVideoFrame) {
+    state.pendingVideoFrame.close();
+    state.pendingVideoFrame = null;
+  }
+}
+
+function resetVideoDecoderForLiveCatchup() {
+  clearPendingVideoFrame();
+  state.renderingVideoFrame = false;
+  state.decoder?.close();
+  state.decoder = null;
+  state.decoderConfigKey = "";
+  setupDecoder();
+  state.waitingForKeyframe = true;
+}
+
+function queueVideoFrameForRender(frame) {
+  if (state.pendingVideoFrame) {
+    state.pendingVideoFrame.close();
+    markStaleDrop("Dropping delayed video");
+  }
+  state.pendingVideoFrame = frame;
+  if (!state.renderingVideoFrame) {
+    void renderLatestVideoFrame();
+  }
+}
+
+async function renderLatestVideoFrame() {
+  if (state.renderingVideoFrame) return;
+  state.renderingVideoFrame = true;
+  try {
+    while (state.pendingVideoFrame) {
+      const frame = state.pendingVideoFrame;
+      state.pendingVideoFrame = null;
+      const sentAtMs = Number(frame.timestamp ?? 0) / 1000;
+      if (estimateMediaAgeMs(sentAtMs) > LIVE_MEDIA_MAX_AGE_MS) {
+        frame.close();
+        markStaleDrop("Dropping delayed video");
+        continue;
+      }
+      await drawFrame(frame);
+      frame.close();
+    }
+  } finally {
+    state.renderingVideoFrame = false;
+    if (state.pendingVideoFrame) {
+      void renderLatestVideoFrame();
+    }
+  }
 }
 
 async function drawFrame(frame) {
@@ -740,9 +949,13 @@ async function drawFrame(frame) {
     state.remoteScreenHeight = frame.displayHeight;
     applyCanvasZoom();
   }
-  const bitmap = await createImageBitmap(frame);
-  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  bitmap.close();
+  try {
+    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+  } catch {
+    const bitmap = await createImageBitmap(frame);
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close();
+  }
   state.frameCount += 1;
 }
 
@@ -760,16 +973,29 @@ function handleVideoFrame(buffer, view) {
   if (!state.decoder || state.decoder.state === "closed") return;
   const key = !!view.getUint8(1);
   const sentAt = Number(view.getBigUint64(2, true));
+  const receivedAt = performance.now();
   const length = view.getUint32(10, true);
   const bytes = new Uint8Array(buffer, 14, length);
   state.bytesReceived += length;
   state.netWindowBytes += length;
-  const now = performance.now();
-  const deltaSec = (now - state.lastNetAt) / 1000;
+  const deltaSec = (receivedAt - state.lastNetAt) / 1000;
   if (deltaSec >= 0.25) {
     state.netKbps = (state.netWindowBytes * 8) / Math.max(deltaSec, 0.001) / 1000;
     state.netWindowBytes = 0;
-    state.lastNetAt = now;
+    state.lastNetAt = receivedAt;
+  }
+  const stalledForMs = state.lastVideoPacketAt ? receivedAt - state.lastVideoPacketAt : 0;
+  state.lastVideoPacketAt = receivedAt;
+  const mediaAgeMs = estimateMediaAgeMs(sentAt);
+  if (stalledForMs >= MEDIA_STALL_RESET_MS || mediaAgeMs > LIVE_MEDIA_MAX_AGE_MS) {
+    markStaleDrop("Dropping delayed video");
+    resetVideoDecoderForLiveCatchup();
+    return;
+  }
+  if ((state.decoder.decodeQueueSize ?? 0) > MAX_VIDEO_DECODE_QUEUE) {
+    markStaleDrop("Video decoder catching up");
+    resetVideoDecoderForLiveCatchup();
+    return;
   }
   const timestamp = sentAt * 1000;
   if (state.waitingForKeyframe) {
@@ -790,12 +1016,26 @@ function handleVideoFrame(buffer, view) {
 function handleAudioFrame(buffer, view) {
   if (!state.audioEnabled) return;
   const sentAt = Number(view.getBigUint64(1, true));
+  const receivedAt = performance.now();
+  const stalledForMs = state.lastAudioPacketAt ? receivedAt - state.lastAudioPacketAt : 0;
+  state.lastAudioPacketAt = receivedAt;
+  const mediaAgeMs = estimateMediaAgeMs(sentAt);
+  if (stalledForMs >= MEDIA_STALL_RESET_MS || mediaAgeMs > LIVE_MEDIA_MAX_AGE_MS) {
+    markStaleDrop("Dropping delayed audio");
+    resetAudioDecoderForLiveCatchup();
+    return;
+  }
   const length = view.getUint32(9, true);
   const bytes = new Uint8Array(buffer, 13, length);
   const frame = parseAdtsFrame(bytes);
   if (!frame) return;
   setupAudioDecoder(frame);
   if (!state.audioDecoder || state.audioDecoder.state === "closed") return;
+  if ((state.audioDecoder.decodeQueueSize ?? 0) > MAX_AUDIO_DECODE_QUEUE) {
+    markStaleDrop("Audio decoder catching up");
+    resetAudioDecoderForLiveCatchup();
+    return;
+  }
   try {
     state.audioDecoder.decode(new EncodedAudioChunk({
       type: "key",
@@ -857,6 +1097,13 @@ function setupAudioDecoder(frame) {
     numberOfChannels: frame.numberOfChannels,
   });
   state.audioConfigKey = configKey;
+}
+
+function resetAudioDecoderForLiveCatchup() {
+  state.audioDecoder?.close();
+  state.audioDecoder = null;
+  state.audioConfigKey = "";
+  resetAudioPlayback();
 }
 
 function resetAudioPlayback() {
@@ -1287,7 +1534,6 @@ async function playAudioData(audioData) {
     resetAudioPlayback();
     state.audioNextTime = now + profile.targetLeadSeconds;
   }
-  state.audioNextTime = Math.max(state.audioNextTime, now + profile.targetLeadSeconds);
   state.audioSources.add(source);
   source.start(state.audioNextTime);
   state.audioNextTime += audioBuffer.duration;
@@ -1353,6 +1599,24 @@ function requestRemoteClipboard() {
   send({ type: "clipboard_get" });
 }
 
+function sendPressedKeyState() {
+  if (!state.inputCaptured && state.pressedKeys.size === 0) return;
+  send({ type: "key_state", pressed_keys: [...state.pressedKeys] });
+}
+
+function startKeyStateSync() {
+  stopKeyStateSync();
+  sendPressedKeyState();
+  state.keyStateSyncTimer = setInterval(() => {
+    sendPressedKeyState();
+  }, KEY_STATE_SYNC_INTERVAL_MS);
+}
+
+function stopKeyStateSync() {
+  clearInterval(state.keyStateSyncTimer);
+  state.keyStateSyncTimer = 0;
+}
+
 function sendPasteClipboard(payload) {
   send({ type: "paste_clipboard", payload });
 }
@@ -1396,12 +1660,14 @@ function resetKeys() {
     send({ type: "key", key, down: false });
   }
   state.pressedKeys.clear();
+  sendPressedKeyState();
 }
 
 function releasePressedKey(key) {
   if (!state.pressedKeys.has(key)) return false;
   state.pressedKeys.delete(key);
   send({ type: "key", key, down: false });
+  sendPressedKeyState();
   return true;
 }
 
@@ -1454,6 +1720,7 @@ function synchronizeModifierState(event, { pressMissing = false } = {}) {
     if (modifier.keys.some((key) => state.pressedKeys.has(key))) continue;
     state.pressedKeys.add(modifier.fallback);
     send({ type: "key", key: modifier.fallback, down: true });
+    sendPressedKeyState();
   }
 }
 
@@ -2228,6 +2495,8 @@ function initControls() {
   scrollSpeedInput.addEventListener("change", persistCurrentSettings);
   audioLatencyInput.addEventListener("input", persistCurrentSettings);
   audioLatencyInput.addEventListener("change", persistCurrentSettings);
+  autoDisconnectMinutesInput.addEventListener("input", persistCurrentSettings);
+  autoDisconnectMinutesInput.addEventListener("change", persistCurrentSettings);
   touchModeSelect.addEventListener("change", persistCurrentSettings);
   directTouchScrollInput.addEventListener("change", persistCurrentSettings);
   for (const button of tabButtons) {
@@ -2294,6 +2563,10 @@ function initControls() {
     }
   });
   canvas.addEventListener("pointerdown", (event) => {
+    if (reconnectFromViewport()) {
+      event.preventDefault();
+      return;
+    }
     if (isTouchPointer(event)) {
       logInputState("pointerdown", event, {
         button: event.button,
@@ -2363,9 +2636,14 @@ function initControls() {
       event.preventDefault();
       return;
     }
-    if (!event.repeat) state.pressedKeys.add(key);
+    if (!event.repeat) {
+      state.pressedKeys.add(key);
+    }
     logInputState("keydown", event, { normalizedKey: key });
     send({ type: "key", key, down: true });
+    if (!event.repeat) {
+      sendPressedKeyState();
+    }
     event.preventDefault();
   });
   window.addEventListener("keyup", (event) => {
@@ -2436,6 +2714,7 @@ state.passwd = loadStoredPassword();
 authInput.value = state.passwd;
 renderMicToggle();
 renderCameraToggle();
+setInterval(monitorConnectionHealth, HEALTH_WATCHDOG_INTERVAL_MS);
 if (state.passwd) {
   clearAuthPrompt();
   void connect();

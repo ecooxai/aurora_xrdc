@@ -13,6 +13,14 @@
           <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
         </div>
         <div id="status" class="status-pill">Connecting...</div>
+        <div id="stream-warning" class="stream-warning hidden" role="status" aria-live="polite" aria-label="Stream warning">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 4.5l8 14H4l8-14z" />
+            <path d="M12 9v4.5" />
+            <circle cx="12" cy="16.5" r="0.8" />
+          </svg>
+          <span id="stream-warning-text">Stream delayed</span>
+        </div>
       </section>
 
       <section class="bottom-dock">
@@ -54,7 +62,14 @@
                 <div class="status-grid">
                   <article class="metric-card metric-card-wide">
                     <span class="metric-label">Latency</span>
-                    <strong id="status-latency" class="metric-value">--</strong>
+                    <div class="metric-inline-row">
+                      <strong id="status-latency" class="metric-value">--</strong>
+                      <strong class="metric-value metric-value-inline metric-value-network" aria-label="Network speed">
+                        <span id="status-speed-download">↓ --</span>
+                        <span id="status-speed-upload">↑ --</span>
+                      </strong>
+                    </div>
+                    <span id="status-updated-at" class="metric-meta">Updates every 3s</span>
                   </article>
                   <article class="metric-card">
                     <span class="metric-label">CPU</span>
@@ -64,21 +79,13 @@
                     <span class="metric-label">RAM</span>
                     <strong id="status-ram" class="metric-value">--</strong>
                   </article>
-                  <article class="metric-card metric-card-wide">
-                    <span class="metric-label">Encoder</span>
-                    <strong id="encoder-status" class="metric-value">Not connected</strong>
-                  </article>
                   <article class="metric-card">
                     <span class="metric-label">Swap</span>
                     <strong id="status-swap" class="metric-value">--</strong>
                   </article>
-                  <article class="metric-card metric-card-wide">
-                    <span class="metric-label">Network Speed</span>
-                    <strong class="metric-value metric-value-stack">
-                      <span id="status-speed-download">Down --</span>
-                      <span id="status-speed-upload">Up --</span>
-                    </strong>
-                    <span id="status-updated-at" class="metric-meta">Updates every 3s</span>
+                  <article class="metric-card">
+                    <span class="metric-label">Encoder</span>
+                    <strong id="encoder-status" class="metric-value">Not connected</strong>
                   </article>
                 </div>
               </section>
@@ -142,8 +149,11 @@
                     <span id="scroll-speed-value">3 / 10</span>
                   </label>
                   <label>Audio latency
-                    <input id="audio-latency" type="range" min="0" max="250" step="10" value="80" />
+                    <input id="audio-latency" type="range" min="0" max="2000" step="10" value="80" />
                     <span id="audio-latency-value">80 ms</span>
+                  </label>
+                  <label>Auto disconnect
+                    <input id="auto-disconnect-minutes" type="number" min="0" max="1440" step="1" value="30" inputmode="numeric" />
                   </label>
                   <label>Touch mode
                     <select id="touch-mode">

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tokio::{io::AsyncReadExt, process::Child, sync::mpsc};
+use tokio::{io::AsyncReadExt, process::Child, sync::watch};
 
 use crate::{
     audio::{AdtsParser, AudioFrame},
@@ -9,13 +9,13 @@ use crate::{
 
 #[derive(Debug)]
 pub struct AudioStreamHandle {
-    pub rx: tokio::sync::mpsc::Receiver<AudioFrame>,
+    pub rx: watch::Receiver<Option<AudioFrame>>,
 }
 
 pub async fn start(server: &ServerConfig) -> Result<(AudioStreamHandle, Child)> {
     let mut child = spawn_audio_capture(server).await?;
     let mut stdout = child.stdout.take().expect("ffmpeg audio stdout missing");
-    let (tx, rx) = mpsc::channel(24);
+    let (tx, rx) = watch::channel(None);
     tokio::spawn(async move {
         let mut parser = AdtsParser::new();
         let mut buf = [0u8; 16 * 1024];
@@ -26,7 +26,7 @@ pub async fn start(server: &ServerConfig) -> Result<(AudioStreamHandle, Child)> 
                 Err(_) => break,
             };
             for frame in parser.push(&buf[..read]) {
-                if tx.send(frame).await.is_err() {
+                if tx.send(Some(frame)).is_err() {
                     return;
                 }
             }

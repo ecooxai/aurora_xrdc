@@ -12,6 +12,7 @@ The project currently supports:
 - Browser-side touchpad and click controls relayed through `xdotool`.
 - Client-selectable codec, bitrate, and FPS.
 - `?debug=1` overlay with latency, FPS, codec, encoder mode, CPU usage, memory usage, and network speed.
+- A compact bottom status tab where latency shows inline `↓`/`↑` network rates and the encoder indicator shares the regular metric grid with CPU, RAM, and Swap.
 - Service worker caching for the web client.
 - Bottom error notification UI without `alert()` or `prompt()`.
 
@@ -56,5 +57,5 @@ The project currently supports:
 
 ## Build output
 
-- Release target directory used for verification: `/tmp/vibe_rdesk-build`
-- Release binary: `/tmp/vibe_rdesk-build/release/vibe_rdesk`
+- Release target directory used for verification: `/var/tmp/vibe_rdesk-build`
+- Release binary: `/var/tmp/vibe_rdesk-build/release/vibe_rdesk`

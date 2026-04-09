@@ -1,8 +1,4 @@
-use std::{
-    ffi::OsStr,
-    path::Path,
-    process::Stdio,
-};
+use std::{ffi::OsStr, path::Path, process::Stdio};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::{
@@ -261,23 +257,10 @@ pub async fn ensure_virtual_camera_device() -> Result<String> {
 
 pub async fn replay_mp4_to_virtual_camera(path: &Path, device: &str) -> Result<()> {
     let output = Command::new("ffmpeg")
-        .args([
-            "-loglevel",
-            "error",
-            "-re",
-            "-i",
-        ])
+        .args(["-loglevel", "error", "-re", "-i"])
         .arg(path)
         .args([
-            "-map",
-            "0:v:0",
-            "-an",
-            "-sn",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "v4l2",
-            device,
+            "-map", "0:v:0", "-an", "-sn", "-pix_fmt", "yuv420p", "-f", "v4l2", device,
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

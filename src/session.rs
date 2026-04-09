@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,44 +9,52 @@ use futures_util::StreamExt;
 use tokio::{
     io::AsyncWriteExt,
     process::Child,
-    sync::{Mutex, mpsc},
+    sync::{mpsc, watch},
+    time::MissedTickBehavior,
 };
 use tracing::{error, warn};
 
 use crate::{
     audio::AudioFrame,
-    audio_streamer,
     clipboard::{read_remote_clipboard, write_remote_clipboard},
     ffmpeg::{MicInputHandle, read_stderr, run_xdotool, spawn_mic_input_injector},
+    media::MediaHub,
     messages::{ClientMessage, ServerMessage},
     settings::{ServerConfig, StreamConfig},
-    streamer::{StreamFrame, start},
+    streamer::StreamFrame,
     system_stats::StatsSampler,
 };
+
+const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
+const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn handle_socket(
     socket: WebSocket,
     server: ServerConfig,
+    media: MediaHub,
     config: StreamConfig,
 ) -> Result<()> {
-    let (stream, child) = start(server.clone(), config.clone()).await?;
-    let video_child = Arc::new(Mutex::new(child));
-    let (audio_stream, audio_child) = match audio_streamer::start(&server).await {
-        Ok((stream, child)) => (Some(stream), Some(Arc::new(Mutex::new(child)))),
-        Err(_) => (None, None),
+    let video_stream = media.acquire_video(config.clone()).await?;
+    let audio_stream = match media.acquire_audio().await {
+        Ok(stream) => Some(stream),
+        Err(_) => None,
     };
-    let (mut ws_sender, receiver) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<Message>(32);
+    let (ws_sender, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(32);
+    let (video_tx, video_rx) = watch::channel(None::<Vec<u8>>);
+    let (audio_tx, audio_rx) = watch::channel(None::<Vec<u8>>);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let audio_enabled = audio_stream.is_some();
     let session_id = format!("{:x}", rand_id());
     out_tx
         .send(Message::Text(
             serde_json::to_string(&ServerMessage::Hello {
                 session_id,
+                server_time_ms: current_ms(),
                 display: server.display.clone(),
                 config: config.clone(),
-                active_encoder: stream.encoder.ffmpeg_encoder.clone(),
-                encoder_mode: stream.encoder.mode,
+                active_encoder: video_stream.encoder.ffmpeg_encoder.clone(),
+                encoder_mode: video_stream.encoder.mode,
                 codec_string: config.codec.as_webcodec().into(),
                 description_b64: None,
                 audio_enabled,
@@ -66,63 +73,86 @@ pub async fn handle_socket(
             ))
             .await;
     }
-    let writer_task = tokio::spawn(async move {
-        while let Some(message) = out_rx.recv().await {
-            if futures_util::SinkExt::send(&mut ws_sender, message)
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
+    let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
     let stats_task = spawn_stats(
         out_tx.clone(),
         config.clone(),
-        stream.encoder.ffmpeg_encoder.clone(),
-        stream.encoder.mode,
+        video_stream.encoder.ffmpeg_encoder.clone(),
+        video_stream.encoder.mode,
     );
     let send_task = tokio::spawn(forward_frames(
         out_tx.clone(),
-        stream.rx,
+        video_tx,
+        video_stream.rx.clone(),
         config.clone(),
-        stream.encoder.ffmpeg_encoder.clone(),
-        stream.encoder.mode,
+        video_stream.encoder.ffmpeg_encoder.clone(),
+        video_stream.encoder.mode,
         audio_enabled,
     ));
-    let audio_task =
-        audio_stream.map(|stream| tokio::spawn(forward_audio(out_tx.clone(), stream.rx)));
-    let recv_task = tokio::spawn(handle_client(receiver, out_tx.clone(), server.clone()));
-    let _ = tokio::try_join!(send_task, recv_task);
-    stats_task.abort();
-    if let Some(task) = audio_task {
-        task.abort();
+    let mut audio_task = audio_stream
+        .as_ref()
+        .map(|stream| tokio::spawn(forward_audio(audio_tx, stream.rx.clone())));
+    let mut recv_task = tokio::spawn(handle_client(
+        receiver,
+        out_tx.clone(),
+        server.clone(),
+        shutdown_rx,
+    ));
+    let mut writer_task = writer_task;
+    let mut send_task = send_task;
+
+    tokio::select! {
+        _ = &mut recv_task => {}
+        _ = &mut writer_task => {}
+        _ = &mut send_task => {}
     }
-    writer_task.abort();
-    kill_ffmpeg(video_child).await;
-    if let Some(child) = audio_child {
-        kill_ffmpeg(child).await;
+
+    let _ = shutdown_tx.send(true);
+    stats_task.abort();
+    if let Some(task) = audio_task.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
+    let _ = writer_task.await;
+    if !send_task.is_finished() {
+        send_task.abort();
+    }
+    let _ = send_task.await;
+    if recv_task.is_finished() {
+        let _ = recv_task.await;
+    } else if tokio::time::timeout(Duration::from_secs(1), &mut recv_task)
+        .await
+        .is_err()
+    {
+        recv_task.abort();
+        let _ = recv_task.await;
     }
     Ok(())
 }
 
 async fn forward_frames(
     sender: mpsc::Sender<Message>,
-    mut rx: tokio::sync::mpsc::Receiver<StreamFrame>,
+    media_sender: watch::Sender<Option<Vec<u8>>>,
+    mut rx: watch::Receiver<Option<StreamFrame>>,
     config: StreamConfig,
     encoder: String,
     mode: &'static str,
     audio_enabled: bool,
 ) -> Result<()> {
-    while let Some(frame) = rx.recv().await {
-        sender
-            .send(Message::Binary(binary_frame(&frame).into()))
-            .await?;
+    while rx.changed().await.is_ok() {
+        let Some(frame) = rx.borrow_and_update().clone() else {
+            continue;
+        };
+        let _ = media_sender.send(Some(binary_frame(&frame)));
         if frame.description_b64.is_some() {
             sender
                 .send(Message::Text(
                     serde_json::to_string(&ServerMessage::Hello {
                         session_id: String::new(),
+                        server_time_ms: current_ms(),
                         display: String::new(),
                         config: config.clone(),
                         active_encoder: encoder.clone(),
@@ -140,15 +170,100 @@ async fn forward_frames(
 }
 
 async fn forward_audio(
-    sender: mpsc::Sender<Message>,
-    mut rx: tokio::sync::mpsc::Receiver<AudioFrame>,
+    media_sender: watch::Sender<Option<Vec<u8>>>,
+    mut rx: watch::Receiver<Option<AudioFrame>>,
 ) -> Result<()> {
-    while let Some(frame) = rx.recv().await {
-        sender
-            .send(Message::Binary(binary_audio_frame(&frame).into()))
-            .await?;
+    while rx.changed().await.is_ok() {
+        let Some(frame) = rx.borrow_and_update().clone() else {
+            continue;
+        };
+        let _ = media_sender.send(Some(binary_audio_frame(&frame)));
     }
     Ok(())
+}
+
+async fn write_socket(
+    mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut control_rx: mpsc::Receiver<Message>,
+    mut video_rx: watch::Receiver<Option<Vec<u8>>>,
+    mut audio_rx: watch::Receiver<Option<Vec<u8>>>,
+) {
+    let mut control_closed = false;
+    let mut video_closed = false;
+    let mut audio_closed = false;
+    let mut pending_video: Option<Vec<u8>> = None;
+    let mut pending_audio: Option<Vec<u8>> = None;
+
+    loop {
+        match control_rx.try_recv() {
+            Ok(message) => {
+                if futures_util::SinkExt::send(&mut ws_sender, message)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                control_closed = true;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        }
+
+        if let Some(bytes) = pending_video.take() {
+            if futures_util::SinkExt::send(&mut ws_sender, Message::Binary(bytes.into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
+
+        if let Some(bytes) = pending_audio.take() {
+            if futures_util::SinkExt::send(&mut ws_sender, Message::Binary(bytes.into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
+
+        if control_closed && video_closed && audio_closed {
+            break;
+        }
+
+        tokio::select! {
+            maybe = control_rx.recv(), if !control_closed => {
+                match maybe {
+                    Some(message) => {
+                        if futures_util::SinkExt::send(&mut ws_sender, message).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => control_closed = true,
+                }
+            }
+            changed = video_rx.changed(), if !video_closed => {
+                match changed {
+                    Ok(()) => {
+                        pending_video = video_rx.borrow_and_update().clone();
+                    }
+                    Err(_) => video_closed = true,
+                }
+            }
+            changed = audio_rx.changed(), if !audio_closed => {
+                match changed {
+                    Ok(()) => {
+                        pending_audio = audio_rx.borrow_and_update().clone();
+                    }
+                    Err(_) => audio_closed = true,
+                }
+            }
+        }
+    }
 }
 
 fn spawn_stats(
@@ -197,23 +312,53 @@ async fn handle_client(
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
     sender: mpsc::Sender<Message>,
     server: ServerConfig,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut pressed_keys = HashSet::new();
     let mut mic_input = MicInputState::Idle;
-    while let Some(message) = receiver.next().await {
-        match message? {
-            Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(client) => {
-                    apply_client_message(&server.display, &sender, client, &mut pressed_keys)
-                        .await?
+    let mut last_key_state_at = None;
+    let mut key_watchdog = tokio::time::interval(KEY_STATE_WATCHDOG_INTERVAL);
+    key_watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            message = receiver.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+                match message? {
+                    Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(client) => {
+                            apply_client_message(
+                                &server.display,
+                                &sender,
+                                client,
+                                &mut pressed_keys,
+                                &mut last_key_state_at,
+                            )
+                            .await?
+                        }
+                        Err(err) => warn!("invalid client message: {err}"),
+                    },
+                    Message::Binary(bytes) => {
+                        forward_client_binary(&server, &sender, bytes.as_ref(), &mut mic_input).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
-                Err(err) => warn!("invalid client message: {err}"),
-            },
-            Message::Binary(bytes) => {
-                forward_client_binary(&server, &sender, bytes.as_ref(), &mut mic_input).await;
             }
-            Message::Close(_) => break,
-            _ => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            _ = key_watchdog.tick() => {
+                if let Some(last_key_state) = last_key_state_at {
+                    if !pressed_keys.is_empty() && last_key_state.elapsed() > KEY_STATE_TIMEOUT {
+                        release_pressed_keys(&server.display, &mut pressed_keys).await?;
+                        last_key_state_at = None;
+                    }
+                }
+            }
         }
     }
     reset_input_state(&server.display, &mut pressed_keys).await?;
@@ -226,6 +371,7 @@ async fn apply_client_message(
     sender: &mpsc::Sender<Message>,
     message: ClientMessage,
     pressed_keys: &mut HashSet<String>,
+    last_key_state_at: &mut Option<Instant>,
 ) -> Result<()> {
     match message {
         ClientMessage::PointerMove { dx, dy } => {
@@ -262,12 +408,28 @@ async fn apply_client_message(
             }
             let action = if down { "keydown" } else { "keyup" };
             run_xdotool(display, [action, &key]).await?;
+            *last_key_state_at = if pressed_keys.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
+        }
+        ClientMessage::KeyState {
+            pressed_keys: desired_keys,
+        } => {
+            sync_pressed_keys(display, pressed_keys, desired_keys).await?;
+            *last_key_state_at = if pressed_keys.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
         }
         ClientMessage::TextInput { text } => {
             type_remote_text(display, &text).await?;
         }
         ClientMessage::Paste => {
             reset_input_state(display, pressed_keys).await?;
+            *last_key_state_at = None;
             run_xdotool(display, ["key", "ctrl+v"]).await?;
         }
         ClientMessage::PasteClipboard { payload } => {
@@ -283,15 +445,21 @@ async fn apply_client_message(
                 ))
                 .await?;
             reset_input_state(display, pressed_keys).await?;
+            *last_key_state_at = None;
             run_xdotool(display, ["key", "ctrl+v"]).await?;
         }
         ClientMessage::ResetInput => {
             reset_input_state(display, pressed_keys).await?;
+            *last_key_state_at = None;
         }
         ClientMessage::Ping { seq } => {
             sender
                 .send(Message::Text(
-                    serde_json::to_string(&ServerMessage::Pong { seq })?.into(),
+                    serde_json::to_string(&ServerMessage::Pong {
+                        seq,
+                        server_time_ms: current_ms(),
+                    })?
+                    .into(),
                 ))
                 .await?;
         }
@@ -314,13 +482,75 @@ async fn apply_client_message(
     Ok(())
 }
 
+fn key_chord_rank(key: &str) -> usize {
+    match key {
+        "Control_L" | "Control_R" => 0,
+        "Shift_L" | "Shift_R" => 1,
+        "Alt_L" | "Alt_R" => 2,
+        "Super_L" | "Super_R" => 3,
+        _ => 10,
+    }
+}
+
+async fn sync_pressed_keys(
+    display: &str,
+    pressed_keys: &mut HashSet<String>,
+    desired_keys: Vec<String>,
+) -> Result<()> {
+    let mut desired_set = HashSet::new();
+    let mut ordered_desired_keys = Vec::new();
+    for key in desired_keys {
+        if desired_set.insert(key.clone()) {
+            ordered_desired_keys.push(key);
+        }
+    }
+
+    let mut keys_to_release: Vec<String> = pressed_keys
+        .iter()
+        .filter(|key| !desired_set.contains(*key))
+        .cloned()
+        .collect();
+    keys_to_release.sort_by(|left, right| {
+        key_chord_rank(right)
+            .cmp(&key_chord_rank(left))
+            .then_with(|| left.cmp(right))
+    });
+    for key in keys_to_release {
+        run_xdotool(display, ["keyup", &key]).await?;
+        pressed_keys.remove(&key);
+    }
+
+    let mut keys_to_press = ordered_desired_keys
+        .iter()
+        .filter(|key| !pressed_keys.contains(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    keys_to_press.sort_by(|left, right| key_chord_rank(left).cmp(&key_chord_rank(right)));
+    for key in keys_to_press {
+        run_xdotool(display, ["keydown", &key]).await?;
+        pressed_keys.insert(key);
+    }
+    Ok(())
+}
+
+async fn release_pressed_keys(display: &str, pressed_keys: &mut HashSet<String>) -> Result<()> {
+    let mut keys = pressed_keys.drain().collect::<Vec<_>>();
+    keys.sort_by(|left, right| {
+        key_chord_rank(right)
+            .cmp(&key_chord_rank(left))
+            .then_with(|| left.cmp(right))
+    });
+    for key in keys {
+        run_xdotool(display, ["keyup", &key]).await?;
+    }
+    Ok(())
+}
+
 async fn reset_input_state(display: &str, pressed_keys: &mut HashSet<String>) -> Result<()> {
     for button in ["1", "2", "3", "4", "5"] {
         run_xdotool(display, ["mouseup", button]).await?;
     }
-    for key in pressed_keys.drain() {
-        run_xdotool(display, ["keyup", &key]).await?;
-    }
+    release_pressed_keys(display, pressed_keys).await?;
     for key in [
         "Shift_L",
         "Shift_R",
@@ -334,6 +564,26 @@ async fn reset_input_state(display: &str, pressed_keys: &mut HashSet<String>) ->
         run_xdotool(display, ["keyup", key]).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_chord_rank;
+
+    #[test]
+    fn chord_modifiers_sort_before_regular_keys() {
+        let mut keys = vec![
+            "v".to_string(),
+            "Shift_L".to_string(),
+            "Control_L".to_string(),
+        ];
+        keys.sort_by(|left, right| {
+            key_chord_rank(left)
+                .cmp(&key_chord_rank(right))
+                .then_with(|| left.cmp(right))
+        });
+        assert_eq!(keys, vec!["Control_L", "Shift_L", "v"]);
+    }
 }
 
 async fn type_remote_text(display: &str, text: &str) -> Result<()> {
@@ -369,17 +619,6 @@ async fn send_clipboard_update(display: &str, sender: &mpsc::Sender<Message>) ->
         ))
         .await?;
     Ok(())
-}
-
-async fn kill_ffmpeg(child: Arc<Mutex<Child>>) {
-    let mut child = child.lock().await;
-    if let Err(err) = child.kill().await {
-        warn!("ffmpeg kill failed: {err}");
-    }
-    let stderr = read_stderr(&mut child).await;
-    if !stderr.trim().is_empty() {
-        warn!("ffmpeg stderr: {}", stderr.trim());
-    }
 }
 
 fn binary_frame(frame: &StreamFrame) -> Vec<u8> {
