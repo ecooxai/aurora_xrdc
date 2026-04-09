@@ -39,8 +39,26 @@ impl Default for StreamConfig {
 
 impl StreamConfig {
     pub fn normalized(mut self) -> Self {
-        self.bitrate_kbps = self.bitrate_kbps.clamp(250, 25_000);
+        self.bitrate_kbps = self.bitrate_kbps.clamp(128, 25_000);
         self.fps = self.fps.clamp(1, 60);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AudioStreamConfig {
+    pub bitrate_kbps: u32,
+}
+
+impl Default for AudioStreamConfig {
+    fn default() -> Self {
+        Self { bitrate_kbps: 128 }
+    }
+}
+
+impl AudioStreamConfig {
+    pub fn normalized(mut self) -> Self {
+        self.bitrate_kbps = self.bitrate_kbps.clamp(16, 320);
         self
     }
 }
@@ -166,7 +184,7 @@ fn bind_with_port(bind: &str, port: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodecKind, ServerConfig, StreamConfig};
+    use super::{AudioStreamConfig, CodecKind, ServerConfig, StreamConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -177,8 +195,16 @@ mod tests {
             fps: 99,
         }
         .normalized();
-        assert_eq!(cfg.bitrate_kbps, 250);
+        assert_eq!(cfg.bitrate_kbps, 128);
         assert_eq!(cfg.fps, 60);
+    }
+
+    #[test]
+    fn audio_stream_config_clamps_values() {
+        let cfg = AudioStreamConfig { bitrate_kbps: 999 }.normalized();
+        assert_eq!(cfg.bitrate_kbps, 320);
+        let cfg = AudioStreamConfig { bitrate_kbps: 1 }.normalized();
+        assert_eq!(cfg.bitrate_kbps, 16);
     }
 
     #[test]

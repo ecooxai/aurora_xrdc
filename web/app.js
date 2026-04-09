@@ -18,12 +18,24 @@ const KEY_STATE_SYNC_INTERVAL_MS = 500;
 const MAX_VIDEO_DECODE_QUEUE = 4;
 const MAX_AUDIO_DECODE_QUEUE = 12;
 const AUTO_DISCONNECT_DISABLED_MINUTES = 0;
+const AUTO_DISCONNECT_ACTIVITY_REFRESH_MS = 1000;
+const SETTINGS_RECONNECT_DELAY_MS = 3000;
+const AUTO_DISCONNECT_ACTIVITY_MESSAGE_TYPES = new Set([
+  "key",
+  "key_state",
+  "pointer_absolute",
+  "pointer_button",
+  "pointer_move",
+  "pointer_wheel",
+  "text_input",
+]);
 const state = {
   socket: null,
   decoder: null,
   audioDecoder: null,
   audioContext: null,
   audioSources: new Set(),
+  micRecorder: null,
   micAudioContext: null,
   micStream: null,
   micSourceNode: null,
@@ -32,6 +44,7 @@ const state = {
   micCompressorNode: null,
   micProcessorNode: null,
   micSilenceNode: null,
+  micStreamId: 0,
   micEnabled: false,
   micStarting: false,
   cameraRecorder: null,
@@ -50,6 +63,8 @@ const state = {
   pendingVideoFrame: null,
   renderingVideoFrame: false,
   audioNextTime: 0,
+  pendingAudioBuffers: [],
+  pendingAudioDuration: 0,
   waitingForKeyframe: true,
   frameCount: 0,
   bytesReceived: 0,
@@ -58,6 +73,7 @@ const state = {
   netKbps: 0,
   manualDisconnect: false,
   reconnectTimer: null,
+  settingsReconnectTimer: null,
   reconnectAttempt: 0,
   touchPointers: new Map(),
   touchLongPressTimer: 0,
@@ -94,7 +110,9 @@ const state = {
   lastStaleDropAt: 0,
   highLatencySinceAt: 0,
   reconnectingForLatency: false,
+  appliedStreamSettingsKey: "",
   autoDisconnectTimer: null,
+  lastAutoDisconnectActivityAt: 0,
 };
 
 const status = $("status");
@@ -117,6 +135,8 @@ const encoderStatus = $("encoder-status");
 const codecSelect = $("codec");
 const bitrateInput = $("bitrate");
 const bitrateValue = $("bitrate-value");
+const audioBitrateSelect = $("audio-bitrate");
+const micBitrateSelect = $("mic-bitrate");
 const fpsInput = $("fps");
 const fpsValue = $("fps-value");
 const scrollSpeedInput = $("scroll-speed");
@@ -160,19 +180,24 @@ const AUDIO_BUFFER_PROFILES = [
   { minLatencyMs: 0, targetLeadSeconds: 0.05, maxQueueSeconds: 0.16, resetGraceSeconds: 0.05 },
 ];
 const MIC_CHUNK_KIND = 3;
-const MIC_SAMPLE_RATE_HEADER_BYTES = 4;
-const MIC_CHANNEL_HEADER_BYTES = 1;
-const MIC_HEADER_BYTES = 1 + MIC_SAMPLE_RATE_HEADER_BYTES + MIC_CHANNEL_HEADER_BYTES;
-const MIC_BUFFER_SIZE = 512;
-const MIC_NOISE_FLOOR = 0.008;
-const MIC_GATE_ATTACK = 0.35;
-const MIC_GATE_RELEASE = 0.985;
+const MIC_STREAM_ID_BYTES = 4;
+const MIC_HEADER_BYTES = 1 + MIC_STREAM_ID_BYTES;
+const MIC_CHUNK_MS = 100;
+const MIC_MIME_CANDIDATES = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+];
 const CAMERA_CHUNK_MS = 1000;
 const CAMERA_MIME_CANDIDATES = [
   "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
   "video/mp4;codecs=avc1,mp4a.40.2",
   "video/mp4",
 ];
+const VIDEO_CODEC_STRINGS = {
+  h264: "avc1.64001f",
+  h265: "hvc1.1.6.L93.B0",
+  vp8: "vp8",
+};
 const MOBILE_KEYBOARD_SPECIAL_KEYS = new Set([
   "Backspace",
   "Delete",
@@ -375,6 +400,58 @@ function forceReconnect(reason) {
   }, 150);
 }
 
+function clearSettingsReconnectTimer() {
+  if (!state.settingsReconnectTimer) return;
+  clearTimeout(state.settingsReconnectTimer);
+  state.settingsReconnectTimer = null;
+}
+
+function streamReconnectSettingsKey(settings = readSettingsFromControls()) {
+  return JSON.stringify({
+    codec: settings.codec,
+    bitrate: settings.bitrate,
+    audioBitrateKbps: settings.audioBitrateKbps,
+    fps: settings.fps,
+  });
+}
+
+function markAppliedStreamSettings(settings) {
+  state.appliedStreamSettingsKey = streamReconnectSettingsKey(settings);
+}
+
+function reconnectForSettings(reason) {
+  if (state.connecting) return;
+  clearSettingsReconnectTimer();
+  showToast("settings_reconnect", reason);
+  closeConnection({ manual: false, preserveStatus: true });
+  setStatus("Reconnecting...");
+  setTimeout(() => {
+    if (state.connecting) return;
+    void connect();
+  }, 150);
+}
+
+function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
+  const socketOpen = state.socket?.readyState === WebSocket.OPEN;
+  if (!socketOpen || state.connecting || state.reconnectingForLatency) {
+    clearSettingsReconnectTimer();
+    return;
+  }
+  const nextKey = streamReconnectSettingsKey(settings);
+  if (!state.appliedStreamSettingsKey || nextKey === state.appliedStreamSettingsKey) {
+    clearSettingsReconnectTimer();
+    return;
+  }
+  clearSettingsReconnectTimer();
+  state.settingsReconnectTimer = setTimeout(() => {
+    state.settingsReconnectTimer = null;
+    if (state.socket?.readyState !== WebSocket.OPEN || state.connecting) return;
+    const latestSettings = readSettingsFromControls();
+    if (streamReconnectSettingsKey(latestSettings) === state.appliedStreamSettingsKey) return;
+    reconnectForSettings("Reconnect to apply stream settings");
+  }, SETTINGS_RECONNECT_DELAY_MS);
+}
+
 function monitorConnectionHealth() {
   const now = performance.now();
   const socketOpen = state.socket?.readyState === WebSocket.OPEN;
@@ -441,14 +518,24 @@ function clampControlValue(control, value, fallback) {
 
 function normalizeSettings(settings = {}) {
   const allowedCodecs = new Set(Array.from(codecSelect.options, (option) => option.value));
+  const allowedAudioBitrates = new Set(Array.from(audioBitrateSelect.options, (option) => Number(option.value)));
+  const allowedMicBitrates = new Set(Array.from(micBitrateSelect.options, (option) => Number(option.value)));
   const allowedTouchModes = new Set(Array.from(touchModeSelect.options, (option) => option.value));
   const defaultBitrate = Number(bitrateInput.value);
+  const defaultAudioBitrate = Number(audioBitrateSelect.value);
+  const defaultMicBitrate = Number(micBitrateSelect.value);
   const defaultFps = Number(fpsInput.value);
   const defaultScrollSpeed = Number(scrollSpeedInput.value);
   const defaultAutoDisconnectMinutes = Number(autoDisconnectMinutesInput.value);
   return {
     codec: allowedCodecs.has(settings.codec) ? settings.codec : codecSelect.value,
     bitrate: clampControlValue(bitrateInput, settings.bitrate, defaultBitrate),
+    audioBitrateKbps: allowedAudioBitrates.has(Number(settings.audioBitrateKbps))
+      ? Number(settings.audioBitrateKbps)
+      : defaultAudioBitrate,
+    micBitrateKbps: allowedMicBitrates.has(Number(settings.micBitrateKbps))
+      ? Number(settings.micBitrateKbps)
+      : defaultMicBitrate,
     fps: clampControlValue(fpsInput, settings.fps, defaultFps),
     scrollSpeed: clampControlValue(scrollSpeedInput, settings.scrollSpeed, defaultScrollSpeed),
     touchMode: allowedTouchModes.has(settings.touchMode) ? settings.touchMode : touchModeSelect.value,
@@ -468,6 +555,8 @@ function readSettingsFromControls() {
   return normalizeSettings({
     codec: codecSelect.value,
     bitrate: bitrateInput.value,
+    audioBitrateKbps: audioBitrateSelect.value,
+    micBitrateKbps: micBitrateSelect.value,
     fps: fpsInput.value,
     scrollSpeed: scrollSpeedInput.value,
     audioLatencyMs: audioLatencyInput.value,
@@ -528,6 +617,8 @@ function applySettings(settings) {
   const normalized = normalizeSettings(settings);
   codecSelect.value = normalized.codec;
   bitrateInput.value = String(normalized.bitrate);
+  audioBitrateSelect.value = String(normalized.audioBitrateKbps);
+  micBitrateSelect.value = String(normalized.micBitrateKbps);
   fpsInput.value = String(normalized.fps);
   scrollSpeedInput.value = String(normalized.scrollSpeed);
   audioLatencyInput.value = String(normalized.audioLatencyMs);
@@ -548,6 +639,7 @@ function persistCurrentSettings() {
   syncTouchModeControls(settings);
   saveSettings(settings);
   syncAutoDisconnectTimer(settings);
+  maybeScheduleSettingsReconnect(settings);
 }
 
 function clearAutoDisconnectTimer() {
@@ -567,6 +659,14 @@ function syncAutoDisconnectTimer(settings = readSettingsFromControls()) {
   }, settings.autoDisconnectMinutes * 60 * 1000);
 }
 
+function noteAutoDisconnectActivity(message) {
+  if (!AUTO_DISCONNECT_ACTIVITY_MESSAGE_TYPES.has(message?.type)) return;
+  const now = performance.now();
+  if (now - state.lastAutoDisconnectActivityAt < AUTO_DISCONNECT_ACTIVITY_REFRESH_MS) return;
+  state.lastAutoDisconnectActivityAt = now;
+  syncAutoDisconnectTimer();
+}
+
 function getPassword() {
   return state.passwd || authInput.value.trim();
 }
@@ -576,6 +676,69 @@ function authUrl(path) {
   const passwd = getPassword();
   if (passwd) url.searchParams.set("passwd", passwd);
   return url;
+}
+
+async function getVideoCodecSupport(codec) {
+  const codecStrings = videoCodecCandidates(codec);
+  if (codecStrings.length === 0) {
+    return { supported: false, message: `Unknown video codec: ${codec}` };
+  }
+  const resolved = await resolveSupportedVideoCodecString(codecStrings);
+  return resolved.supported
+    ? { supported: true, codecString: resolved.codecString }
+    : { supported: false, message: `This browser does not support ${codec.toUpperCase()} video decode` };
+}
+
+function videoCodecCandidates(codecOrCodecString) {
+  if (!codecOrCodecString) return [];
+  if (codecOrCodecString === "h265") {
+    return ["hvc1.1.6.L93.B0", "hev1.1.6.L93.B0"];
+  }
+  if (VIDEO_CODEC_STRINGS[codecOrCodecString]) {
+    return [VIDEO_CODEC_STRINGS[codecOrCodecString]];
+  }
+  if (codecOrCodecString.startsWith("hvc1.")) {
+    return [codecOrCodecString, codecOrCodecString.replace(/^hvc1\./, "hev1.")];
+  }
+  if (codecOrCodecString.startsWith("hev1.")) {
+    return [codecOrCodecString, codecOrCodecString.replace(/^hev1\./, "hvc1.")];
+  }
+  return [codecOrCodecString];
+}
+
+async function resolveSupportedVideoCodecString(codecStrings, description = null) {
+  let decoder = null;
+  for (const codecString of codecStrings) {
+    const config = { codec: codecString, optimizeForLatency: true };
+    if (description) {
+      config.description = description;
+    }
+    if (!("VideoDecoder" in window)) {
+      return { supported: false };
+    }
+    if (typeof VideoDecoder.isConfigSupported === "function") {
+      try {
+        const result = await VideoDecoder.isConfigSupported(config);
+        if (result.supported) {
+          return { supported: true, codecString };
+        }
+      } catch {
+        // Fall back to direct configure probing below.
+      }
+    }
+    try {
+      decoder = new VideoDecoder({
+        output: (frame) => frame.close(),
+        error: () => {},
+      });
+      decoder.configure(config);
+      return { supported: true, codecString };
+    } catch {
+      decoder?.close();
+      decoder = null;
+    }
+  }
+  return { supported: false };
 }
 
 function normalizeClipboardHistory(entries) {
@@ -652,8 +815,24 @@ async function connect() {
     state.manualDisconnect = false;
     clearTimeout(state.reconnectTimer);
     void primeAudioPlayback();
-    const { codec, bitrate, fps } = readSettingsFromControls();
+    const {
+      codec,
+      bitrate,
+      audioBitrateKbps,
+      fps,
+    } = readSettingsFromControls();
+    const requestedStreamSettings = { codec, bitrate, audioBitrateKbps, fps };
+    const videoCodecSupport = await getVideoCodecSupport(codec);
+    if (!videoCodecSupport.supported) {
+      setStatus("Disconnected");
+      setEncoderStatus("Not connected");
+      showToast("codec_unsupported", videoCodecSupport.message);
+      return;
+    }
     state.activeCodec = codec;
+    if (videoCodecSupport.codecString) {
+      state.codecString = videoCodecSupport.codecString;
+    }
     state.frameCount = 0;
     state.bytesReceived = 0;
     state.netWindowBytes = 0;
@@ -663,6 +842,7 @@ async function connect() {
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("codec", codec);
     url.searchParams.set("bitrate_kbps", bitrate);
+    url.searchParams.set("audio_bitrate_kbps", audioBitrateKbps);
     url.searchParams.set("fps", fps);
     url.searchParams.set("passwd", passwd);
     setStatus("Connecting...");
@@ -670,6 +850,7 @@ async function connect() {
     state.socket = new WebSocket(url);
     state.socket.binaryType = "arraybuffer";
     state.socket.onopen = () => {
+      markAppliedStreamSettings(requestedStreamSettings);
       state.reconnectAttempt = 0;
       state.reconnectingForLatency = false;
       state.highLatencySinceAt = 0;
@@ -683,6 +864,7 @@ async function connect() {
       if (state.micEnabled) {
         void startMicrophoneCapture();
       }
+      maybeScheduleSettingsReconnect();
     };
     state.socket.onclose = () => {
       setStatus("Disconnected");
@@ -711,6 +893,7 @@ async function connect() {
 function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.manualDisconnect = manual;
   clearTimeout(state.reconnectTimer);
+  clearSettingsReconnectTimer();
   clearAutoDisconnectTimer();
   stopKeyStateSync();
   clearInterval(startPing.timer);
@@ -827,14 +1010,21 @@ function handleServerMessage(message) {
     if (message.session_id) {
       state.sessionId = message.session_id;
     }
+    const codecStringChanged = typeof message.codec_string === "string"
+      && message.codec_string !== state.codecString;
     if (message.codec_string) {
       state.codecString = message.codec_string;
     }
+    if (message.config?.codec) {
+      state.activeCodec = message.config.codec;
+    }
     if (message.description_b64) {
       state.description = Uint8Array.from(atob(message.description_b64), (c) => c.charCodeAt(0));
+    } else if (codecStringChanged) {
+      state.description = null;
     }
     state.audioEnabled = !!message.audio_enabled;
-    setupDecoder();
+    void setupDecoder();
     if (!state.audioEnabled) {
       state.audioDecoder?.close();
       state.audioDecoder = null;
@@ -860,13 +1050,26 @@ function handleServerMessage(message) {
   }
 }
 
-function setupDecoder() {
+async function setupDecoder() {
   if (!("VideoDecoder" in window)) {
     showToast("webcodecs_missing", "This browser does not support WebCodecs");
     return;
   }
-  const configKey = `${state.codecString}:${state.description ? btoa(String.fromCharCode(...state.description)) : ""}`;
+  const codecSupport = await resolveSupportedVideoCodecString(
+    videoCodecCandidates(state.codecString),
+    state.description,
+  );
+  if (!codecSupport.supported) {
+    state.decoder?.close();
+    state.decoder = null;
+    state.decoderConfigKey = "";
+    showToast("decoder_config_failed", `Decoder does not support ${state.codecString}`);
+    return;
+  }
+  const selectedCodecString = codecSupport.codecString;
+  const configKey = `${selectedCodecString}:${state.description ? btoa(String.fromCharCode(...state.description)) : ""}`;
   if (state.decoder && state.decoder.state !== "closed" && state.decoderConfigKey === configKey) {
+    state.codecString = selectedCodecString;
     return;
   }
   state.decoder?.close();
@@ -876,11 +1079,19 @@ function setupDecoder() {
     },
     error: (err) => showToast("decoder_error", err.message || String(err)),
   });
-  const config = { codec: state.codecString, optimizeForLatency: true };
+  const config = { codec: selectedCodecString, optimizeForLatency: true };
   if (state.description) config.description = state.description;
-  state.decoder.configure(config);
-  state.decoderConfigKey = configKey;
-  state.waitingForKeyframe = true;
+  try {
+    state.decoder.configure(config);
+    state.codecString = selectedCodecString;
+    state.decoderConfigKey = configKey;
+    state.waitingForKeyframe = true;
+  } catch (error) {
+    state.decoder?.close();
+    state.decoder = null;
+    state.decoderConfigKey = "";
+    showToast("decoder_config_failed", error.message || String(error));
+  }
 }
 
 function clearPendingVideoFrame() {
@@ -896,7 +1107,7 @@ function resetVideoDecoderForLiveCatchup() {
   state.decoder?.close();
   state.decoder = null;
   state.decoderConfigKey = "";
-  setupDecoder();
+  void setupDecoder();
   state.waitingForKeyframe = true;
 }
 
@@ -1117,23 +1328,76 @@ function resetAudioPlayback() {
   }
   state.audioSources.clear();
   state.audioNextTime = 0;
+  state.pendingAudioBuffers = [];
+  state.pendingAudioDuration = 0;
+}
+
+function currentConfiguredAudioLatencyMs() {
+  return clampControlValue(
+    audioLatencyInput,
+    audioLatencyInput.value,
+    Number(audioLatencyInput.value),
+  );
 }
 
 function currentAudioBufferProfile() {
   const latencyMs = Number.isFinite(state.wsLatencyMs) ? state.wsLatencyMs : 0;
   const profile = AUDIO_BUFFER_PROFILES.find((entry) => latencyMs >= entry.minLatencyMs)
     || AUDIO_BUFFER_PROFILES[AUDIO_BUFFER_PROFILES.length - 1];
-  const extraLatencyMs = clampControlValue(
-    audioLatencyInput,
-    audioLatencyInput.value,
-    Number(audioLatencyInput.value),
-  );
+  const extraLatencyMs = currentConfiguredAudioLatencyMs();
   const extraSeconds = extraLatencyMs / 1000;
   return {
     targetLeadSeconds: profile.targetLeadSeconds + extraSeconds,
     maxQueueSeconds: profile.maxQueueSeconds + extraSeconds,
     resetGraceSeconds: Math.max(profile.resetGraceSeconds, 0.05),
   };
+}
+
+function currentAudioStartSlack(audioContext) {
+  const baseLatency = Number.isFinite(audioContext?.baseLatency) ? audioContext.baseLatency : 0;
+  return Math.max(0.01, Math.min(0.04, Math.max(baseLatency * 2, 0.02)));
+}
+
+function scheduleAudioBuffer(audioContext, audioBuffer, profile = currentAudioBufferProfile()) {
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+  const now = audioContext.currentTime;
+  const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
+  if (!state.audioNextTime || state.audioNextTime < now - profile.resetGraceSeconds) {
+    state.audioNextTime = now + currentAudioStartSlack(audioContext);
+  } else if (queuedFor > profile.maxQueueSeconds) {
+    resetAudioPlayback();
+    state.audioNextTime = now + currentAudioStartSlack(audioContext);
+  }
+  state.audioSources.add(source);
+  source.start(state.audioNextTime);
+  state.audioNextTime += audioBuffer.duration;
+  source.onended = () => {
+    state.audioSources.delete(source);
+    source.disconnect();
+  };
+}
+
+function flushPendingAudioPlayback(audioContext) {
+  const profile = currentAudioBufferProfile();
+  while (state.pendingAudioBuffers.length > 0) {
+    const now = audioContext.currentTime;
+    const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
+    const playbackStale = !state.audioNextTime || state.audioNextTime < now - profile.resetGraceSeconds;
+    if (playbackStale && state.pendingAudioDuration < profile.targetLeadSeconds) {
+      break;
+    }
+    if (!playbackStale && queuedFor >= profile.maxQueueSeconds) {
+      break;
+    }
+    const nextBuffer = state.pendingAudioBuffers.shift();
+    if (!nextBuffer) {
+      break;
+    }
+    state.pendingAudioDuration = Math.max(0, state.pendingAudioDuration - nextBuffer.duration);
+    scheduleAudioBuffer(audioContext, nextBuffer, profile);
+  }
 }
 
 async function ensureAudioContext() {
@@ -1155,21 +1419,27 @@ async function primeAudioPlayback() {
   }
 }
 
+function currentConfiguredMicBitrateBps() {
+  return readSettingsFromControls().micBitrateKbps * 1000;
+}
+
 async function startMicrophoneCapture() {
-  if (!navigator.mediaDevices?.getUserMedia) return;
-  if (state.micProcessorNode || state.micStarting || !state.micEnabled) return;
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) return;
+  if (state.micRecorder || state.micStarting || !state.micEnabled) return;
   state.micStarting = true;
   renderMicToggle();
   try {
+    const mimeType = pickMicMimeType();
+    if (!mimeType) {
+      throw new Error("This browser cannot record microphone uplink as Opus");
+    }
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        sampleRate: 48000,
-        sampleSize: 16,
         latency: 0.02,
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: false,
+        autoGainControl: true,
       },
     });
     if (state.socket?.readyState !== WebSocket.OPEN) {
@@ -1179,72 +1449,31 @@ async function startMicrophoneCapture() {
       return;
     }
     stopMicrophoneCapture();
-    const audioContext = new AudioContext({
-      latencyHint: "interactive",
-      sampleRate: 48000,
+    state.micStreamId += 1;
+    const streamId = state.micStreamId >>> 0;
+    const recorder = new MediaRecorder(stream, {
+      mimeType,
+      audioBitsPerSecond: currentConfiguredMicBitrateBps(),
     });
-    const sourceNode = audioContext.createMediaStreamSource(stream);
-    const highpassNode = audioContext.createBiquadFilter();
-    highpassNode.type = "highpass";
-    highpassNode.frequency.value = 120;
-    highpassNode.Q.value = 0.8;
-    const lowpassNode = audioContext.createBiquadFilter();
-    lowpassNode.type = "lowpass";
-    lowpassNode.frequency.value = 7200;
-    lowpassNode.Q.value = 0.7;
-    const compressorNode = audioContext.createDynamicsCompressor();
-    compressorNode.threshold.value = -24;
-    compressorNode.knee.value = 18;
-    compressorNode.ratio.value = 3;
-    compressorNode.attack.value = 0.003;
-    compressorNode.release.value = 0.14;
-    const processorNode = audioContext.createScriptProcessor(MIC_BUFFER_SIZE, 1, 1);
-    const silenceNode = audioContext.createGain();
-    silenceNode.gain.value = 0;
-    let gateGain = 1;
-    processorNode.onaudioprocess = (event) => {
-      if (state.socket?.readyState !== WebSocket.OPEN) return;
-      const input = event.inputBuffer.getChannelData(0);
-      let peak = 0;
-      for (let i = 0; i < input.length; i += 1) {
-        peak = Math.max(peak, Math.abs(input[i]));
-      }
-      const targetGate = peak < MIC_NOISE_FLOOR ? 0 : 1;
-      const gateSmoothing = targetGate > gateGain ? MIC_GATE_ATTACK : MIC_GATE_RELEASE;
-      gateGain += (targetGate - gateGain) * gateSmoothing;
-      if (gateGain < 0.002) {
-        gateGain = 0;
-      }
-      const payload = new Uint8Array(input.length * 2);
-      const view = new DataView(payload.buffer);
-      for (let i = 0; i < input.length; i += 1) {
-        const sample = Math.max(-1, Math.min(1, input[i] * gateGain));
-        const pcm = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-        view.setInt16(i * 2, pcm, true);
-      }
+    recorder.ondataavailable = async (event) => {
+      if (state.socket?.readyState !== WebSocket.OPEN || !event.data || event.data.size === 0) return;
+      const payload = new Uint8Array(await event.data.arrayBuffer());
       const message = new Uint8Array(MIC_HEADER_BYTES + payload.byteLength);
       const header = new DataView(message.buffer);
       header.setUint8(0, MIC_CHUNK_KIND);
-      header.setUint32(1, audioContext.sampleRate, true);
-      header.setUint8(5, 1);
+      header.setUint32(1, streamId, true);
       message.set(payload, MIC_HEADER_BYTES);
       sendBinary(message);
     };
-    sourceNode.connect(highpassNode);
-    highpassNode.connect(lowpassNode);
-    lowpassNode.connect(compressorNode);
-    compressorNode.connect(processorNode);
-    processorNode.connect(silenceNode);
-    silenceNode.connect(audioContext.destination);
-    await audioContext.resume();
-    state.micAudioContext = audioContext;
+    recorder.onerror = () => {
+      showToast("mic_record_failed", "Microphone recorder stopped unexpectedly");
+      state.micEnabled = false;
+      persistCurrentSettings();
+      stopMicrophoneCapture();
+    };
+    recorder.start(MIC_CHUNK_MS);
+    state.micRecorder = recorder;
     state.micStream = stream;
-    state.micSourceNode = sourceNode;
-    state.micHighpassNode = highpassNode;
-    state.micLowpassNode = lowpassNode;
-    state.micCompressorNode = compressorNode;
-    state.micProcessorNode = processorNode;
-    state.micSilenceNode = silenceNode;
   } catch (error) {
     showToast("mic_access_failed", error.message || String(error));
     state.micEnabled = false;
@@ -1257,54 +1486,17 @@ async function startMicrophoneCapture() {
 
 function stopMicrophoneCapture() {
   state.micStarting = false;
-  if (state.micProcessorNode) {
-    state.micProcessorNode.onaudioprocess = null;
+  if (state.micRecorder) {
     try {
-      state.micProcessorNode.disconnect();
+      if (state.micRecorder.state !== "inactive") {
+        state.micRecorder.stop();
+      }
     } catch {
-      // Ignore graph teardown errors during reconnect/close.
+      // Ignore recorder shutdown errors during reconnect/close.
     }
-    state.micProcessorNode = null;
-  }
-  if (state.micSourceNode) {
-    try {
-      state.micSourceNode.disconnect();
-    } catch {
-      // Ignore graph teardown errors during reconnect/close.
-    }
-    state.micSourceNode = null;
-  }
-  if (state.micHighpassNode) {
-    try {
-      state.micHighpassNode.disconnect();
-    } catch {
-      // Ignore graph teardown errors during reconnect/close.
-    }
-    state.micHighpassNode = null;
-  }
-  if (state.micLowpassNode) {
-    try {
-      state.micLowpassNode.disconnect();
-    } catch {
-      // Ignore graph teardown errors during reconnect/close.
-    }
-    state.micLowpassNode = null;
-  }
-  if (state.micCompressorNode) {
-    try {
-      state.micCompressorNode.disconnect();
-    } catch {
-      // Ignore graph teardown errors during reconnect/close.
-    }
-    state.micCompressorNode = null;
-  }
-  if (state.micSilenceNode) {
-    try {
-      state.micSilenceNode.disconnect();
-    } catch {
-      // Ignore graph teardown errors during reconnect/close.
-    }
-    state.micSilenceNode = null;
+    state.micRecorder.ondataavailable = null;
+    state.micRecorder.onerror = null;
+    state.micRecorder = null;
   }
   if (state.micStream) {
     for (const track of state.micStream.getTracks()) {
@@ -1312,12 +1504,22 @@ function stopMicrophoneCapture() {
     }
     state.micStream = null;
   }
-  if (state.micAudioContext) {
-    const micAudioContext = state.micAudioContext;
-    state.micAudioContext = null;
-    void micAudioContext.close().catch(() => {});
-  }
+  state.micAudioContext = null;
+  state.micSourceNode = null;
+  state.micHighpassNode = null;
+  state.micLowpassNode = null;
+  state.micCompressorNode = null;
+  state.micProcessorNode = null;
+  state.micSilenceNode = null;
   renderMicToggle();
+}
+
+function pickMicMimeType() {
+  if (!window.MediaRecorder) return "";
+  if (typeof MediaRecorder.isTypeSupported !== "function") {
+    return MIC_MIME_CANDIDATES[0];
+  }
+  return MIC_MIME_CANDIDATES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || "";
 }
 
 function pickCameraMimeType() {
@@ -1522,30 +1724,15 @@ async function playAudioData(audioData) {
       format: "f32-planar",
     });
   }
-  const source = audioContext.createBufferSource();
-  source.buffer = audioBuffer;
-  source.connect(audioContext.destination);
-  const now = audioContext.currentTime;
-  const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
-  const profile = currentAudioBufferProfile();
-  if (!state.audioNextTime || state.audioNextTime < now - profile.resetGraceSeconds) {
-    state.audioNextTime = now + profile.targetLeadSeconds;
-  } else if (queuedFor > profile.maxQueueSeconds) {
-    resetAudioPlayback();
-    state.audioNextTime = now + profile.targetLeadSeconds;
-  }
-  state.audioSources.add(source);
-  source.start(state.audioNextTime);
-  state.audioNextTime += audioBuffer.duration;
-  source.onended = () => {
-    state.audioSources.delete(source);
-    source.disconnect();
-  };
+  state.pendingAudioBuffers.push(audioBuffer);
+  state.pendingAudioDuration += audioBuffer.duration;
+  flushPendingAudioPlayback(audioContext);
   audioData.close();
 }
 
 function send(message) {
   if (state.socket?.readyState === WebSocket.OPEN) {
+    noteAutoDisconnectActivity(message);
     state.socket.send(JSON.stringify(message));
   }
 }
@@ -2489,6 +2676,13 @@ function initControls() {
   codecSelect.addEventListener("change", persistCurrentSettings);
   bitrateInput.addEventListener("input", persistCurrentSettings);
   bitrateInput.addEventListener("change", persistCurrentSettings);
+  audioBitrateSelect.addEventListener("change", persistCurrentSettings);
+  micBitrateSelect.addEventListener("change", () => {
+    persistCurrentSettings();
+    if (!state.micEnabled || state.socket?.readyState !== WebSocket.OPEN) return;
+    stopMicrophoneCapture();
+    void startMicrophoneCapture();
+  });
   fpsInput.addEventListener("input", persistCurrentSettings);
   fpsInput.addEventListener("change", persistCurrentSettings);
   scrollSpeedInput.addEventListener("input", persistCurrentSettings);

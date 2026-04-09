@@ -137,11 +137,41 @@
                     </select>
                   </label>
                   <label>Bitrate
-                    <input id="bitrate" type="range" min="1000" max="12000" step="250" value="4000" />
+                    <input id="bitrate" type="range" min="128" max="12000" step="32" value="4000" />
                     <span id="bitrate-value">4000 kbps</span>
                   </label>
+                  <label>Audio playback bitrate
+                    <select id="audio-bitrate">
+                      <option value="16">16 kbps</option>
+                      <option value="24">24 kbps</option>
+                      <option value="32">32 kbps</option>
+                      <option value="48">48 kbps</option>
+                      <option value="64">64 kbps</option>
+                      <option value="96">96 kbps</option>
+                      <option value="128" selected>128 kbps</option>
+                      <option value="160">160 kbps</option>
+                      <option value="192">192 kbps</option>
+                      <option value="256">256 kbps</option>
+                      <option value="320">320 kbps</option>
+                    </select>
+                  </label>
+                  <label>Mic bitrate
+                    <select id="mic-bitrate">
+                      <option value="16">16 kbps</option>
+                      <option value="24">24 kbps</option>
+                      <option value="32">32 kbps</option>
+                      <option value="48">48 kbps</option>
+                      <option value="64">64 kbps</option>
+                      <option value="96">96 kbps</option>
+                      <option value="128">128 kbps</option>
+                      <option value="160">160 kbps</option>
+                      <option value="192">192 kbps</option>
+                      <option value="256">256 kbps</option>
+                      <option value="320" selected>320 kbps</option>
+                    </select>
+                  </label>
                   <label>FPS
-                    <input id="fps" type="range" min="8" max="30" step="1" value="16" />
+                    <input id="fps" type="range" min="1" max="30" step="1" value="16" />
                     <span id="fps-value">16 fps</span>
                   </label>
                   <label>Scroll speed

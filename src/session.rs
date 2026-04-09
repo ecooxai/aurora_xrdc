@@ -20,22 +20,24 @@ use crate::{
     ffmpeg::{MicInputHandle, read_stderr, run_xdotool, spawn_mic_input_injector},
     media::MediaHub,
     messages::{ClientMessage, ServerMessage},
-    settings::{ServerConfig, StreamConfig},
+    settings::{AudioStreamConfig, ServerConfig, StreamConfig},
     streamer::StreamFrame,
     system_stats::StatsSampler,
 };
 
 const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
+const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
 
 pub async fn handle_socket(
     socket: WebSocket,
     server: ServerConfig,
     media: MediaHub,
     config: StreamConfig,
+    audio_config: AudioStreamConfig,
 ) -> Result<()> {
     let video_stream = media.acquire_video(config.clone()).await?;
-    let audio_stream = match media.acquire_audio().await {
+    let audio_stream = match media.acquire_audio(audio_config).await {
         Ok(stream) => Some(stream),
         Err(_) => None,
     };
@@ -656,8 +658,7 @@ enum MicInputState {
     Idle,
     Active {
         handle: MicInputHandle,
-        sample_rate: u32,
-        channels: u8,
+        stream_id: u32,
     },
     Failed,
 }
@@ -671,13 +672,12 @@ async fn forward_client_binary(
     let Some((&kind, payload)) = bytes.split_first() else {
         return;
     };
-    if kind != 3 || payload.len() <= 5 {
+    if kind != 3 || payload.len() <= MIC_STREAM_ID_BYTES {
         return;
     }
-    let sample_rate = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let channels = payload[4].clamp(1, 2);
-    let pcm = &payload[5..];
-    if pcm.is_empty() || pcm.len() % 2 != 0 {
+    let stream_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let audio = &payload[MIC_STREAM_ID_BYTES..];
+    if audio.is_empty() {
         return;
     }
 
@@ -687,58 +687,61 @@ async fn forward_client_binary(
 
     if let MicInputState::Active {
         handle,
-        sample_rate: active_sample_rate,
-        channels: active_channels,
+        stream_id: active_stream_id,
     } = mic_input
     {
-        if *active_sample_rate != sample_rate || *active_channels != channels {
+        if *active_stream_id != stream_id {
             let _ = handle.stdin.shutdown().await;
             if let Err(err) = shutdown_mic_child(&mut handle.child).await {
                 warn!("mic injector restart shutdown failed: {err}");
             }
             *mic_input = MicInputState::Idle;
+        } else if let Err(err) = handle.stdin.write_all(audio).await {
+            warn!("mic injector write failed: {err}");
+            send_runtime_error(
+                sender,
+                "mic_uplink_failed",
+                "Microphone uplink stopped on the server.".into(),
+            )
+            .await;
+            if let Err(stop_err) = shutdown_mic_child(&mut handle.child).await {
+                warn!("mic injector shutdown failed: {stop_err}");
+            }
+            *mic_input = MicInputState::Failed;
+            return;
+        } else {
+            return;
         }
     }
 
-    if matches!(mic_input, MicInputState::Idle) {
-        match spawn_mic_input_injector(server, sample_rate, channels).await {
-            Ok(handle) => {
-                *mic_input = MicInputState::Active {
-                    handle,
-                    sample_rate,
-                    channels,
-                }
-            }
-            Err(err) => {
-                warn!("mic injector startup failed: {err}");
+    match spawn_mic_input_injector(server).await {
+        Ok(mut handle) => {
+            if let Err(err) = handle.stdin.write_all(audio).await {
+                warn!("mic injector write failed: {err}");
                 send_runtime_error(
                     sender,
-                    "mic_unavailable",
-                    format!("Microphone uplink is unavailable on the server: {err}"),
+                    "mic_uplink_failed",
+                    "Microphone uplink stopped on the server.".into(),
                 )
                 .await;
+                if let Err(stop_err) = shutdown_mic_child(&mut handle.child).await {
+                    warn!("mic injector shutdown failed: {stop_err}");
+                }
                 *mic_input = MicInputState::Failed;
                 return;
             }
+            *mic_input = MicInputState::Active { handle, stream_id };
         }
-    }
-
-    let MicInputState::Active { handle, .. } = mic_input else {
-        return;
-    };
-
-    if let Err(err) = handle.stdin.write_all(pcm).await {
-        warn!("mic injector write failed: {err}");
-        send_runtime_error(
-            sender,
-            "mic_uplink_failed",
-            "Microphone uplink stopped on the server.".into(),
-        )
-        .await;
-        if let Err(stop_err) = shutdown_mic_child(&mut handle.child).await {
-            warn!("mic injector shutdown failed: {stop_err}");
+        Err(err) => {
+            warn!("mic injector startup failed: {err}");
+            send_runtime_error(
+                sender,
+                "mic_unavailable",
+                format!("Microphone uplink is unavailable on the server: {err}"),
+            )
+            .await;
+            *mic_input = MicInputState::Failed;
         }
-        *mic_input = MicInputState::Failed;
     }
 }
 

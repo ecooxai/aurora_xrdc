@@ -11,7 +11,7 @@ use crate::{
     audio::AudioFrame,
     audio_streamer,
     ffmpeg::read_stderr,
-    settings::{ServerConfig, StreamConfig},
+    settings::{AudioStreamConfig, ServerConfig, StreamConfig},
     streamer::{self, StreamFrame},
 };
 
@@ -23,7 +23,7 @@ pub struct MediaHub {
 
 struct HubState {
     videos: HashMap<StreamConfig, VideoSlot>,
-    audio: Option<AudioSlot>,
+    audio: HashMap<AudioStreamConfig, AudioSlot>,
 }
 
 struct VideoSlot {
@@ -44,6 +44,7 @@ struct VideoEntry {
 }
 
 struct AudioEntry {
+    config: AudioStreamConfig,
     rx: watch::Receiver<Option<AudioFrame>>,
     child: Arc<Mutex<Child>>,
 }
@@ -67,6 +68,7 @@ struct ReleaseVideo {
 
 struct ReleaseAudio {
     hub: MediaHub,
+    config: AudioStreamConfig,
     entry: Arc<AudioEntry>,
 }
 
@@ -76,7 +78,7 @@ impl MediaHub {
             server,
             state: Arc::new(Mutex::new(HubState {
                 videos: HashMap::new(),
-                audio: None,
+                audio: HashMap::new(),
             })),
         }
     }
@@ -154,24 +156,30 @@ impl MediaHub {
         Ok(lease)
     }
 
-    pub async fn acquire_audio(&self) -> Result<AudioLease> {
+    pub async fn acquire_audio(&self, config: AudioStreamConfig) -> Result<AudioLease> {
         {
             let mut state = self.state.lock().await;
-            if let Some(slot) = state.audio.as_mut() {
+            if let Some(slot) = state.audio.get_mut(&config) {
                 slot.subscribers += 1;
-                info!(subscribers = slot.subscribers, "reusing shared audio capture");
+                info!(
+                    ?config,
+                    subscribers = slot.subscribers,
+                    "reusing shared audio capture"
+                );
                 return Ok(AudioLease {
                     rx: slot.entry.rx.clone(),
                     release: Some(ReleaseAudio {
                         hub: self.clone(),
+                        config,
                         entry: Arc::clone(&slot.entry),
                     }),
                 });
             }
         }
 
-        let (stream, child) = audio_streamer::start(&self.server).await?;
+        let (stream, child) = audio_streamer::start(&self.server, &config).await?;
         let entry = Arc::new(AudioEntry {
+            config: config.clone(),
             rx: stream.rx,
             child: Arc::new(Mutex::new(child)),
         });
@@ -179,26 +187,31 @@ impl MediaHub {
         let mut replace = None;
         let lease = {
             let mut state = self.state.lock().await;
-            if let Some(slot) = state.audio.as_mut() {
+            if let Some(slot) = state.audio.get_mut(&config) {
                 slot.subscribers += 1;
                 replace = Some(Arc::clone(&entry));
                 AudioLease {
                     rx: slot.entry.rx.clone(),
                     release: Some(ReleaseAudio {
                         hub: self.clone(),
+                        config,
                         entry: Arc::clone(&slot.entry),
                     }),
                 }
             } else {
-                info!("starting shared audio capture");
-                state.audio = Some(AudioSlot {
-                    entry: Arc::clone(&entry),
-                    subscribers: 1,
-                });
+                info!(?config, "starting shared audio capture");
+                state.audio.insert(
+                    config.clone(),
+                    AudioSlot {
+                        entry: Arc::clone(&entry),
+                        subscribers: 1,
+                    },
+                );
                 AudioLease {
                     rx: entry.rx.clone(),
                     release: Some(ReleaseAudio {
                         hub: self.clone(),
+                        config,
                         entry,
                     }),
                 }
@@ -206,7 +219,7 @@ impl MediaHub {
         };
 
         if let Some(entry) = replace {
-            shutdown_child("audio", None, Arc::clone(&entry.child)).await;
+            shutdown_audio_child(Arc::clone(&entry.child), &entry.config).await;
         }
 
         Ok(lease)
@@ -239,10 +252,10 @@ impl MediaHub {
         }
     }
 
-    async fn release_audio(&self, entry: Arc<AudioEntry>) {
+    async fn release_audio(&self, config: AudioStreamConfig, entry: Arc<AudioEntry>) {
         let removed = {
             let mut state = self.state.lock().await;
-            let Some(slot) = state.audio.as_mut() else {
+            let Some(slot) = state.audio.get_mut(&config) else {
                 return;
             };
             if !Arc::ptr_eq(&slot.entry, &entry) {
@@ -250,15 +263,19 @@ impl MediaHub {
             }
             slot.subscribers = slot.subscribers.saturating_sub(1);
             if slot.subscribers > 0 {
-                info!(subscribers = slot.subscribers, "shared audio capture still in use");
+                info!(
+                    ?config,
+                    subscribers = slot.subscribers,
+                    "shared audio capture still in use"
+                );
                 None
             } else {
-                info!("stopping shared audio capture");
-                state.audio.take().map(|slot| slot.entry)
+                info!(?config, "stopping shared audio capture");
+                state.audio.remove(&config).map(|slot| slot.entry)
             }
         };
         if let Some(entry) = removed {
-            shutdown_child("audio", None, Arc::clone(&entry.child)).await;
+            shutdown_audio_child(Arc::clone(&entry.child), &config).await;
         }
     }
 }
@@ -267,7 +284,10 @@ impl Drop for VideoLease {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
             tokio::spawn(async move {
-                release.hub.release_video(release.config, release.entry).await;
+                release
+                    .hub
+                    .release_video(release.config, release.entry)
+                    .await;
             });
         }
     }
@@ -277,7 +297,7 @@ impl Drop for AudioLease {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
             tokio::spawn(async move {
-                release.hub.release_audio(release.entry).await;
+                release.hub.release_audio(release.config, release.entry).await;
             });
         }
     }
@@ -290,6 +310,22 @@ async fn shutdown_child(kind: &str, config: Option<&StreamConfig>, child: Arc<Mu
     }
     let stderr = read_stderr(&mut child).await;
     if !stderr.trim().is_empty() {
-        warn!(kind = kind, ?config, stderr = stderr.trim(), "capture stderr");
+        warn!(
+            kind = kind,
+            ?config,
+            stderr = stderr.trim(),
+            "capture stderr"
+        );
+    }
+}
+
+async fn shutdown_audio_child(child: Arc<Mutex<Child>>, config: &AudioStreamConfig) {
+    let mut child = child.lock().await;
+    if let Err(err) = child.kill().await {
+        warn!(kind = "audio", ?config, "capture kill failed: {err}");
+    }
+    let stderr = read_stderr(&mut child).await;
+    if !stderr.trim().is_empty() {
+        warn!(kind = "audio", ?config, stderr = stderr.trim(), "capture stderr");
     }
 }

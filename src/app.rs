@@ -24,7 +24,7 @@ use crate::{
     ffmpeg,
     media::MediaHub,
     session,
-    settings::{CodecKind, ServerConfig, StreamConfig},
+    settings::{AudioStreamConfig, CodecKind, ServerConfig, StreamConfig},
 };
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -129,6 +129,7 @@ struct AuthQuery {
 struct WsQuery {
     codec: Option<CodecKind>,
     bitrate_kbps: Option<u32>,
+    audio_bitrate_kbps: Option<u32>,
     fps: Option<u32>,
     passwd: Option<String>,
 }
@@ -220,9 +221,20 @@ async fn ws(
         fps: query.fps.unwrap_or(16),
     }
     .normalized();
+    let audio_config = AudioStreamConfig {
+        bitrate_kbps: query.audio_bitrate_kbps.unwrap_or(128),
+    }
+    .normalized();
     ws.on_upgrade(move |socket| async move {
         if let Err(err) =
-            session::handle_socket(socket, state.server.clone(), state.media.clone(), config).await
+            session::handle_socket(
+                socket,
+                state.server.clone(),
+                state.media.clone(),
+                config,
+                audio_config,
+            )
+            .await
         {
             let _ = err;
         }

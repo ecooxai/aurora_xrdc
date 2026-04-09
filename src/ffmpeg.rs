@@ -7,7 +7,7 @@ use tokio::{
     time::{Duration, sleep},
 };
 
-use crate::settings::{CodecKind, ServerConfig, StreamConfig};
+use crate::settings::{AudioStreamConfig, CodecKind, ServerConfig, StreamConfig};
 
 #[derive(Debug, Clone)]
 pub struct EncoderChoice {
@@ -28,34 +28,27 @@ const VIRTUAL_CAMERA_NR: &str = "42";
 
 pub async fn choose_encoder(codec: CodecKind) -> Result<EncoderChoice> {
     let encoders = ffmpeg_list_encoders().await?;
-    let choice = match codec {
-        CodecKind::H264 if has_working_encoder(&encoders, "h264_nvenc").await => EncoderChoice {
-            ffmpeg_encoder: "h264_nvenc".into(),
-            mode: "gpu",
-            output_format: "h264",
-        },
-        CodecKind::H265 if has_working_encoder(&encoders, "hevc_nvenc").await => EncoderChoice {
-            ffmpeg_encoder: "hevc_nvenc".into(),
-            mode: "gpu",
-            output_format: "hevc",
-        },
-        CodecKind::H264 => EncoderChoice {
-            ffmpeg_encoder: "libx264".into(),
-            mode: "cpu",
-            output_format: "h264",
-        },
-        CodecKind::H265 => EncoderChoice {
-            ffmpeg_encoder: "libx265".into(),
-            mode: "cpu",
-            output_format: "hevc",
-        },
-        CodecKind::Vp8 => EncoderChoice {
-            ffmpeg_encoder: "libvpx".into(),
-            mode: "cpu",
-            output_format: "ivf",
-        },
-    };
-    Ok(choice)
+    for (encoder, mode, output_format) in preferred_encoders(codec) {
+        if has_working_encoder(&encoders, encoder).await {
+            return Ok(EncoderChoice {
+                ffmpeg_encoder: (*encoder).into(),
+                mode,
+                output_format,
+            });
+        }
+    }
+
+    Err(anyhow!(
+        "no working ffmpeg encoder available for requested codec {codec:?}"
+    ))
+}
+
+fn preferred_encoders(codec: CodecKind) -> &'static [(&'static str, &'static str, &'static str)] {
+    match codec {
+        CodecKind::H264 => &[("h264_nvenc", "gpu", "h264"), ("libx264", "cpu", "h264")],
+        CodecKind::H265 => &[("hevc_nvenc", "gpu", "hevc"), ("libx265", "cpu", "hevc")],
+        CodecKind::Vp8 => &[("libvpx", "cpu", "ivf")],
+    }
 }
 
 async fn has_working_encoder(encoders: &str, encoder: &str) -> bool {
@@ -155,26 +148,42 @@ pub fn spawn_capture(
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    match stream.codec {
-        CodecKind::H264 => {
+    match encoder.ffmpeg_encoder.as_str() {
+        "libx264" => {
             cmd.args(["-x264-params", "repeat-headers=1:aud=1"]);
-            if encoder.mode == "gpu" {
-                cmd.args(["-rc", "cbr_ld_hq", "-tune", "ll"]);
-            }
         }
-        CodecKind::H265 => {
+        "h264_nvenc" | "hevc_nvenc" => {
+            cmd.args([
+                "-rc",
+                "cbr_ld_hq",
+                "-tune",
+                "ll",
+                "-zerolatency",
+                "1",
+                "-forced-idr",
+                "1",
+                "-aud",
+                "1",
+            ]);
+        }
+        "libx265" => {
             cmd.args(["-x265-params", "repeat-headers=1:aud=1"]);
         }
-        CodecKind::Vp8 => {
+        "libvpx" => {
             cmd.args(["-deadline", "realtime", "-cpu-used", "8"]);
         }
+        _ => {}
     }
     cmd.args(["-f", encoder.output_format, "pipe:1"]);
     cmd.spawn().context("failed to spawn ffmpeg capture")
 }
 
-pub async fn spawn_audio_capture(server: &ServerConfig) -> Result<tokio::process::Child> {
+pub async fn spawn_audio_capture(
+    server: &ServerConfig,
+    config: &AudioStreamConfig,
+) -> Result<tokio::process::Child> {
     let source = ensure_pulse_monitor_source(server).await?;
+    let bitrate = format!("{}k", config.bitrate_kbps);
     let mut cmd = Command::new("ffmpeg");
     cmd.env("DISPLAY", &server.display)
         .args([
@@ -209,7 +218,7 @@ pub async fn spawn_audio_capture(server: &ServerConfig) -> Result<tokio::process
             "-profile:a",
             "aac_low",
             "-b:a",
-            "128k",
+            &bitrate,
             "-f",
             "adts",
             "pipe:1",
@@ -280,15 +289,9 @@ pub async fn replay_mp4_to_virtual_camera(path: &Path, device: &str) -> Result<(
     ))
 }
 
-pub async fn spawn_mic_input_injector(
-    server: &ServerConfig,
-    sample_rate: u32,
-    channels: u8,
-) -> Result<MicInputHandle> {
+pub async fn spawn_mic_input_injector(server: &ServerConfig) -> Result<MicInputHandle> {
     ensure_virtual_mic_source().await?;
     let mut cmd = Command::new("ffmpeg");
-    let input_sample_rate = sample_rate.max(8_000).to_string();
-    let input_channels = channels.clamp(1, 2).to_string();
     cmd.env("DISPLAY", &server.display)
         .args([
             "-loglevel",
@@ -297,12 +300,12 @@ pub async fn spawn_mic_input_injector(
             "nobuffer",
             "-avioflags",
             "direct",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
             "-f",
-            "s16le",
-            "-ar",
-            &input_sample_rate,
-            "-ac",
-            &input_channels,
+            "webm",
             "-i",
             "pipe:0",
             "-vn",
@@ -627,8 +630,18 @@ async fn run_status_best_effort(program: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::settings::CodecKind;
+
     #[tokio::test]
     async fn missing_encoder_is_not_reported_as_working() {
         assert!(!super::has_working_encoder("", "h264_nvenc").await);
+    }
+
+    #[test]
+    fn h265_candidates_never_include_h264() {
+        let candidates = super::preferred_encoders(CodecKind::H265);
+        assert_eq!(candidates[0].0, "hevc_nvenc");
+        assert_eq!(candidates[1].0, "libx265");
+        assert!(candidates.iter().all(|(encoder, _, _)| !encoder.contains("264")));
     }
 }
