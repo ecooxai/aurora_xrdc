@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Result;
 use tokio::{
     process::Child,
-    sync::{Mutex, watch},
+    sync::{Mutex, broadcast, watch},
 };
 use tracing::{info, warn};
 
@@ -45,7 +45,7 @@ struct VideoEntry {
 
 struct AudioEntry {
     config: AudioStreamConfig,
-    rx: watch::Receiver<Option<AudioFrame>>,
+    tx: broadcast::Sender<AudioFrame>,
     child: Arc<Mutex<Child>>,
 }
 
@@ -56,7 +56,7 @@ pub struct VideoLease {
 }
 
 pub struct AudioLease {
-    pub rx: watch::Receiver<Option<AudioFrame>>,
+    rx: Option<broadcast::Receiver<AudioFrame>>,
     release: Option<ReleaseAudio>,
 }
 
@@ -167,7 +167,7 @@ impl MediaHub {
                     "reusing shared audio capture"
                 );
                 return Ok(AudioLease {
-                    rx: slot.entry.rx.clone(),
+                    rx: Some(slot.entry.tx.subscribe()),
                     release: Some(ReleaseAudio {
                         hub: self.clone(),
                         config,
@@ -180,7 +180,7 @@ impl MediaHub {
         let (stream, child) = audio_streamer::start(&self.server, &config).await?;
         let entry = Arc::new(AudioEntry {
             config: config.clone(),
-            rx: stream.rx,
+            tx: stream.tx,
             child: Arc::new(Mutex::new(child)),
         });
 
@@ -191,7 +191,7 @@ impl MediaHub {
                 slot.subscribers += 1;
                 replace = Some(Arc::clone(&entry));
                 AudioLease {
-                    rx: slot.entry.rx.clone(),
+                    rx: Some(slot.entry.tx.subscribe()),
                     release: Some(ReleaseAudio {
                         hub: self.clone(),
                         config,
@@ -208,7 +208,7 @@ impl MediaHub {
                     },
                 );
                 AudioLease {
-                    rx: entry.rx.clone(),
+                    rx: Some(entry.tx.subscribe()),
                     release: Some(ReleaseAudio {
                         hub: self.clone(),
                         config,
@@ -280,6 +280,12 @@ impl MediaHub {
     }
 }
 
+impl AudioLease {
+    pub fn take_audio_rx(&mut self) -> Option<broadcast::Receiver<AudioFrame>> {
+        self.rx.take()
+    }
+}
+
 impl Drop for VideoLease {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
@@ -297,7 +303,10 @@ impl Drop for AudioLease {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
             tokio::spawn(async move {
-                release.hub.release_audio(release.config, release.entry).await;
+                release
+                    .hub
+                    .release_audio(release.config, release.entry)
+                    .await;
             });
         }
     }
@@ -326,6 +335,11 @@ async fn shutdown_audio_child(child: Arc<Mutex<Child>>, config: &AudioStreamConf
     }
     let stderr = read_stderr(&mut child).await;
     if !stderr.trim().is_empty() {
-        warn!(kind = "audio", ?config, stderr = stderr.trim(), "capture stderr");
+        warn!(
+            kind = "audio",
+            ?config,
+            stderr = stderr.trim(),
+            "capture stderr"
+        );
     }
 }

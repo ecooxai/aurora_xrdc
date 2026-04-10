@@ -16,7 +16,7 @@ const HIGH_LATENCY_RECONNECT_GRACE_MS = 5000;
 const HEALTH_WATCHDOG_INTERVAL_MS = 250;
 const KEY_STATE_SYNC_INTERVAL_MS = 500;
 const MAX_VIDEO_DECODE_QUEUE = 4;
-const MAX_AUDIO_DECODE_QUEUE = 12;
+const MAX_AUDIO_DECODE_QUEUE = 24;
 const AUTO_DISCONNECT_DISABLED_MINUTES = 0;
 const AUTO_DISCONNECT_ACTIVITY_REFRESH_MS = 1000;
 const SETTINGS_RECONNECT_DELAY_MS = 3000;
@@ -174,10 +174,10 @@ const AAC_SAMPLE_RATES = [
   16000, 12000, 11025, 8000, 7350,
 ];
 const AUDIO_BUFFER_PROFILES = [
-  { minLatencyMs: 200, targetLeadSeconds: 0.32, maxQueueSeconds: 0.6, resetGraceSeconds: 0.1 },
-  { minLatencyMs: 100, targetLeadSeconds: 0.2, maxQueueSeconds: 0.42, resetGraceSeconds: 0.08 },
-  { minLatencyMs: 50, targetLeadSeconds: 0.12, maxQueueSeconds: 0.28, resetGraceSeconds: 0.07 },
-  { minLatencyMs: 0, targetLeadSeconds: 0.05, maxQueueSeconds: 0.16, resetGraceSeconds: 0.05 },
+  { minLatencyMs: 200, targetLeadSeconds: 0.5, maxQueueSeconds: 0.9, resetGraceSeconds: 0.14 },
+  { minLatencyMs: 100, targetLeadSeconds: 0.36, maxQueueSeconds: 0.72, resetGraceSeconds: 0.12 },
+  { minLatencyMs: 50, targetLeadSeconds: 0.24, maxQueueSeconds: 0.52, resetGraceSeconds: 0.1 },
+  { minLatencyMs: 0, targetLeadSeconds: 0.14, maxQueueSeconds: 0.34, resetGraceSeconds: 0.08 },
 ];
 const MIC_CHUNK_KIND = 3;
 const MIC_STREAM_ID_BYTES = 4;
@@ -1346,8 +1346,10 @@ function currentAudioBufferProfile() {
     || AUDIO_BUFFER_PROFILES[AUDIO_BUFFER_PROFILES.length - 1];
   const extraLatencyMs = currentConfiguredAudioLatencyMs();
   const extraSeconds = extraLatencyMs / 1000;
+  const targetLeadSeconds = profile.targetLeadSeconds + extraSeconds;
   return {
-    targetLeadSeconds: profile.targetLeadSeconds + extraSeconds,
+    targetLeadSeconds,
+    continueLeadSeconds: Math.max(0.06, targetLeadSeconds * 0.5),
     maxQueueSeconds: profile.maxQueueSeconds + extraSeconds,
     resetGraceSeconds: Math.max(profile.resetGraceSeconds, 0.05),
   };
@@ -1355,7 +1357,7 @@ function currentAudioBufferProfile() {
 
 function currentAudioStartSlack(audioContext) {
   const baseLatency = Number.isFinite(audioContext?.baseLatency) ? audioContext.baseLatency : 0;
-  return Math.max(0.01, Math.min(0.04, Math.max(baseLatency * 2, 0.02)));
+  return Math.max(0.03, Math.min(0.08, Math.max(baseLatency * 3, 0.05)));
 }
 
 function scheduleAudioBuffer(audioContext, audioBuffer, profile = currentAudioBufferProfile()) {
@@ -1388,6 +1390,12 @@ function flushPendingAudioPlayback(audioContext) {
     if (playbackStale && state.pendingAudioDuration < profile.targetLeadSeconds) {
       break;
     }
+    if (!playbackStale) {
+      const totalAvailableLead = queuedFor + state.pendingAudioDuration;
+      if (queuedFor < profile.continueLeadSeconds && totalAvailableLead < profile.targetLeadSeconds) {
+        break;
+      }
+    }
     if (!playbackStale && queuedFor >= profile.maxQueueSeconds) {
       break;
     }
@@ -1403,7 +1411,7 @@ function flushPendingAudioPlayback(audioContext) {
 async function ensureAudioContext() {
   if (!window.AudioContext) return null;
   if (!state.audioContext || state.audioContext.state === "closed") {
-    state.audioContext = new AudioContext({ latencyHint: "interactive", sampleRate: 48000 });
+    state.audioContext = new AudioContext({ latencyHint: "balanced", sampleRate: 48000 });
   }
   if (state.audioContext.state === "suspended") {
     await state.audioContext.resume();

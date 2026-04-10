@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use tokio::{
     io::AsyncWriteExt,
     process::Child,
-    sync::{mpsc, watch},
+    sync::{broadcast, mpsc, watch},
     time::MissedTickBehavior,
 };
 use tracing::{error, warn};
@@ -28,6 +28,7 @@ use crate::{
 const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
+const AUDIO_PACKET_QUEUE_CAPACITY: usize = 128;
 
 pub async fn handle_socket(
     socket: WebSocket,
@@ -37,14 +38,14 @@ pub async fn handle_socket(
     audio_config: AudioStreamConfig,
 ) -> Result<()> {
     let video_stream = media.acquire_video(config.clone()).await?;
-    let audio_stream = match media.acquire_audio(audio_config).await {
+    let mut audio_stream = match media.acquire_audio(audio_config).await {
         Ok(stream) => Some(stream),
         Err(_) => None,
     };
     let (ws_sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
     let (video_tx, video_rx) = watch::channel(None::<Vec<u8>>);
-    let (audio_tx, audio_rx) = watch::channel(None::<Vec<u8>>);
+    let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let audio_enabled = audio_stream.is_some();
     let session_id = format!("{:x}", rand_id());
@@ -92,8 +93,9 @@ pub async fn handle_socket(
         audio_enabled,
     ));
     let mut audio_task = audio_stream
-        .as_ref()
-        .map(|stream| tokio::spawn(forward_audio(audio_tx, stream.rx.clone())));
+        .as_mut()
+        .and_then(|stream| stream.take_audio_rx())
+        .map(|rx| tokio::spawn(forward_audio(audio_tx, rx)));
     let mut recv_task = tokio::spawn(handle_client(
         receiver,
         out_tx.clone(),
@@ -172,14 +174,21 @@ async fn forward_frames(
 }
 
 async fn forward_audio(
-    media_sender: watch::Sender<Option<Vec<u8>>>,
-    mut rx: watch::Receiver<Option<AudioFrame>>,
+    media_sender: mpsc::Sender<Vec<u8>>,
+    mut rx: broadcast::Receiver<AudioFrame>,
 ) -> Result<()> {
-    while rx.changed().await.is_ok() {
-        let Some(frame) = rx.borrow_and_update().clone() else {
-            continue;
-        };
-        let _ = media_sender.send(Some(binary_audio_frame(&frame)));
+    loop {
+        match rx.recv().await {
+            Ok(frame) => {
+                if media_sender.send(binary_audio_frame(&frame)).await.is_err() {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(skipped, "audio subscriber lagged behind live stream");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
     }
     Ok(())
 }
@@ -188,7 +197,7 @@ async fn write_socket(
     mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
     mut control_rx: mpsc::Receiver<Message>,
     mut video_rx: watch::Receiver<Option<Vec<u8>>>,
-    mut audio_rx: watch::Receiver<Option<Vec<u8>>>,
+    mut audio_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut control_closed = false;
     let mut video_closed = false;
@@ -213,7 +222,7 @@ async fn write_socket(
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
         }
 
-        if let Some(bytes) = pending_video.take() {
+        if let Some(bytes) = pending_audio.take() {
             if futures_util::SinkExt::send(&mut ws_sender, Message::Binary(bytes.into()))
                 .await
                 .is_err()
@@ -223,7 +232,7 @@ async fn write_socket(
             continue;
         }
 
-        if let Some(bytes) = pending_audio.take() {
+        if let Some(bytes) = pending_video.take() {
             if futures_util::SinkExt::send(&mut ws_sender, Message::Binary(bytes.into()))
                 .await
                 .is_err()
@@ -256,12 +265,10 @@ async fn write_socket(
                     Err(_) => video_closed = true,
                 }
             }
-            changed = audio_rx.changed(), if !audio_closed => {
-                match changed {
-                    Ok(()) => {
-                        pending_audio = audio_rx.borrow_and_update().clone();
-                    }
-                    Err(_) => audio_closed = true,
+            maybe = audio_rx.recv(), if !audio_closed => {
+                match maybe {
+                    Some(bytes) => pending_audio = Some(bytes),
+                    None => audio_closed = true,
                 }
             }
         }

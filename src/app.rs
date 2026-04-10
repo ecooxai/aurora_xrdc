@@ -226,15 +226,14 @@ async fn ws(
     }
     .normalized();
     ws.on_upgrade(move |socket| async move {
-        if let Err(err) =
-            session::handle_socket(
-                socket,
-                state.server.clone(),
-                state.media.clone(),
-                config,
-                audio_config,
-            )
-            .await
+        if let Err(err) = session::handle_socket(
+            socket,
+            state.server.clone(),
+            state.media.clone(),
+            config,
+            audio_config,
+        )
+        .await
         {
             let _ = err;
         }

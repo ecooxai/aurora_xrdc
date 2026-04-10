@@ -25,6 +25,7 @@ const VIRTUAL_MIC_SOURCE_NAME: &str = "Viberdeskmic";
 const VIRTUAL_MIC_SINK_NAME: &str = "vibe_rdesk_virtual_mic_sink";
 const VIRTUAL_CAMERA_LABEL: &str = "viberdeskcamera";
 const VIRTUAL_CAMERA_NR: &str = "42";
+const VIDEO_GOP_SECONDS: u32 = 2;
 
 pub async fn choose_encoder(codec: CodecKind) -> Result<EncoderChoice> {
     let encoders = ffmpeg_list_encoders().await?;
@@ -92,6 +93,7 @@ pub fn spawn_capture(
 ) -> Result<tokio::process::Child> {
     let bitrate = format!("{}k", stream.bitrate_kbps);
     let fps = stream.fps.to_string();
+    let gop = video_gop_frames(stream.fps).to_string();
     let mut cmd = Command::new("ffmpeg");
     cmd.env("DISPLAY", &server.display)
         .args([
@@ -136,11 +138,9 @@ pub fn spawn_capture(
             "-bufsize",
             &format!("{}k", stream.bitrate_kbps / 2),
             "-g",
-            &fps,
+            &gop,
             "-keyint_min",
-            &fps,
-            "-force_key_frames",
-            "expr:gte(t,n_forced*2)",
+            &gop,
             "-threads",
             "2",
             "-c:v",
@@ -160,7 +160,7 @@ pub fn spawn_capture(
                 "ll",
                 "-zerolatency",
                 "1",
-                "-forced-idr",
+                "-strict_gop",
                 "1",
                 "-aud",
                 "1",
@@ -176,6 +176,10 @@ pub fn spawn_capture(
     }
     cmd.args(["-f", encoder.output_format, "pipe:1"]);
     cmd.spawn().context("failed to spawn ffmpeg capture")
+}
+
+fn video_gop_frames(fps: u32) -> u32 {
+    fps.saturating_mul(VIDEO_GOP_SECONDS).max(1)
 }
 
 pub async fn spawn_audio_capture(
@@ -642,6 +646,17 @@ mod tests {
         let candidates = super::preferred_encoders(CodecKind::H265);
         assert_eq!(candidates[0].0, "hevc_nvenc");
         assert_eq!(candidates[1].0, "libx265");
-        assert!(candidates.iter().all(|(encoder, _, _)| !encoder.contains("264")));
+        assert!(
+            candidates
+                .iter()
+                .all(|(encoder, _, _)| !encoder.contains("264"))
+        );
+    }
+
+    #[test]
+    fn video_gop_tracks_two_seconds_of_frames() {
+        assert_eq!(super::video_gop_frames(1), 2);
+        assert_eq!(super::video_gop_frames(16), 32);
+        assert_eq!(super::video_gop_frames(60), 120);
     }
 }

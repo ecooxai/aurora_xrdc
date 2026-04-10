@@ -280,12 +280,12 @@ mod tests {
     fn keeps_h265_frames_in_annex_b_without_description() {
         let mut parser = AnnexBParser::new(CodecKind::H265);
         let frame1 = [
-            &[0, 0, 0, 1, 0x40, 0x01, 0xaa][..], // VPS (type 32)
-            &[0, 0, 0, 1, 0x42, 0x01, 0xbb][..], // SPS (type 33)
-            &[0, 0, 0, 1, 0x44, 0x01, 0xcc][..], // PPS (type 34)
-            &[0, 0, 0, 1, 0x46, 0x01][..],       // AUD (type 35)
+            &[0, 0, 0, 1, 0x40, 0x01, 0xaa][..],    // VPS (type 32)
+            &[0, 0, 0, 1, 0x42, 0x01, 0xbb][..],    // SPS (type 33)
+            &[0, 0, 0, 1, 0x44, 0x01, 0xcc][..],    // PPS (type 34)
+            &[0, 0, 0, 1, 0x46, 0x01][..],          // AUD (type 35)
             &[0, 0, 0, 1, 0x26, 0x01, 1, 2, 3][..], // IDR_W_RADL (type 19)
-            &[0, 0, 0, 1, 0x46, 0x01][..],       // AUD (type 35)
+            &[0, 0, 0, 1, 0x46, 0x01][..],          // AUD (type 35)
             &[0, 0, 0, 1, 0x02, 0x01, 4, 5, 6][..], // TRAIL_R (type 1)
         ]
         .concat();
