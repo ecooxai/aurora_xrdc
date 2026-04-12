@@ -46,9 +46,27 @@ body {
   gap: 12px;
 }
 label { display: grid; gap: 8px; color: var(--muted); font-size: 0.95rem; }
+.range-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.range-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
 .toggle-label {
   grid-template-columns: 1fr auto;
   align-items: center;
+}
+.inline-toggle {
+  display: inline-grid;
+  grid-template-columns: auto auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 0.85rem;
+  justify-self: start;
 }
 
 .toggle-label input[type="checkbox"] {

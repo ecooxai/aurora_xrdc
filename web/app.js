@@ -17,6 +17,32 @@ const HEALTH_WATCHDOG_INTERVAL_MS = 250;
 const KEY_STATE_SYNC_INTERVAL_MS = 500;
 const MAX_VIDEO_DECODE_QUEUE = 4;
 const MAX_AUDIO_DECODE_QUEUE = 24;
+const AUDIO_MIN_BUFFER_SECONDS = 0.05;
+const AUDIO_UNDERRUN_RETRY_MS = 2000;
+const AUDIO_UNDERRUN_RESUME_SECONDS = 2;
+const AUDIO_UNDERRUN_POLL_MS = 100;
+const AUDIO_REBUFFER_BUFFER_SECONDS = 3;
+const AUDIO_REBUFFER_HOLD_MS = 4000;
+const AUDIO_TRIM_LATENCY_LOW_BUFFER_SECONDS = 1.9;
+const AUDIO_TRIM_LATENCY_BUFFER_SECONDS = 2.1;
+const AUDIO_TRIM_LATENCY_HOLD_MS = 20000;
+const AUDIO_TRIM_TARGET_EXTRA_SECONDS = 0.2;
+const AUDIO_UNDERRUN_WARNING = "Audio buffer too small, pausing playback";
+const AAC_SAMPLES_PER_FRAME = 1024;
+const AUDIO_BASE_PLAYBACK_RATE = 0.9650;
+const AUDIO_AUTO_CLOCK_STEP = 0.005;
+const AUDIO_AUTO_CLOCK_INCREASE_BUFFER_SECONDS = 2.4;
+const AUDIO_AUTO_CLOCK_INCREASE_INTERVAL_MS = 7000;
+const AUDIO_AUTO_CLOCK_INCREASE_MIN_GROWTH_SECONDS = 0.1;
+const AUDIO_AUTO_CLOCK_SLOW_TUNE_STEP = 0.001;
+const AUDIO_AUTO_CLOCK_SLOW_TUNE_TARGET_EXTRA_SECONDS = 0.2;
+const AUDIO_AUTO_CLOCK_SLOW_TUNE_INTERVAL_MS = 30000;
+const AUDIO_DRIFT_SLOWDOWN_MAX = 0.05;
+const AUDIO_DRIFT_SPEEDUP_MAX = 0.02;
+const AUDIO_DRIFT_CORRECTION_DEADZONE_SECONDS = 0.015;
+const AUDIO_DRIFT_PROPORTIONAL_GAIN = 0.02;
+const AUDIO_DRIFT_INTEGRAL_GAIN = 0.015;
+const AUDIO_DRIFT_INTEGRAL_MAX = 0.03;
 const AUTO_DISCONNECT_DISABLED_MINUTES = 0;
 const AUTO_DISCONNECT_ACTIVITY_REFRESH_MS = 1000;
 const SETTINGS_RECONNECT_DELAY_MS = 3000;
@@ -63,8 +89,22 @@ const state = {
   pendingVideoFrame: null,
   renderingVideoFrame: false,
   audioNextTime: 0,
+  pendingEncodedAudioFrames: [],
   pendingAudioBuffers: [],
   pendingAudioDuration: 0,
+  audioDecodingDuration: 0,
+  audioResumeTimer: 0,
+  audioResumeBlockedUntil: 0,
+  audioUnderrunActive: false,
+  audioPlaybackBlocked: false,
+  audioUserActivated: false,
+  audioLargeBufferSinceAt: 0,
+  audioHighLatencySinceAt: 0,
+  audioRateIntegral: 0,
+  audioRateLastUpdatedAt: 0,
+  audioClockAutoLastIncreaseAt: 0,
+  audioClockAutoLastIncreaseLead: 0,
+  audioClockAutoLastSlowTuneAt: 0,
   waitingForKeyframe: true,
   frameCount: 0,
   bytesReceived: 0,
@@ -143,6 +183,9 @@ const scrollSpeedInput = $("scroll-speed");
 const scrollSpeedValue = $("scroll-speed-value");
 const audioLatencyInput = $("audio-latency");
 const audioLatencyValue = $("audio-latency-value");
+const audioClockRateInput = $("audio-clock-rate");
+const audioClockRateValue = $("audio-clock-rate-value");
+const audioClockAutoInput = $("audio-clock-auto");
 const autoDisconnectMinutesInput = $("auto-disconnect-minutes");
 const touchModeSelect = $("touch-mode");
 const directTouchScrollInput = $("direct-touch-scroll");
@@ -157,6 +200,7 @@ const statusSwap = $("status-swap");
 const statusLatency = $("status-latency");
 const statusSpeedDownload = $("status-speed-download");
 const statusSpeedUpload = $("status-speed-upload");
+const statusAudioBuffer = $("status-audio-buffer");
 const statusUpdatedAt = $("status-updated-at");
 const localClipboardSyncBtn = $("local-clipboard-sync-btn");
 const remoteClipboardSyncBtn = $("remote-clipboard-sync-btn");
@@ -263,6 +307,7 @@ function renderStatusMetrics({
   statusRam.textContent = formatMemoryUsage(memory_used_mb, memory_total_mb);
   statusSwap.textContent = formatMemoryUsage(swap_used_mb, swap_total_mb);
   renderLatencyMetric();
+  renderAudioBufferMetric();
   statusSpeedDownload.textContent = `↓ ${formatMbPerSecond(net_rx_kbps)}`;
   statusSpeedUpload.textContent = `↑ ${formatMbPerSecond(net_tx_kbps)}`;
   statusUpdatedAt.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
@@ -272,6 +317,21 @@ function renderLatencyMetric() {
   statusLatency.textContent = Number.isFinite(state.wsLatencyMs)
     ? `${Math.round(state.wsLatencyMs)} ms`
     : "--";
+}
+
+function currentBufferedAudioSeconds() {
+  const audioContext = state.audioContext;
+  const now = Number.isFinite(audioContext?.currentTime) ? audioContext.currentTime : 0;
+  const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
+  return Math.max(0, queuedFor + state.pendingAudioDuration + state.audioDecodingDuration);
+}
+
+function renderAudioBufferMetric() {
+  if (!state.audioEnabled) {
+    statusAudioBuffer.textContent = "--";
+    return;
+  }
+  statusAudioBuffer.textContent = `${Math.round(currentBufferedAudioSeconds() * 1000)} ms`;
 }
 
 function resetStatusMetrics() {
@@ -457,7 +517,9 @@ function monitorConnectionHealth() {
   const socketOpen = state.socket?.readyState === WebSocket.OPEN;
 
   let warning = "";
-  if (socketOpen && state.lastVideoPacketAt && now - state.lastVideoPacketAt > MEDIA_STALL_RESET_MS) {
+  if (socketOpen && state.audioUnderrunActive) {
+    warning = state.streamWarning || AUDIO_UNDERRUN_WARNING;
+  } else if (socketOpen && state.lastVideoPacketAt && now - state.lastVideoPacketAt > MEDIA_STALL_RESET_MS) {
     warning = "Video stalled";
   } else if (socketOpen && state.lastStaleDropAt && now - state.lastStaleDropAt < 3000) {
     warning = state.streamWarning || "Dropping delayed frames";
@@ -526,6 +588,7 @@ function normalizeSettings(settings = {}) {
   const defaultMicBitrate = Number(micBitrateSelect.value);
   const defaultFps = Number(fpsInput.value);
   const defaultScrollSpeed = Number(scrollSpeedInput.value);
+  const defaultAudioClockRate = Number(audioClockRateInput.value);
   const defaultAutoDisconnectMinutes = Number(autoDisconnectMinutesInput.value);
   return {
     codec: allowedCodecs.has(settings.codec) ? settings.codec : codecSelect.value,
@@ -542,6 +605,8 @@ function normalizeSettings(settings = {}) {
     directTouchScroll: settings.directTouchScroll === true,
     micEnabled: settings.micEnabled === true,
     audioLatencyMs: clampControlValue(audioLatencyInput, settings.audioLatencyMs, Number(audioLatencyInput.value)),
+    audioClockRate: clampControlValue(audioClockRateInput, settings.audioClockRate, defaultAudioClockRate),
+    audioClockAuto: settings.audioClockAuto !== false,
     autoDisconnectMinutes: clampControlValue(
       autoDisconnectMinutesInput,
       settings.autoDisconnectMinutes,
@@ -560,6 +625,8 @@ function readSettingsFromControls() {
     fps: fpsInput.value,
     scrollSpeed: scrollSpeedInput.value,
     audioLatencyMs: audioLatencyInput.value,
+    audioClockRate: audioClockRateInput.value,
+    audioClockAuto: audioClockAutoInput.checked,
     autoDisconnectMinutes: autoDisconnectMinutesInput.value,
     touchMode: touchModeSelect.value,
     directTouchScroll: directTouchScrollInput.checked,
@@ -591,6 +658,7 @@ function renderSettingsValues(settings = readSettingsFromControls()) {
   fpsValue.textContent = `${settings.fps} fps`;
   scrollSpeedValue.textContent = `${settings.scrollSpeed} / 10`;
   audioLatencyValue.textContent = `${settings.audioLatencyMs} ms`;
+  audioClockRateValue.textContent = `${Number(settings.audioClockRate).toFixed(4)}x`;
 }
 
 function syncTouchModeControls(settings = readSettingsFromControls()) {
@@ -622,6 +690,8 @@ function applySettings(settings) {
   fpsInput.value = String(normalized.fps);
   scrollSpeedInput.value = String(normalized.scrollSpeed);
   audioLatencyInput.value = String(normalized.audioLatencyMs);
+  audioClockRateInput.value = String(normalized.audioClockRate);
+  audioClockAutoInput.checked = normalized.audioClockAuto;
   autoDisconnectMinutesInput.value = String(normalized.autoDisconnectMinutes);
   touchModeSelect.value = normalized.touchMode;
   directTouchScrollInput.checked = normalized.directTouchScroll;
@@ -1225,16 +1295,14 @@ function handleVideoFrame(buffer, view) {
 }
 
 function handleAudioFrame(buffer, view) {
-  if (!state.audioEnabled) return;
+  if (!state.audioEnabled || !state.audioUserActivated) return;
   const sentAt = Number(view.getBigUint64(1, true));
   const receivedAt = performance.now();
   const stalledForMs = state.lastAudioPacketAt ? receivedAt - state.lastAudioPacketAt : 0;
   state.lastAudioPacketAt = receivedAt;
   const mediaAgeMs = estimateMediaAgeMs(sentAt);
   if (stalledForMs >= MEDIA_STALL_RESET_MS || mediaAgeMs > LIVE_MEDIA_MAX_AGE_MS) {
-    markStaleDrop("Dropping delayed audio");
-    resetAudioDecoderForLiveCatchup();
-    return;
+    markStaleDrop("Buffered delayed audio");
   }
   const length = view.getUint32(9, true);
   const bytes = new Uint8Array(buffer, 13, length);
@@ -1242,20 +1310,12 @@ function handleAudioFrame(buffer, view) {
   if (!frame) return;
   setupAudioDecoder(frame);
   if (!state.audioDecoder || state.audioDecoder.state === "closed") return;
-  if ((state.audioDecoder.decodeQueueSize ?? 0) > MAX_AUDIO_DECODE_QUEUE) {
-    markStaleDrop("Audio decoder catching up");
-    resetAudioDecoderForLiveCatchup();
-    return;
-  }
-  try {
-    state.audioDecoder.decode(new EncodedAudioChunk({
-      type: "key",
-      timestamp: sentAt * 1000,
-      data: frame.payload,
-    }));
-  } catch (error) {
-    showToast("audio_decode_submit_failed", error.message || String(error));
-  }
+  state.pendingEncodedAudioFrames.push({
+    timestamp: sentAt * 1000,
+    data: frame.payload,
+    durationSeconds: AAC_SAMPLES_PER_FRAME / frame.sampleRate,
+  });
+  pumpPendingAudioDecode();
 }
 
 function parseAdtsFrame(bytes) {
@@ -1318,6 +1378,15 @@ function resetAudioDecoderForLiveCatchup() {
 }
 
 function resetAudioPlayback() {
+  if (state.audioResumeTimer) {
+    clearTimeout(state.audioResumeTimer);
+    state.audioResumeTimer = 0;
+  }
+  state.audioResumeBlockedUntil = 0;
+  state.audioUnderrunActive = false;
+  state.audioPlaybackBlocked = false;
+  state.audioLargeBufferSinceAt = 0;
+  state.audioHighLatencySinceAt = 0;
   for (const source of state.audioSources) {
     try {
       source.stop();
@@ -1328,8 +1397,72 @@ function resetAudioPlayback() {
   }
   state.audioSources.clear();
   state.audioNextTime = 0;
+  state.pendingEncodedAudioFrames = [];
   state.pendingAudioBuffers = [];
   state.pendingAudioDuration = 0;
+  state.audioDecodingDuration = 0;
+  state.audioRateIntegral = 0;
+  state.audioRateLastUpdatedAt = 0;
+  state.audioClockAutoLastIncreaseAt = 0;
+  state.audioClockAutoLastIncreaseLead = 0;
+  state.audioClockAutoLastSlowTuneAt = 0;
+}
+
+function stopActiveAudioPlayback() {
+  for (const source of state.audioSources) {
+    try {
+      source.stop();
+    } catch {
+      // Source may already be ended.
+    }
+    source.disconnect();
+  }
+  state.audioSources.clear();
+  state.audioNextTime = 0;
+}
+
+function scheduleAudioResumeCheck(audioContext, delayMs) {
+  if (state.audioResumeTimer) return;
+  state.audioResumeTimer = window.setTimeout(() => {
+    state.audioResumeTimer = 0;
+    if (!state.audioContext || state.audioContext.state === "closed") {
+      return;
+    }
+    driveAudioPlayback(audioContext);
+  }, Math.max(0, delayMs));
+}
+
+function enterAudioUnderrun(audioContext, bufferedSeconds) {
+  const wallNow = performance.now();
+  const wasUnderrunActive = state.audioUnderrunActive;
+  state.audioLargeBufferSinceAt = 0;
+  state.audioHighLatencySinceAt = 0;
+  state.audioUnderrunActive = true;
+  state.audioResumeBlockedUntil = Math.max(
+    state.audioResumeBlockedUntil,
+    wallNow + AUDIO_UNDERRUN_RETRY_MS,
+  );
+  if (!wasUnderrunActive) {
+    maybeAutoDecreaseAudioClockRate();
+  }
+  stopActiveAudioPlayback();
+  const bufferedMs = Math.max(0, Math.round(bufferedSeconds * 1000));
+  setStreamWarning(`${AUDIO_UNDERRUN_WARNING} (${bufferedMs} ms buffered)`);
+  scheduleAudioResumeCheck(
+    audioContext,
+    state.audioResumeBlockedUntil - wallNow,
+  );
+}
+
+function clearAudioUnderrun() {
+  state.audioUnderrunActive = false;
+  state.audioResumeBlockedUntil = 0;
+  if (
+    state.streamWarning.startsWith(AUDIO_UNDERRUN_WARNING)
+    || state.streamWarning.startsWith("Audio rebuffering")
+  ) {
+    setStreamWarning("");
+  }
 }
 
 function currentConfiguredAudioLatencyMs() {
@@ -1340,19 +1473,144 @@ function currentConfiguredAudioLatencyMs() {
   );
 }
 
+function currentConfiguredAudioClockRate() {
+  return clampControlValue(
+    audioClockRateInput,
+    audioClockRateInput.value,
+    AUDIO_BASE_PLAYBACK_RATE,
+  );
+}
+
+function currentConfiguredAudioClockAutoEnabled() {
+  return audioClockAutoInput.checked;
+}
+
+function currentConfiguredAudioLatencySeconds() {
+  return Math.max(AUDIO_MIN_BUFFER_SECONDS, currentConfiguredAudioLatencyMs() / 1000);
+}
+
+function rebufferOversizedAudioBuffer() {
+  state.audioLargeBufferSinceAt = 0;
+  state.audioHighLatencySinceAt = 0;
+  markStaleDrop("Rebuffering oversized audio buffer");
+  resetAudioDecoderForLiveCatchup();
+}
+
+function trimAudioBufferToTarget(profile) {
+  const keepSeconds = Math.max(
+    profile.minBufferSeconds,
+    profile.targetBufferSeconds + AUDIO_TRIM_TARGET_EXTRA_SECONDS,
+  );
+  stopActiveAudioPlayback();
+  const keptBuffers = [];
+  let keptDuration = 0;
+  for (let index = state.pendingAudioBuffers.length - 1; index >= 0; index -= 1) {
+    const buffer = state.pendingAudioBuffers[index];
+    keptBuffers.unshift(buffer);
+    keptDuration += buffer.duration;
+    if (keptDuration >= keepSeconds) {
+      break;
+    }
+  }
+  state.pendingAudioBuffers = keptBuffers;
+  state.pendingAudioDuration = keptDuration;
+  state.audioHighLatencySinceAt = 0;
+  state.audioLargeBufferSinceAt = 0;
+  state.audioClockAutoLastIncreaseAt = 0;
+  state.audioClockAutoLastIncreaseLead = 0;
+  state.audioClockAutoLastSlowTuneAt = 0;
+  markStaleDrop(`Trimming delayed audio to ${Math.round(keepSeconds * 1000)} ms`);
+}
+
+function setConfiguredAudioClockRate(nextRate) {
+  const clamped = clampControlValue(
+    audioClockRateInput,
+    nextRate,
+    currentConfiguredAudioClockRate(),
+  );
+  if (Math.abs(clamped - currentConfiguredAudioClockRate()) < 0.00005) {
+    return false;
+  }
+  audioClockRateInput.value = clamped.toFixed(4);
+  audioClockRateValue.textContent = `${clamped.toFixed(4)}x`;
+  persistCurrentSettings();
+  return true;
+}
+
+function maybeAutoDecreaseAudioClockRate() {
+  if (!currentConfiguredAudioClockAutoEnabled()) return;
+  state.audioClockAutoLastIncreaseAt = 0;
+  state.audioClockAutoLastIncreaseLead = 0;
+  state.audioClockAutoLastSlowTuneAt = 0;
+  setConfiguredAudioClockRate(currentConfiguredAudioClockRate() - AUDIO_AUTO_CLOCK_STEP);
+}
+
+function maybeAutoIncreaseAudioClockRate(totalAvailableLead, wallNow) {
+  if (!currentConfiguredAudioClockAutoEnabled() || state.audioUnderrunActive) {
+    state.audioClockAutoLastIncreaseAt = 0;
+    state.audioClockAutoLastIncreaseLead = 0;
+    state.audioClockAutoLastSlowTuneAt = 0;
+    return;
+  }
+  if (totalAvailableLead < AUDIO_AUTO_CLOCK_INCREASE_BUFFER_SECONDS) {
+    state.audioClockAutoLastIncreaseAt = 0;
+    state.audioClockAutoLastIncreaseLead = 0;
+    return;
+  }
+  if (!state.audioClockAutoLastIncreaseAt) {
+    state.audioClockAutoLastIncreaseAt = wallNow;
+    state.audioClockAutoLastIncreaseLead = totalAvailableLead;
+    return;
+  }
+  if (wallNow - state.audioClockAutoLastIncreaseAt < AUDIO_AUTO_CLOCK_INCREASE_INTERVAL_MS) {
+    return;
+  }
+  const leadGrowth = totalAvailableLead - state.audioClockAutoLastIncreaseLead;
+  if (leadGrowth >= AUDIO_AUTO_CLOCK_INCREASE_MIN_GROWTH_SECONDS) {
+    setConfiguredAudioClockRate(currentConfiguredAudioClockRate() + AUDIO_AUTO_CLOCK_STEP);
+  } else {
+    trimAudioBufferToTarget(currentAudioBufferProfile());
+  }
+  state.audioClockAutoLastIncreaseAt = wallNow;
+  state.audioClockAutoLastIncreaseLead = totalAvailableLead;
+}
+
+function maybeAutoSlowTuneAudioClockRate(totalAvailableLead, wallNow, profile) {
+  if (!currentConfiguredAudioClockAutoEnabled() || state.audioUnderrunActive) {
+    state.audioClockAutoLastSlowTuneAt = 0;
+    return;
+  }
+  const slowTuneThreshold = (
+    profile.targetBufferSeconds + AUDIO_AUTO_CLOCK_SLOW_TUNE_TARGET_EXTRA_SECONDS
+  );
+  if (!state.audioClockAutoLastSlowTuneAt) {
+    state.audioClockAutoLastSlowTuneAt = wallNow;
+    return;
+  }
+  if (wallNow - state.audioClockAutoLastSlowTuneAt < AUDIO_AUTO_CLOCK_SLOW_TUNE_INTERVAL_MS) {
+    return;
+  }
+  const nextRate = totalAvailableLead > slowTuneThreshold
+    ? currentConfiguredAudioClockRate() + AUDIO_AUTO_CLOCK_SLOW_TUNE_STEP
+    : currentConfiguredAudioClockRate() - AUDIO_AUTO_CLOCK_SLOW_TUNE_STEP;
+  setConfiguredAudioClockRate(nextRate);
+  state.audioClockAutoLastSlowTuneAt = wallNow;
+}
+
 function currentAudioBufferProfile() {
-  const latencyMs = Number.isFinite(state.wsLatencyMs) ? state.wsLatencyMs : 0;
-  const profile = AUDIO_BUFFER_PROFILES.find((entry) => latencyMs >= entry.minLatencyMs)
-    || AUDIO_BUFFER_PROFILES[AUDIO_BUFFER_PROFILES.length - 1];
-  const extraLatencyMs = currentConfiguredAudioLatencyMs();
-  const extraSeconds = extraLatencyMs / 1000;
-  const targetLeadSeconds = profile.targetLeadSeconds + extraSeconds;
+  const targetBufferSeconds = Math.max(
+    AUDIO_MIN_BUFFER_SECONDS,
+    currentConfiguredAudioLatencyMs() / 1000,
+  );
   return {
-    targetLeadSeconds,
-    continueLeadSeconds: Math.max(0.06, targetLeadSeconds * 0.5),
-    maxQueueSeconds: profile.maxQueueSeconds + extraSeconds,
-    resetGraceSeconds: Math.max(profile.resetGraceSeconds, 0.05),
+    minBufferSeconds: AUDIO_MIN_BUFFER_SECONDS,
+    targetBufferSeconds,
+    resetGraceSeconds: 0.05,
   };
+}
+
+function currentAudioResumeBufferSeconds(profile = currentAudioBufferProfile()) {
+  return profile.targetBufferSeconds;
 }
 
 function currentAudioStartSlack(audioContext) {
@@ -1360,51 +1618,141 @@ function currentAudioStartSlack(audioContext) {
   return Math.max(0.03, Math.min(0.08, Math.max(baseLatency * 3, 0.05)));
 }
 
-function scheduleAudioBuffer(audioContext, audioBuffer, profile = currentAudioBufferProfile()) {
+function currentAudioPlaybackRate(profile, totalAvailableLead) {
+  return currentConfiguredAudioClockRate();
+}
+
+function scheduleAudioBuffer(
+  audioContext,
+  audioBuffer,
+  playbackRate = 1,
+  profile = currentAudioBufferProfile(),
+) {
   const source = audioContext.createBufferSource();
   source.buffer = audioBuffer;
+  source.playbackRate.value = playbackRate;
   source.connect(audioContext.destination);
   const now = audioContext.currentTime;
-  const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
   if (!state.audioNextTime || state.audioNextTime < now - profile.resetGraceSeconds) {
-    state.audioNextTime = now + currentAudioStartSlack(audioContext);
-  } else if (queuedFor > profile.maxQueueSeconds) {
-    resetAudioPlayback();
     state.audioNextTime = now + currentAudioStartSlack(audioContext);
   }
   state.audioSources.add(source);
   source.start(state.audioNextTime);
-  state.audioNextTime += audioBuffer.duration;
+  state.audioNextTime += audioBuffer.duration / playbackRate;
   source.onended = () => {
     state.audioSources.delete(source);
     source.disconnect();
+    driveAudioPlayback(audioContext);
   };
+}
+
+function pumpPendingAudioDecode() {
+  const audioDecoder = state.audioDecoder;
+  if (!audioDecoder || audioDecoder.state === "closed") return;
+  if (state.audioPlaybackBlocked) return;
+  const profile = currentAudioBufferProfile();
+  const decodeTargetSeconds = state.audioUnderrunActive
+    ? currentAudioResumeBufferSeconds(profile)
+    : AUDIO_REBUFFER_BUFFER_SECONDS;
+  while (state.pendingEncodedAudioFrames.length > 0) {
+    const bufferedSeconds = currentBufferedAudioSeconds();
+    if (bufferedSeconds >= decodeTargetSeconds) {
+      break;
+    }
+    if ((audioDecoder.decodeQueueSize ?? 0) >= MAX_AUDIO_DECODE_QUEUE) {
+      markStaleDrop("Audio decoder backlog growing");
+      break;
+    }
+    const nextFrame = state.pendingEncodedAudioFrames.shift();
+    if (!nextFrame) {
+      break;
+    }
+    try {
+      audioDecoder.decode(new EncodedAudioChunk({
+        type: "key",
+        timestamp: nextFrame.timestamp,
+        data: nextFrame.data,
+      }));
+      state.audioDecodingDuration += nextFrame.durationSeconds;
+    } catch (error) {
+      state.pendingEncodedAudioFrames.unshift(nextFrame);
+      showToast("audio_decode_submit_failed", error.message || String(error));
+      break;
+    }
+  }
+}
+
+function driveAudioPlayback(audioContext = state.audioContext) {
+  if (!audioContext || audioContext.state === "closed") return;
+  pumpPendingAudioDecode();
+  flushPendingAudioPlayback(audioContext);
+  pumpPendingAudioDecode();
+  flushPendingAudioPlayback(audioContext);
 }
 
 function flushPendingAudioPlayback(audioContext) {
   const profile = currentAudioBufferProfile();
-  while (state.pendingAudioBuffers.length > 0) {
+  while (true) {
     const now = audioContext.currentTime;
+    const wallNow = performance.now();
     const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
+    const totalAvailableLead = queuedFor + state.pendingAudioDuration + state.audioDecodingDuration;
     const playbackStale = !state.audioNextTime || state.audioNextTime < now - profile.resetGraceSeconds;
-    if (playbackStale && state.pendingAudioDuration < profile.targetLeadSeconds) {
-      break;
-    }
-    if (!playbackStale) {
-      const totalAvailableLead = queuedFor + state.pendingAudioDuration;
-      if (queuedFor < profile.continueLeadSeconds && totalAvailableLead < profile.targetLeadSeconds) {
+    if (totalAvailableLead > AUDIO_REBUFFER_BUFFER_SECONDS) {
+      if (!state.audioLargeBufferSinceAt) {
+        state.audioLargeBufferSinceAt = wallNow;
+      } else if (wallNow - state.audioLargeBufferSinceAt >= AUDIO_REBUFFER_HOLD_MS) {
+        rebufferOversizedAudioBuffer();
         break;
       }
+    } else {
+      state.audioLargeBufferSinceAt = 0;
     }
-    if (!playbackStale && queuedFor >= profile.maxQueueSeconds) {
+    const trimInBand = totalAvailableLead > AUDIO_TRIM_LATENCY_LOW_BUFFER_SECONDS
+      && totalAvailableLead < AUDIO_TRIM_LATENCY_BUFFER_SECONDS;
+    if (trimInBand) {
+      if (!state.audioHighLatencySinceAt) {
+        state.audioHighLatencySinceAt = wallNow;
+      } else if (wallNow - state.audioHighLatencySinceAt >= AUDIO_TRIM_LATENCY_HOLD_MS) {
+        trimAudioBufferToTarget(profile);
+        break;
+      }
+    } else {
+      state.audioHighLatencySinceAt = 0;
+    }
+    if (totalAvailableLead < profile.minBufferSeconds) {
+      enterAudioUnderrun(audioContext, totalAvailableLead);
+      break;
+    }
+    if (state.audioUnderrunActive) {
+      const resumeBufferSeconds = currentAudioResumeBufferSeconds(profile);
+      if (wallNow < state.audioResumeBlockedUntil || totalAvailableLead < resumeBufferSeconds) {
+        const bufferedMs = Math.max(0, Math.round(totalAvailableLead * 1000));
+        const resumeMs = Math.max(0, Math.round(resumeBufferSeconds * 1000));
+        setStreamWarning(`Audio rebuffering (${bufferedMs} / ${resumeMs} ms)`);
+        const nextDelayMs = wallNow < state.audioResumeBlockedUntil
+          ? state.audioResumeBlockedUntil - wallNow
+          : AUDIO_UNDERRUN_POLL_MS;
+        scheduleAudioResumeCheck(audioContext, nextDelayMs);
+        break;
+      }
+      clearAudioUnderrun();
+    }
+    maybeAutoIncreaseAudioClockRate(totalAvailableLead, wallNow);
+    maybeAutoSlowTuneAudioClockRate(totalAvailableLead, wallNow, profile);
+    if (playbackStale && totalAvailableLead < profile.targetBufferSeconds) {
+      break;
+    }
+    if (!playbackStale && queuedFor >= profile.targetBufferSeconds) {
       break;
     }
     const nextBuffer = state.pendingAudioBuffers.shift();
     if (!nextBuffer) {
       break;
     }
+    const playbackRate = currentAudioPlaybackRate(profile, totalAvailableLead);
     state.pendingAudioDuration = Math.max(0, state.pendingAudioDuration - nextBuffer.duration);
-    scheduleAudioBuffer(audioContext, nextBuffer, profile);
+    scheduleAudioBuffer(audioContext, nextBuffer, playbackRate, profile);
   }
 }
 
@@ -1420,10 +1768,20 @@ async function ensureAudioContext() {
 }
 
 async function primeAudioPlayback() {
+  const wasBlocked = state.audioPlaybackBlocked;
   try {
     await ensureAudioContext();
+    if (!state.audioUserActivated) {
+      state.audioUserActivated = true;
+      resetAudioDecoderForLiveCatchup();
+    }
+    if (wasBlocked) {
+      resetAudioDecoderForLiveCatchup();
+    }
+    state.audioPlaybackBlocked = false;
   } catch {
     // Autoplay policy may require a user gesture; playback will retry later.
+    state.audioPlaybackBlocked = true;
   }
 }
 
@@ -1716,8 +2074,11 @@ async function stopCameraCapture({ notifyServer = true, keepEnabled = false } = 
 }
 
 async function playAudioData(audioData) {
+  const audioDuration = audioData.numberOfFrames / audioData.sampleRate;
+  state.audioDecodingDuration = Math.max(0, state.audioDecodingDuration - audioDuration);
   const audioContext = await ensureAudioContext().catch(() => null);
   if (!audioContext) {
+    state.audioPlaybackBlocked = true;
     audioData.close();
     return;
   }
@@ -1732,9 +2093,10 @@ async function playAudioData(audioData) {
       format: "f32-planar",
     });
   }
+  state.audioPlaybackBlocked = false;
   state.pendingAudioBuffers.push(audioBuffer);
   state.pendingAudioDuration += audioBuffer.duration;
-  flushPendingAudioPlayback(audioContext);
+  driveAudioPlayback(audioContext);
   audioData.close();
 }
 
@@ -2697,6 +3059,14 @@ function initControls() {
   scrollSpeedInput.addEventListener("change", persistCurrentSettings);
   audioLatencyInput.addEventListener("input", persistCurrentSettings);
   audioLatencyInput.addEventListener("change", persistCurrentSettings);
+  audioClockRateInput.addEventListener("input", persistCurrentSettings);
+  audioClockRateInput.addEventListener("change", persistCurrentSettings);
+  audioClockAutoInput.addEventListener("change", () => {
+    state.audioClockAutoLastIncreaseAt = 0;
+    state.audioClockAutoLastIncreaseLead = 0;
+    state.audioClockAutoLastSlowTuneAt = 0;
+    persistCurrentSettings();
+  });
   autoDisconnectMinutesInput.addEventListener("input", persistCurrentSettings);
   autoDisconnectMinutesInput.addEventListener("change", persistCurrentSettings);
   touchModeSelect.addEventListener("change", persistCurrentSettings);
@@ -2760,6 +3130,7 @@ function initControls() {
     }
   });
   document.addEventListener("pointerdown", (event) => {
+    void primeAudioPlayback();
     if (event.target instanceof HTMLElement && event.target.closest("#control-panel")) {
       releaseInput();
     }
@@ -2824,6 +3195,7 @@ function initControls() {
     queueWheel(event.deltaY);
   }, { passive: false });
   window.addEventListener("keydown", (event) => {
+    void primeAudioPlayback();
     if (isReleaseInputChord(event)) {
       event.preventDefault();
       releaseInput();
@@ -2916,6 +3288,7 @@ state.passwd = loadStoredPassword();
 authInput.value = state.passwd;
 renderMicToggle();
 renderCameraToggle();
+setInterval(renderAudioBufferMetric, 500);
 setInterval(monitorConnectionHealth, HEALTH_WATCHDOG_INTERVAL_MS);
 if (state.passwd) {
   clearAuthPrompt();
