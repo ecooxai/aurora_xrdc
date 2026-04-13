@@ -25,7 +25,7 @@ pub struct StreamHandle {
 }
 
 pub async fn start(server: ServerConfig, config: StreamConfig) -> Result<(StreamHandle, Child)> {
-    let encoder = choose_encoder(config.codec).await?;
+    let encoder = choose_encoder(config.codec, config.encode_preference).await?;
     let mut child = spawn_capture(&server, &config, &encoder)?;
     let mut stdout = child.stdout.take().expect("ffmpeg stdout missing");
     let (tx, rx) = watch::channel(None);

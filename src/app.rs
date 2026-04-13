@@ -24,7 +24,7 @@ use crate::{
     ffmpeg,
     media::MediaHub,
     session,
-    settings::{AudioStreamConfig, CodecKind, ServerConfig, StreamConfig},
+    settings::{AudioStreamConfig, CodecKind, EncodePreference, ServerConfig, StreamConfig},
 };
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -126,11 +126,18 @@ struct AuthQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct EncodersQuery {
+    codec: Option<CodecKind>,
+    passwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct WsQuery {
     codec: Option<CodecKind>,
     bitrate_kbps: Option<u32>,
     audio_bitrate_kbps: Option<u32>,
     fps: Option<u32>,
+    encode_preference: Option<EncodePreference>,
     passwd: Option<String>,
 }
 
@@ -152,6 +159,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/app.css", get(css))
         .route("/healthz", get(healthz))
         .route("/api/auth", get(auth))
+        .route("/api/encoders", get(encoders))
         .route("/ws", get(ws))
         .route("/api/upload", post(upload))
         .route("/api/camera/chunk", post(upload_camera_chunk))
@@ -203,6 +211,26 @@ async fn auth(
     Ok("ok")
 }
 
+#[derive(Debug, Serialize)]
+struct EncodersResponse {
+    options: Vec<ffmpeg::AvailableEncoderOption>,
+}
+
+async fn encoders(
+    Query(query): Query<EncodersQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<EncodersResponse>, (StatusCode, String)> {
+    state
+        .auth
+        .require_passwd(&state.server.passwd, query.passwd.as_deref())
+        .await?;
+    let codec = query.codec.unwrap_or(CodecKind::H264);
+    let options = ffmpeg::available_encoder_options(codec)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(EncodersResponse { options }))
+}
+
 async fn ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -219,6 +247,7 @@ async fn ws(
         codec: query.codec.unwrap_or(CodecKind::H264),
         bitrate_kbps: query.bitrate_kbps.unwrap_or(4_000),
         fps: query.fps.unwrap_or(16),
+        encode_preference: query.encode_preference.unwrap_or_default(),
     }
     .normalized();
     let audio_config = AudioStreamConfig {

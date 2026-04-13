@@ -46,6 +46,20 @@ const AUDIO_DRIFT_INTEGRAL_MAX = 0.03;
 const AUTO_DISCONNECT_DISABLED_MINUTES = 0;
 const AUTO_DISCONNECT_ACTIVITY_REFRESH_MS = 1000;
 const SETTINGS_RECONNECT_DELAY_MS = 3000;
+const KNOWN_ENCODE_PREFERENCE_VALUES = new Set([
+  "gpu",
+  "cpu",
+  "h264_nvenc",
+  "h264_qsv",
+  "h264_vaapi",
+  "libx264",
+  "hevc_nvenc",
+  "hevc_qsv",
+  "hevc_vaapi",
+  "libx265",
+  "libvpx",
+]);
+const CPU_ENCODE_PREFERENCE_VALUES = new Set(["cpu", "libx264", "libx265", "libvpx"]);
 const AUTO_DISCONNECT_ACTIVITY_MESSAGE_TYPES = new Set([
   "key",
   "key_state",
@@ -173,6 +187,7 @@ const cameraToggle = $("camera-toggle");
 const mobileKeyboardInput = $("mobile-keyboard-input");
 const encoderStatus = $("encoder-status");
 const codecSelect = $("codec");
+const encodePreferenceSelect = $("encode-preference");
 const bitrateInput = $("bitrate");
 const bitrateValue = $("bitrate-value");
 const audioBitrateSelect = $("audio-bitrate");
@@ -469,6 +484,7 @@ function clearSettingsReconnectTimer() {
 function streamReconnectSettingsKey(settings = readSettingsFromControls()) {
   return JSON.stringify({
     codec: settings.codec,
+    encodePreference: settings.encodePreference,
     bitrate: settings.bitrate,
     audioBitrateKbps: settings.audioBitrateKbps,
     fps: settings.fps,
@@ -590,8 +606,10 @@ function normalizeSettings(settings = {}) {
   const defaultScrollSpeed = Number(scrollSpeedInput.value);
   const defaultAudioClockRate = Number(audioClockRateInput.value);
   const defaultAutoDisconnectMinutes = Number(autoDisconnectMinutesInput.value);
+  const codec = allowedCodecs.has(settings.codec) ? settings.codec : codecSelect.value;
   return {
-    codec: allowedCodecs.has(settings.codec) ? settings.codec : codecSelect.value,
+    codec,
+    encodePreference: normalizeEncodePreferenceForCodec(settings.encodePreference, codec),
     bitrate: clampControlValue(bitrateInput, settings.bitrate, defaultBitrate),
     audioBitrateKbps: allowedAudioBitrates.has(Number(settings.audioBitrateKbps))
       ? Number(settings.audioBitrateKbps)
@@ -619,6 +637,7 @@ function normalizeSettings(settings = {}) {
 function readSettingsFromControls() {
   return normalizeSettings({
     codec: codecSelect.value,
+    encodePreference: encodePreferenceSelect.value,
     bitrate: bitrateInput.value,
     audioBitrateKbps: audioBitrateSelect.value,
     micBitrateKbps: micBitrateSelect.value,
@@ -684,6 +703,7 @@ function renderCameraToggle() {
 function applySettings(settings) {
   const normalized = normalizeSettings(settings);
   codecSelect.value = normalized.codec;
+  renderEncodePreferenceOptions(defaultEncodeOptionsForCodec(normalized.codec), normalized.encodePreference);
   bitrateInput.value = String(normalized.bitrate);
   audioBitrateSelect.value = String(normalized.audioBitrateKbps);
   micBitrateSelect.value = String(normalized.micBitrateKbps);
@@ -746,6 +766,100 @@ function authUrl(path) {
   const passwd = getPassword();
   if (passwd) url.searchParams.set("passwd", passwd);
   return url;
+}
+
+function defaultEncodePreferenceForCodec(codec) {
+  return codec === "vp8" ? "cpu" : "gpu";
+}
+
+function defaultEncodeOptionsForCodec(codec) {
+  const options = [];
+  if (codec !== "vp8") {
+    options.push({ value: "gpu", label: "GPU auto" });
+  }
+  options.push({ value: "cpu", label: "CPU auto" });
+  return options;
+}
+
+function normalizeEncodePreferenceForCodec(value, codec) {
+  const preferred = KNOWN_ENCODE_PREFERENCE_VALUES.has(value)
+    ? value
+    : defaultEncodePreferenceForCodec(codec);
+  const allowedValues = new Set(
+    codec === "h264"
+      ? ["gpu", "cpu", "h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
+      : codec === "h265"
+        ? ["gpu", "cpu", "hevc_nvenc", "hevc_qsv", "hevc_vaapi", "libx265"]
+        : ["cpu", "libvpx"],
+  );
+  if (allowedValues.has(preferred)) return preferred;
+  return codec === "vp8" || CPU_ENCODE_PREFERENCE_VALUES.has(preferred)
+    ? "cpu"
+    : defaultEncodePreferenceForCodec(codec);
+}
+
+function renderEncodePreferenceOptions(
+  options = defaultEncodeOptionsForCodec(codecSelect.value),
+  preferredValue = encodePreferenceSelect.value,
+) {
+  const fallbackOptions = Array.isArray(options) && options.length > 0
+    ? options
+    : defaultEncodeOptionsForCodec(codecSelect.value);
+  encodePreferenceSelect.replaceChildren();
+  for (const option of fallbackOptions) {
+    if (typeof option?.value !== "string" || typeof option?.label !== "string") continue;
+    const element = document.createElement("option");
+    element.value = option.value;
+    element.textContent = option.label;
+    encodePreferenceSelect.appendChild(element);
+  }
+  const allowedValues = new Set(Array.from(encodePreferenceSelect.options, (option) => option.value));
+  const fallbackValue = encodePreferenceSelect.options[0]?.value || defaultEncodePreferenceForCodec(codecSelect.value);
+  const nextValue = normalizeEncodePreferenceForCodec(preferredValue, codecSelect.value);
+  encodePreferenceSelect.value = allowedValues.has(nextValue) ? nextValue : fallbackValue;
+}
+
+async function refreshEncodePreferenceOptions(
+  codec = codecSelect.value,
+  preferredValue = encodePreferenceSelect.value,
+  { silent = false } = {},
+) {
+  let options = defaultEncodeOptionsForCodec(codec);
+  if (getPassword()) {
+    try {
+      const url = authUrl("/api/encoders");
+      url.searchParams.set("codec", codec);
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(await response.text().catch(() => "Failed to load encoders"));
+      }
+      const body = await response.json();
+      if (Array.isArray(body?.options) && body.options.length > 0) {
+        options = body.options;
+      }
+    } catch (error) {
+      if (!silent) {
+        showToast("encoder_options_failed", error.message || String(error));
+      }
+    }
+  }
+  renderEncodePreferenceOptions(options, preferredValue);
+}
+
+async function handleCodecSettingChange() {
+  const preferredValue = encodePreferenceSelect.value;
+  await refreshEncodePreferenceOptions(codecSelect.value, preferredValue, { silent: true });
+  persistCurrentSettings();
+  if (state.socket?.readyState === WebSocket.OPEN && !state.connecting && !state.reconnectingForLatency) {
+    reconnectForSettings("Reconnect to apply stream settings");
+  }
+}
+
+function handleEncoderSettingChange() {
+  persistCurrentSettings();
+  if (state.socket?.readyState === WebSocket.OPEN && !state.connecting && !state.reconnectingForLatency) {
+    reconnectForSettings("Reconnect to apply stream settings");
+  }
 }
 
 async function getVideoCodecSupport(codec) {
@@ -880,6 +994,7 @@ async function connect() {
     savePassword(passwd);
     state.passwd = passwd;
     clearAuthPrompt();
+    await refreshEncodePreferenceOptions(codecSelect.value, loadStoredSettings().encodePreference, { silent: true });
     closeConnection({ manual: false, preserveStatus: true });
     await loadClipboardHistory();
     state.manualDisconnect = false;
@@ -887,11 +1002,12 @@ async function connect() {
     void primeAudioPlayback();
     const {
       codec,
+      encodePreference,
       bitrate,
       audioBitrateKbps,
       fps,
     } = readSettingsFromControls();
-    const requestedStreamSettings = { codec, bitrate, audioBitrateKbps, fps };
+    const requestedStreamSettings = { codec, encodePreference, bitrate, audioBitrateKbps, fps };
     const videoCodecSupport = await getVideoCodecSupport(codec);
     if (!videoCodecSupport.supported) {
       setStatus("Disconnected");
@@ -911,6 +1027,7 @@ async function connect() {
     const url = new URL("/ws", window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.searchParams.set("codec", codec);
+    url.searchParams.set("encode_preference", encodePreference);
     url.searchParams.set("bitrate_kbps", bitrate);
     url.searchParams.set("audio_bitrate_kbps", audioBitrateKbps);
     url.searchParams.set("fps", fps);
@@ -3043,7 +3160,10 @@ function initControls() {
     authError.textContent = "";
     authError.classList.add("hidden");
   });
-  codecSelect.addEventListener("change", persistCurrentSettings);
+  codecSelect.addEventListener("change", () => {
+    void handleCodecSettingChange();
+  });
+  encodePreferenceSelect.addEventListener("change", handleEncoderSettingChange);
   bitrateInput.addEventListener("input", persistCurrentSettings);
   bitrateInput.addEventListener("change", persistCurrentSettings);
   audioBitrateSelect.addEventListener("change", persistCurrentSettings);

@@ -1,19 +1,49 @@
-use std::{ffi::OsStr, path::Path, process::Stdio};
+use std::{
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 use tokio::{
     io::AsyncReadExt,
     process::{ChildStdin, Command},
     time::{Duration, sleep},
 };
 
-use crate::settings::{AudioStreamConfig, CodecKind, ServerConfig, StreamConfig};
+use crate::settings::{AudioStreamConfig, CodecKind, EncodePreference, ServerConfig, StreamConfig};
 
 #[derive(Debug, Clone)]
 pub struct EncoderChoice {
     pub ffmpeg_encoder: String,
     pub mode: &'static str,
     pub output_format: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AvailableEncoderOption {
+    pub value: EncodePreference,
+    pub label: String,
+    pub mode: &'static str,
+    pub ffmpeg_encoder: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EncoderBackend {
+    Cpu,
+    NvidiaNvenc,
+    IntelQsv,
+    Vaapi,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EncoderProfile {
+    ffmpeg_encoder: &'static str,
+    mode: &'static str,
+    output_format: &'static str,
+    backend: EncoderBackend,
 }
 
 pub struct MicInputHandle {
@@ -27,14 +57,92 @@ const VIRTUAL_CAMERA_LABEL: &str = "viberdeskcamera";
 const VIRTUAL_CAMERA_NR: &str = "42";
 const VIDEO_GOP_SECONDS: u32 = 2;
 
-pub async fn choose_encoder(codec: CodecKind) -> Result<EncoderChoice> {
+const H264_GPU_ENCODERS: &[EncoderProfile] = &[
+    EncoderProfile {
+        ffmpeg_encoder: "h264_nvenc",
+        mode: "gpu",
+        output_format: "h264",
+        backend: EncoderBackend::NvidiaNvenc,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "h264_qsv",
+        mode: "gpu",
+        output_format: "h264",
+        backend: EncoderBackend::IntelQsv,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "h264_vaapi",
+        mode: "gpu",
+        output_format: "h264",
+        backend: EncoderBackend::Vaapi,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "libx264",
+        mode: "cpu",
+        output_format: "h264",
+        backend: EncoderBackend::Cpu,
+    },
+];
+
+const H264_CPU_ENCODERS: &[EncoderProfile] = &[EncoderProfile {
+    ffmpeg_encoder: "libx264",
+    mode: "cpu",
+    output_format: "h264",
+    backend: EncoderBackend::Cpu,
+}];
+
+const H265_GPU_ENCODERS: &[EncoderProfile] = &[
+    EncoderProfile {
+        ffmpeg_encoder: "hevc_nvenc",
+        mode: "gpu",
+        output_format: "hevc",
+        backend: EncoderBackend::NvidiaNvenc,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "hevc_qsv",
+        mode: "gpu",
+        output_format: "hevc",
+        backend: EncoderBackend::IntelQsv,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "hevc_vaapi",
+        mode: "gpu",
+        output_format: "hevc",
+        backend: EncoderBackend::Vaapi,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "libx265",
+        mode: "cpu",
+        output_format: "hevc",
+        backend: EncoderBackend::Cpu,
+    },
+];
+
+const H265_CPU_ENCODERS: &[EncoderProfile] = &[EncoderProfile {
+    ffmpeg_encoder: "libx265",
+    mode: "cpu",
+    output_format: "hevc",
+    backend: EncoderBackend::Cpu,
+}];
+
+const VP8_ENCODERS: &[EncoderProfile] = &[EncoderProfile {
+    ffmpeg_encoder: "libvpx",
+    mode: "cpu",
+    output_format: "ivf",
+    backend: EncoderBackend::Cpu,
+}];
+
+pub async fn choose_encoder(
+    codec: CodecKind,
+    encode_preference: EncodePreference,
+) -> Result<EncoderChoice> {
     let encoders = ffmpeg_list_encoders().await?;
-    for (encoder, mode, output_format) in preferred_encoders(codec) {
-        if has_working_encoder(&encoders, encoder).await {
+    for profile in preferred_encoders(codec, encode_preference) {
+        if has_working_encoder(&encoders, profile).await {
             return Ok(EncoderChoice {
-                ffmpeg_encoder: (*encoder).into(),
-                mode,
-                output_format,
+                ffmpeg_encoder: profile.ffmpeg_encoder.into(),
+                mode: profile.mode,
+                output_format: profile.output_format,
             });
         }
     }
@@ -44,45 +152,157 @@ pub async fn choose_encoder(codec: CodecKind) -> Result<EncoderChoice> {
     ))
 }
 
-fn preferred_encoders(codec: CodecKind) -> &'static [(&'static str, &'static str, &'static str)] {
-    match codec {
-        CodecKind::H264 => &[("h264_nvenc", "gpu", "h264"), ("libx264", "cpu", "h264")],
-        CodecKind::H265 => &[("hevc_nvenc", "gpu", "hevc"), ("libx265", "cpu", "hevc")],
-        CodecKind::Vp8 => &[("libvpx", "cpu", "ivf")],
+pub async fn available_encoder_options(codec: CodecKind) -> Result<Vec<AvailableEncoderOption>> {
+    let encoders = ffmpeg_list_encoders().await?;
+    let mut options = default_encoder_options(codec);
+    for profile in available_profiles(codec, &encoders).await {
+        options.push(AvailableEncoderOption {
+            value: specific_preference(profile.ffmpeg_encoder)
+                .ok_or_else(|| anyhow!("unsupported encoder {}", profile.ffmpeg_encoder))?,
+            label: format!(
+                "{} ({})",
+                profile.ffmpeg_encoder,
+                profile.mode.to_ascii_uppercase()
+            ),
+            mode: profile.mode,
+            ffmpeg_encoder: Some(profile.ffmpeg_encoder.into()),
+        });
+    }
+    Ok(options)
+}
+
+fn default_encoder_options(codec: CodecKind) -> Vec<AvailableEncoderOption> {
+    let mut options = Vec::new();
+    if codec != CodecKind::Vp8 {
+        options.push(AvailableEncoderOption {
+            value: EncodePreference::Gpu,
+            label: "GPU auto".into(),
+            mode: "gpu",
+            ffmpeg_encoder: None,
+        });
+    }
+    options.push(AvailableEncoderOption {
+        value: EncodePreference::Cpu,
+        label: "CPU auto".into(),
+        mode: "cpu",
+        ffmpeg_encoder: None,
+    });
+    options
+}
+
+async fn available_profiles(codec: CodecKind, encoders: &str) -> Vec<EncoderProfile> {
+    let mut profiles = Vec::new();
+    for profile in all_profiles(codec) {
+        if has_working_encoder(encoders, *profile).await {
+            profiles.push(*profile);
+        }
+    }
+    profiles
+}
+
+fn preferred_encoders(
+    codec: CodecKind,
+    encode_preference: EncodePreference,
+) -> Vec<EncoderProfile> {
+    if let Some(profile) = specific_profile(codec, encode_preference) {
+        return vec![profile];
+    }
+
+    match (codec, encode_preference) {
+        (CodecKind::H264, EncodePreference::Gpu) => H264_GPU_ENCODERS.to_vec(),
+        (CodecKind::H264, EncodePreference::Cpu) => H264_CPU_ENCODERS.to_vec(),
+        (CodecKind::H265, EncodePreference::Gpu) => H265_GPU_ENCODERS.to_vec(),
+        (CodecKind::H265, EncodePreference::Cpu) => H265_CPU_ENCODERS.to_vec(),
+        (CodecKind::Vp8, _) => VP8_ENCODERS.to_vec(),
+        _ => Vec::new(),
     }
 }
 
-async fn has_working_encoder(encoders: &str, encoder: &str) -> bool {
-    if !encoders.contains(&format!(" {encoder} ")) {
+fn all_profiles(codec: CodecKind) -> &'static [EncoderProfile] {
+    match codec {
+        CodecKind::H264 => H264_GPU_ENCODERS,
+        CodecKind::H265 => H265_GPU_ENCODERS,
+        CodecKind::Vp8 => VP8_ENCODERS,
+    }
+}
+
+fn specific_profile(
+    codec: CodecKind,
+    encode_preference: EncodePreference,
+) -> Option<EncoderProfile> {
+    let ffmpeg_encoder = specific_ffmpeg_encoder(codec, encode_preference)?;
+    all_profiles(codec)
+        .iter()
+        .copied()
+        .find(|profile| profile.ffmpeg_encoder == ffmpeg_encoder)
+}
+
+fn specific_ffmpeg_encoder(
+    codec: CodecKind,
+    encode_preference: EncodePreference,
+) -> Option<&'static str> {
+    match (codec, encode_preference) {
+        (CodecKind::H264, EncodePreference::H264Nvenc) => Some("h264_nvenc"),
+        (CodecKind::H264, EncodePreference::H264Qsv) => Some("h264_qsv"),
+        (CodecKind::H264, EncodePreference::H264Vaapi) => Some("h264_vaapi"),
+        (CodecKind::H264, EncodePreference::Libx264) => Some("libx264"),
+        (CodecKind::H265, EncodePreference::HevcNvenc) => Some("hevc_nvenc"),
+        (CodecKind::H265, EncodePreference::HevcQsv) => Some("hevc_qsv"),
+        (CodecKind::H265, EncodePreference::HevcVaapi) => Some("hevc_vaapi"),
+        (CodecKind::H265, EncodePreference::Libx265) => Some("libx265"),
+        (CodecKind::Vp8, EncodePreference::Libvpx) => Some("libvpx"),
+        _ => None,
+    }
+}
+
+fn specific_preference(ffmpeg_encoder: &str) -> Option<EncodePreference> {
+    match ffmpeg_encoder {
+        "h264_nvenc" => Some(EncodePreference::H264Nvenc),
+        "h264_qsv" => Some(EncodePreference::H264Qsv),
+        "h264_vaapi" => Some(EncodePreference::H264Vaapi),
+        "libx264" => Some(EncodePreference::Libx264),
+        "hevc_nvenc" => Some(EncodePreference::HevcNvenc),
+        "hevc_qsv" => Some(EncodePreference::HevcQsv),
+        "hevc_vaapi" => Some(EncodePreference::HevcVaapi),
+        "libx265" => Some(EncodePreference::Libx265),
+        "libvpx" => Some(EncodePreference::Libvpx),
+        _ => None,
+    }
+}
+
+async fn has_working_encoder(encoders: &str, profile: EncoderProfile) -> bool {
+    if !encoders.contains(&format!(" {} ", profile.ffmpeg_encoder)) {
         return false;
     }
-    ffmpeg_probe_encoder(encoder).await.unwrap_or(false)
+    ffmpeg_probe_encoder(profile).await.unwrap_or(false)
 }
 
-async fn ffmpeg_probe_encoder(encoder: &str) -> Result<bool> {
-    let output = Command::new("ffmpeg")
-        .args([
-            "-loglevel",
-            "error",
-            "-f",
-            "lavfi",
-            "-i",
-            "color=size=16x16:rate=1:color=black",
-            "-frames:v",
-            "1",
-            "-an",
-            "-sn",
-            "-c:v",
-            encoder,
-            "-f",
-            "null",
-            "-",
-        ])
+async fn ffmpeg_probe_encoder(profile: EncoderProfile) -> Result<bool> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-loglevel", "error"]);
+    append_hw_device_args(&mut cmd, profile.backend)?;
+    cmd.args([
+        "-f",
+        "lavfi",
+        "-i",
+        "color=size=128x128:rate=1:color=black",
+        "-frames:v",
+        "1",
+        "-an",
+        "-sn",
+    ]);
+    append_video_filter_args(&mut cmd, profile.backend);
+    cmd.args(["-c:v", profile.ffmpeg_encoder]);
+    append_bitrate_args(&mut cmd, "200k", "100k");
+    append_gop_args(&mut cmd, "1", profile.backend);
+    append_encoder_specific_args(&mut cmd, profile.ffmpeg_encoder);
+    let output = cmd
+        .args(["-f", "null", "-"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .await
-        .with_context(|| format!("failed to probe ffmpeg encoder {encoder}"))?;
+        .with_context(|| format!("failed to probe ffmpeg encoder {}", profile.ffmpeg_encoder))?;
     Ok(output.status.success())
 }
 
@@ -94,70 +314,122 @@ pub fn spawn_capture(
     let bitrate = format!("{}k", stream.bitrate_kbps);
     let fps = stream.fps.to_string();
     let gop = video_gop_frames(stream.fps).to_string();
+    let buffer = format!("{}k", (stream.bitrate_kbps / 2).max(1));
+    let backend = encoder_backend(&encoder.ffmpeg_encoder);
     let mut cmd = Command::new("ffmpeg");
-    cmd.env("DISPLAY", &server.display)
-        .args([
-            "-loglevel",
-            "error",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            "-fflags",
-            "nobuffer",
-            "-avioflags",
-            "direct",
-            "-flush_packets",
-            "1",
-            "-max_delay",
-            "0",
-            "-flags",
-            "low_delay",
-            "-f",
-            "x11grab",
-            "-framerate",
-            &fps,
-            "-i",
-            &server.display,
-            "-an",
-            "-sn",
-            "-pix_fmt",
-            "yuv420p",
-            "-preset",
-            if encoder.mode == "gpu" {
-                "p1"
-            } else {
-                "ultrafast"
-            },
-            "-tune",
-            "zerolatency",
-            "-b:v",
-            &bitrate,
-            "-maxrate",
-            &bitrate,
-            "-bufsize",
-            &format!("{}k", stream.bitrate_kbps / 2),
-            "-g",
-            &gop,
-            "-keyint_min",
-            &gop,
-            "-threads",
-            "2",
-            "-c:v",
-            &encoder.ffmpeg_encoder,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    match encoder.ffmpeg_encoder.as_str() {
+    cmd.env("DISPLAY", &server.display).args([
+        "-loglevel",
+        "error",
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-fflags",
+        "nobuffer",
+        "-avioflags",
+        "direct",
+        "-flush_packets",
+        "1",
+        "-max_delay",
+        "0",
+        "-flags",
+        "low_delay",
+    ]);
+    append_hw_device_args(&mut cmd, backend)?;
+    cmd.args([
+        "-f",
+        "x11grab",
+        "-framerate",
+        &fps,
+        "-i",
+        &server.display,
+        "-an",
+        "-sn",
+    ]);
+    append_video_filter_args(&mut cmd, backend);
+    cmd.args(["-c:v", &encoder.ffmpeg_encoder]);
+    append_bitrate_args(&mut cmd, &bitrate, &buffer);
+    append_gop_args(&mut cmd, &gop, backend);
+    append_encoder_specific_args(&mut cmd, &encoder.ffmpeg_encoder);
+    append_bitstream_filter_args(&mut cmd, encoder.output_format);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(["-f", encoder.output_format, "pipe:1"]);
+    cmd.spawn().context("failed to spawn ffmpeg capture")
+}
+
+fn append_hw_device_args(cmd: &mut Command, backend: EncoderBackend) -> Result<()> {
+    let Some(render_device) = matches!(backend, EncoderBackend::IntelQsv | EncoderBackend::Vaapi)
+        .then(render_device_path)
+        .transpose()?
+    else {
+        return Ok(());
+    };
+
+    let render_device = render_device.to_string_lossy().into_owned();
+    match backend {
+        EncoderBackend::IntelQsv => {
+            cmd.args([
+                "-init_hw_device",
+                &format!("qsv=hw:{render_device}"),
+                "-filter_hw_device",
+                "hw",
+            ]);
+        }
+        EncoderBackend::Vaapi => {
+            cmd.args(["-vaapi_device", &render_device]);
+        }
+        EncoderBackend::Cpu | EncoderBackend::NvidiaNvenc => {}
+    }
+    Ok(())
+}
+
+fn append_video_filter_args(cmd: &mut Command, backend: EncoderBackend) {
+    match backend {
+        EncoderBackend::Cpu | EncoderBackend::NvidiaNvenc => {
+            cmd.args(["-pix_fmt", "yuv420p"]);
+        }
+        EncoderBackend::IntelQsv | EncoderBackend::Vaapi => {
+            cmd.args(["-vf", "format=nv12,hwupload=extra_hw_frames=64"]);
+        }
+    }
+}
+
+fn append_bitrate_args(cmd: &mut Command, bitrate: &str, buffer: &str) {
+    cmd.args(["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", buffer]);
+}
+
+fn append_gop_args(cmd: &mut Command, gop: &str, backend: EncoderBackend) {
+    cmd.args(["-g", gop]);
+    match backend {
+        EncoderBackend::Cpu | EncoderBackend::NvidiaNvenc => {
+            cmd.args(["-keyint_min", gop, "-threads", "2"]);
+        }
+        EncoderBackend::IntelQsv | EncoderBackend::Vaapi => {
+            cmd.args(["-bf", "0"]);
+        }
+    }
+}
+
+fn append_encoder_specific_args(cmd: &mut Command, encoder: &str) {
+    match encoder {
         "libx264" => {
-            cmd.args(["-x264-params", "repeat-headers=1:aud=1"]);
+            cmd.args([
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-x264-params",
+                "repeat-headers=1:aud=1",
+            ]);
         }
         "h264_nvenc" | "hevc_nvenc" => {
             cmd.args([
-                "-rc",
-                "cbr_ld_hq",
+                "-preset",
+                "p1",
                 "-tune",
                 "ll",
+                "-rc",
+                "cbr_ld_hq",
                 "-zerolatency",
                 "1",
                 "-strict_gop",
@@ -167,15 +439,68 @@ pub fn spawn_capture(
             ]);
         }
         "libx265" => {
-            cmd.args(["-x265-params", "repeat-headers=1:aud=1"]);
+            cmd.args([
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-x265-params",
+                "repeat-headers=1:aud=1",
+            ]);
         }
+        "h264_qsv" | "hevc_qsv" => {
+            cmd.args([
+                "-preset",
+                "veryfast",
+                "-look_ahead",
+                "0",
+                "-async_depth",
+                "1",
+            ]);
+        }
+        "h264_vaapi" | "hevc_vaapi" => {}
         "libvpx" => {
             cmd.args(["-deadline", "realtime", "-cpu-used", "8"]);
         }
         _ => {}
     }
-    cmd.args(["-f", encoder.output_format, "pipe:1"]);
-    cmd.spawn().context("failed to spawn ffmpeg capture")
+}
+
+fn append_bitstream_filter_args(cmd: &mut Command, output_format: &str) {
+    match output_format {
+        // The Annex B parser splits access units on AUD NALs. QSV and other
+        // hardware encoders do not consistently emit them unless requested.
+        "h264" => cmd.args(["-bsf:v", "h264_metadata=aud=insert"]),
+        "hevc" => cmd.args(["-bsf:v", "hevc_metadata=aud=insert"]),
+        _ => cmd,
+    };
+}
+
+fn encoder_backend(encoder: &str) -> EncoderBackend {
+    match encoder {
+        "h264_nvenc" | "hevc_nvenc" => EncoderBackend::NvidiaNvenc,
+        "h264_qsv" | "hevc_qsv" => EncoderBackend::IntelQsv,
+        "h264_vaapi" | "hevc_vaapi" => EncoderBackend::Vaapi,
+        _ => EncoderBackend::Cpu,
+    }
+}
+
+fn render_device_path() -> Result<PathBuf> {
+    let entries = fs::read_dir("/dev/dri").context("failed to inspect /dev/dri")?;
+    let mut devices = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("renderD"))
+        })
+        .collect::<Vec<_>>();
+    devices.sort();
+    devices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no GPU render device found under /dev/dri"))
 }
 
 fn video_gop_frames(fps: u32) -> u32 {
@@ -634,23 +959,65 @@ async fn run_status_best_effort(program: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::settings::CodecKind;
+    use crate::settings::{CodecKind, EncodePreference};
+    use tokio::process::Command;
 
     #[tokio::test]
     async fn missing_encoder_is_not_reported_as_working() {
-        assert!(!super::has_working_encoder("", "h264_nvenc").await);
+        assert!(
+            !super::has_working_encoder(
+                "",
+                super::EncoderProfile {
+                    ffmpeg_encoder: "h264_nvenc",
+                    mode: "gpu",
+                    output_format: "h264",
+                    backend: super::EncoderBackend::NvidiaNvenc,
+                },
+            )
+            .await
+        );
     }
 
     #[test]
-    fn h265_candidates_never_include_h264() {
-        let candidates = super::preferred_encoders(CodecKind::H265);
-        assert_eq!(candidates[0].0, "hevc_nvenc");
-        assert_eq!(candidates[1].0, "libx265");
+    fn h265_gpu_candidates_never_include_h264() {
+        let candidates = super::preferred_encoders(CodecKind::H265, EncodePreference::Gpu);
+        assert_eq!(candidates[0].ffmpeg_encoder, "hevc_nvenc");
+        assert_eq!(candidates[1].ffmpeg_encoder, "hevc_qsv");
         assert!(
             candidates
                 .iter()
-                .all(|(encoder, _, _)| !encoder.contains("264"))
+                .all(|candidate| !candidate.ffmpeg_encoder.contains("264"))
         );
+    }
+
+    #[test]
+    fn cpu_preference_skips_gpu_encoders() {
+        let candidates = super::preferred_encoders(CodecKind::H264, EncodePreference::Cpu);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ffmpeg_encoder, "libx264");
+        assert_eq!(candidates[0].mode, "cpu");
+    }
+
+    #[test]
+    fn specific_encoder_preference_uses_exact_encoder() {
+        let candidates = super::preferred_encoders(CodecKind::H264, EncodePreference::H264Qsv);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ffmpeg_encoder, "h264_qsv");
+    }
+
+    #[test]
+    fn h264_output_inserts_aud_bitstream_filter() {
+        let mut cmd = Command::new("ffmpeg");
+        super::append_bitstream_filter_args(&mut cmd, "h264");
+        let args = cmd.as_std().get_args().collect::<Vec<_>>();
+        assert_eq!(args, vec!["-bsf:v", "h264_metadata=aud=insert"]);
+    }
+
+    #[test]
+    fn vp8_output_does_not_add_bitstream_filter() {
+        let mut cmd = Command::new("ffmpeg");
+        super::append_bitstream_filter_args(&mut cmd, "ivf");
+        assert!(cmd.as_std().get_args().next().is_none());
     }
 
     #[test]

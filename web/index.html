@@ -140,6 +140,12 @@
                       <option value="vp8">VP8</option>
                     </select>
                   </label>
+                  <label>Encoder
+                    <select id="encode-preference">
+                      <option value="gpu" selected>GPU auto</option>
+                      <option value="cpu">CPU auto</option>
+                    </select>
+                  </label>
                   <label>Bitrate
                     <input id="bitrate" type="range" min="128" max="12000" step="32" value="4000" />
                     <span id="bitrate-value">4000 kbps</span>

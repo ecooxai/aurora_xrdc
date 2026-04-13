@@ -10,6 +10,63 @@ pub enum CodecKind {
     Vp8,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EncodePreference {
+    #[default]
+    Gpu,
+    Cpu,
+    #[serde(rename = "h264_nvenc")]
+    H264Nvenc,
+    #[serde(rename = "h264_qsv")]
+    H264Qsv,
+    #[serde(rename = "h264_vaapi")]
+    H264Vaapi,
+    #[serde(rename = "libx264")]
+    Libx264,
+    #[serde(rename = "hevc_nvenc")]
+    HevcNvenc,
+    #[serde(rename = "hevc_qsv")]
+    HevcQsv,
+    #[serde(rename = "hevc_vaapi")]
+    HevcVaapi,
+    #[serde(rename = "libx265")]
+    Libx265,
+    #[serde(rename = "libvpx")]
+    Libvpx,
+}
+
+impl EncodePreference {
+    pub fn normalized_for_codec(self, codec: CodecKind) -> Self {
+        match codec {
+            CodecKind::H264 => match self {
+                Self::Gpu
+                | Self::Cpu
+                | Self::H264Nvenc
+                | Self::H264Qsv
+                | Self::H264Vaapi
+                | Self::Libx264 => self,
+                Self::Libx265 | Self::Libvpx => Self::Cpu,
+                Self::HevcNvenc | Self::HevcQsv | Self::HevcVaapi => Self::Gpu,
+            },
+            CodecKind::H265 => match self {
+                Self::Gpu
+                | Self::Cpu
+                | Self::HevcNvenc
+                | Self::HevcQsv
+                | Self::HevcVaapi
+                | Self::Libx265 => self,
+                Self::Libx264 | Self::Libvpx => Self::Cpu,
+                Self::H264Nvenc | Self::H264Qsv | Self::H264Vaapi => Self::Gpu,
+            },
+            CodecKind::Vp8 => match self {
+                Self::Cpu | Self::Libvpx => self,
+                _ => Self::Cpu,
+            },
+        }
+    }
+}
+
 impl CodecKind {
     pub fn as_webcodec(self) -> &'static str {
         match self {
@@ -25,6 +82,8 @@ pub struct StreamConfig {
     pub codec: CodecKind,
     pub bitrate_kbps: u32,
     pub fps: u32,
+    #[serde(default)]
+    pub encode_preference: EncodePreference,
 }
 
 impl Default for StreamConfig {
@@ -33,6 +92,7 @@ impl Default for StreamConfig {
             codec: CodecKind::H264,
             bitrate_kbps: 4_000,
             fps: 16,
+            encode_preference: EncodePreference::Gpu,
         }
     }
 }
@@ -41,6 +101,7 @@ impl StreamConfig {
     pub fn normalized(mut self) -> Self {
         self.bitrate_kbps = self.bitrate_kbps.clamp(128, 25_000);
         self.fps = self.fps.clamp(1, 60);
+        self.encode_preference = self.encode_preference.normalized_for_codec(self.codec);
         self
     }
 }
@@ -184,7 +245,7 @@ fn bind_with_port(bind: &str, port: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioStreamConfig, CodecKind, ServerConfig, StreamConfig};
+    use super::{AudioStreamConfig, CodecKind, EncodePreference, ServerConfig, StreamConfig};
     use std::path::PathBuf;
 
     #[test]
@@ -193,10 +254,31 @@ mod tests {
             codec: CodecKind::H264,
             bitrate_kbps: 99,
             fps: 99,
+            encode_preference: EncodePreference::Gpu,
         }
         .normalized();
         assert_eq!(cfg.bitrate_kbps, 128);
         assert_eq!(cfg.fps, 60);
+    }
+
+    #[test]
+    fn stream_config_defaults_to_gpu_preference() {
+        assert_eq!(
+            StreamConfig::default().encode_preference,
+            EncodePreference::Gpu
+        );
+    }
+
+    #[test]
+    fn invalid_specific_encoder_falls_back_for_codec() {
+        let cfg = StreamConfig {
+            codec: CodecKind::Vp8,
+            bitrate_kbps: 4_000,
+            fps: 16,
+            encode_preference: EncodePreference::H264Qsv,
+        }
+        .normalized();
+        assert_eq!(cfg.encode_preference, EncodePreference::Cpu);
     }
 
     #[test]

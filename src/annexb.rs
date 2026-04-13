@@ -52,6 +52,9 @@ impl AnnexBParser {
             let end = pair[1];
             if start < end {
                 let slice = self.buffer[start..end].to_vec();
+                if !contains_vcl(self.codec, &slice) {
+                    continue;
+                }
                 frames.push(EncodedFrame {
                     keyframe: contains_keyframe(self.codec, &slice),
                     description_b64: self.description_b64(),
@@ -222,6 +225,16 @@ fn contains_keyframe(codec: CodecKind, data: &[u8]) -> bool {
         })
 }
 
+fn contains_vcl(codec: CodecKind, data: &[u8]) -> bool {
+    start_codes(data)
+        .into_iter()
+        .any(|idx| match nal_type(codec, &data[idx..]) {
+            Some(1..=5) if codec == CodecKind::H264 => true,
+            Some(0..=31) if codec == CodecKind::H265 => true,
+            _ => false,
+        })
+}
+
 fn avcc_from_sps_pps(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     let mut out = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe1];
     out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
@@ -311,5 +324,25 @@ mod tests {
         assert_eq!(&converted[4..6], &[0x09, 0x10]);
         assert_eq!(&converted[6..10], &(4u32.to_be_bytes()));
         assert_eq!(&converted[10..14], &[0x67, 0x64, 0, 0x1f]);
+    }
+
+    #[test]
+    fn ignores_repeated_h264_auds_without_vcl_payload() {
+        let mut parser = AnnexBParser::new(CodecKind::H264);
+        let sample = [
+            &[0, 0, 0, 1, 0x09, 0x10][..],
+            &[0, 0, 0, 1, 0x09, 0x10][..],
+            &[0, 0, 0, 1, 0x67, 0x64, 0, 0x1f][..],
+            &[0, 0, 0, 1, 0x68, 0xee, 0x3c, 0x80][..],
+            &[0, 0, 0, 1, 0x65, 1, 2, 3][..],
+            &[0, 0, 0, 1, 0x09, 0x10][..],
+            &[0, 0, 0, 1, 0x09, 0x10][..],
+            &[0, 0, 0, 1, 0x61, 4, 5, 6][..],
+        ]
+        .concat();
+        let frames = parser.push(&sample);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe);
+        assert!(frames[0].description_b64.is_some());
     }
 }
