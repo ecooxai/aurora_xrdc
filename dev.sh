@@ -17,11 +17,13 @@ XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
 XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
+AUDIO_BACKEND=""
 APP_PID=""
 XVFB_PID=""
 JWM_PID=""
 XTERM_PID=""
 PULSE_PID=""
+PIPEWIRE_LOOPBACK_PID=""
 
 normalize_display() {
     local display="${1:-}"
@@ -98,13 +100,121 @@ sink_exists() {
     pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "${sink_name}"
 }
 
+wait_for_pipewire_server() {
+    local attempts=20
+
+    while (( attempts > 0 )); do
+        if pw-cli info 0 >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
+}
+
+pipewire_node_id() {
+    local node_name="${1:-}"
+    local media_class="${2:-}"
+    local node_id=""
+    if [[ -z "${node_name}" || -z "${media_class}" ]]; then
+        return 1
+    fi
+
+    node_id="$(pw-cli ls Node 2>/dev/null | awk -v node_name="${node_name}" -v media_class="${media_class}" '
+        function flush_block() {
+            if (current_id != "" && current_name == node_name && current_class == media_class) {
+                print current_id
+                found = 1
+                exit
+            }
+        }
+        /^[[:space:]]*id / {
+            flush_block()
+            current_id = $2
+            sub(/,/, "", current_id)
+            current_name = ""
+            current_class = ""
+            next
+        }
+        /node\.name = "/ {
+            split($0, parts, "\"")
+            current_name = parts[2]
+            next
+        }
+        /media\.class = "/ {
+            split($0, parts, "\"")
+            current_class = parts[2]
+            next
+        }
+        END {
+            if (!found && current_id != "" && current_name == node_name && current_class == media_class) {
+                print current_id
+            }
+        }
+    ')"
+
+    if [[ -z "${node_id}" ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${node_id}"
+}
+
+pipewire_source_exists() {
+    local source_name="${1:-}"
+    [[ -n "${source_name}" ]] && pipewire_node_id "${source_name}" "Audio/Source" >/dev/null
+}
+
+pipewire_sink_exists() {
+    local sink_name="${1:-}"
+    [[ -n "${sink_name}" ]] && pipewire_node_id "${sink_name}" "Audio/Sink" >/dev/null
+}
+
+wait_for_pipewire_source() {
+    local source_name="$1"
+    local attempts=10
+
+    while (( attempts > 0 )); do
+        if pipewire_source_exists "${source_name}"; then
+            return 0
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
+}
+
+wait_for_pipewire_sink() {
+    local sink_name="$1"
+    local attempts=10
+
+    while (( attempts > 0 )); do
+        if pipewire_sink_exists "${sink_name}"; then
+            return 0
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
+}
+
 wait_for_source() {
     local source_name="$1"
     local attempts=10
 
     while (( attempts > 0 )); do
-        if source_exists "${source_name}"; then
-            return 0
+        if [[ "${AUDIO_BACKEND}" == "pipewire" ]]; then
+            if pipewire_source_exists "${source_name}"; then
+                return 0
+            fi
+        else
+            if source_exists "${source_name}"; then
+                return 0
+            fi
         fi
         sleep 0.25
         ((attempts--))
@@ -148,7 +258,86 @@ start_pulse_server() {
     fi
 }
 
-ensure_virtual_mic() {
+start_pipewire_server() {
+    if wait_for_pipewire_server; then
+        echo "[dev] using existing PipeWire server"
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        echo "[dev] starting PipeWire user services"
+        systemctl --user start pipewire pipewire-pulse wireplumber >/dev/null 2>&1 || true
+    fi
+
+    if ! wait_for_pipewire_server; then
+        return 1
+    fi
+}
+
+pipewire_uses_pulse_server() {
+    pactl info 2>/dev/null | grep -Fq 'Server Name: PulseAudio (on PipeWire'
+}
+
+start_audio_server() {
+    if command -v pw-cli >/dev/null 2>&1 && command -v pw-loopback >/dev/null 2>&1; then
+        if start_pipewire_server || wait_for_pipewire_server; then
+            AUDIO_BACKEND="pipewire"
+            echo "[dev] audio backend: PipeWire"
+            return 0
+        fi
+    fi
+
+    if start_pulse_server; then
+        AUDIO_BACKEND="pulseaudio"
+        if pipewire_uses_pulse_server; then
+            echo "[dev] audio backend: PipeWire (PulseAudio compatibility)"
+        else
+            echo "[dev] audio backend: PulseAudio"
+        fi
+        return 0
+    fi
+
+    echo "[dev] failed to start an audio server" >&2
+    return 1
+}
+
+ensure_pipewire_virtual_mic() {
+    if pipewire_source_exists "${VIRTUAL_MIC_SOURCE_NAME}"; then
+        echo "[dev] using existing PipeWire virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
+        return 0
+    fi
+
+    if ! pipewire_sink_exists "${VIRTUAL_MIC_SINK_NAME}"; then
+        echo "[dev] creating PipeWire virtual sink ${VIRTUAL_MIC_SINK_NAME}"
+        pw-cli create-node adapter \
+            "{ factory.name = support.null-audio-sink node.name = \"${VIRTUAL_MIC_SINK_NAME}\" node.description = \"VibeRDeskVirtualMicSink\" media.class = \"Audio/Sink\" object.linger = true audio.position = [ FL FR ] }" \
+            >/dev/null
+        if ! wait_for_pipewire_sink "${VIRTUAL_MIC_SINK_NAME}"; then
+            echo "[dev] PipeWire virtual sink ${VIRTUAL_MIC_SINK_NAME} did not appear" >&2
+            return 1
+        fi
+    fi
+
+    echo "[dev] creating PipeWire virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
+    pw-loopback \
+        --name "${VIRTUAL_MIC_SOURCE_NAME}_loopback" \
+        --capture-props "{ stream.capture.sink = true target.object = \"${VIRTUAL_MIC_SINK_NAME}\" node.passive = true node.dont-reconnect = true }" \
+        --playback-props "{ node.name = \"${VIRTUAL_MIC_SOURCE_NAME}\" node.description = \"${VIRTUAL_MIC_SOURCE_NAME}\" media.class = \"Audio/Source\" audio.position = [ FL FR ] }" \
+        >/tmp/vibe_rdesk-pipewire-loopback.log 2>&1 &
+    PIPEWIRE_LOOPBACK_PID=$!
+
+    if ! wait_for_pipewire_source "${VIRTUAL_MIC_SOURCE_NAME}"; then
+        echo "[dev] PipeWire virtual mic source ${VIRTUAL_MIC_SOURCE_NAME} did not appear" >&2
+        if [[ -n "${PIPEWIRE_LOOPBACK_PID}" ]] && kill -0 "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null; then
+            kill "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null || true
+            wait "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null || true
+        fi
+        PIPEWIRE_LOOPBACK_PID=""
+        return 1
+    fi
+}
+
+ensure_pulse_virtual_mic() {
     if ! command -v pactl >/dev/null 2>&1; then
         echo "[dev] pactl is required to provision the virtual microphone" >&2
         return 1
@@ -180,6 +369,15 @@ ensure_virtual_mic() {
         echo "[dev] virtual mic source ${VIRTUAL_MIC_SOURCE_NAME} did not appear" >&2
         return 1
     fi
+}
+
+ensure_virtual_mic() {
+    if [[ "${AUDIO_BACKEND}" == "pipewire" ]]; then
+        ensure_pipewire_virtual_mic
+        return $?
+    fi
+
+    ensure_pulse_virtual_mic
 }
 
 start_headless_display() {
@@ -285,6 +483,11 @@ cleanup() {
         kill "${PULSE_PID}" 2>/dev/null || true
         wait "${PULSE_PID}" 2>/dev/null || true
     fi
+
+    if [[ -n "${PIPEWIRE_LOOPBACK_PID}" ]] && kill -0 "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null; then
+        kill "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null || true
+        wait "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null || true
+    fi
 }
 
 build_and_run() {
@@ -327,7 +530,7 @@ wait_for_change_polling() {
 trap cleanup EXIT INT TERM
 
 ensure_display
-start_pulse_server
+start_audio_server
 ensure_virtual_mic
 
 build_and_run "$@"
