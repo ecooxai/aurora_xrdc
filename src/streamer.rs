@@ -1,11 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use tokio::{
-    io::AsyncReadExt,
-    process::Child,
-    sync::mpsc,
-};
+use tokio::{io::AsyncReadExt, process::Child, sync::watch};
 
 use crate::{
     annexb::{AnnexBParser, EncodedFrame, IvfParser},
@@ -24,7 +20,7 @@ pub struct StreamFrame {
 
 #[derive(Debug)]
 pub struct StreamHandle {
-    pub rx: tokio::sync::mpsc::Receiver<StreamFrame>,
+    pub rx: watch::Receiver<Option<StreamFrame>>,
     pub encoder: EncoderChoice,
 }
 
@@ -32,7 +28,7 @@ pub async fn start(server: ServerConfig, config: StreamConfig) -> Result<(Stream
     let encoder = choose_encoder(config.codec).await?;
     let mut child = spawn_capture(&server, &config, &encoder)?;
     let mut stdout = child.stdout.take().expect("ffmpeg stdout missing");
-    let (tx, rx) = mpsc::channel(12);
+    let (tx, rx) = watch::channel(None);
     tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
         let mut h26x = AnnexBParser::new(config.codec);
@@ -48,7 +44,7 @@ pub async fn start(server: ServerConfig, config: StreamConfig) -> Result<(Stream
                 CodecKind::H264 | CodecKind::H265 => h26x.push(&buf[..read]),
             };
             for frame in frames {
-                if tx.send(pack_frame(config.codec, frame)).await.is_err() {
+                if tx.send(Some(pack_frame(config.codec, frame))).is_err() {
                     return;
                 }
             }

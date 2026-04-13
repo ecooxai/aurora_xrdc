@@ -1,9 +1,13 @@
-use std::{ffi::OsStr, process::Stdio};
+use std::{ffi::OsStr, path::Path, process::Stdio};
 
 use anyhow::{Context, Result, anyhow};
-use tokio::{io::AsyncReadExt, process::Command, time::{Duration, sleep}};
+use tokio::{
+    io::AsyncReadExt,
+    process::{ChildStdin, Command},
+    time::{Duration, sleep},
+};
 
-use crate::settings::{CodecKind, ServerConfig, StreamConfig};
+use crate::settings::{AudioStreamConfig, CodecKind, ServerConfig, StreamConfig};
 
 #[derive(Debug, Clone)]
 pub struct EncoderChoice {
@@ -12,36 +16,40 @@ pub struct EncoderChoice {
     pub output_format: &'static str,
 }
 
+pub struct MicInputHandle {
+    pub child: tokio::process::Child,
+    pub stdin: ChildStdin,
+}
+
+const VIRTUAL_MIC_SOURCE_NAME: &str = "Viberdeskmic";
+const VIRTUAL_MIC_SINK_NAME: &str = "vibe_rdesk_virtual_mic_sink";
+const VIRTUAL_CAMERA_LABEL: &str = "viberdeskcamera";
+const VIRTUAL_CAMERA_NR: &str = "42";
+const VIDEO_GOP_SECONDS: u32 = 2;
+
 pub async fn choose_encoder(codec: CodecKind) -> Result<EncoderChoice> {
     let encoders = ffmpeg_list_encoders().await?;
-    let choice = match codec {
-        CodecKind::H264 if has_working_encoder(&encoders, "h264_nvenc").await => EncoderChoice {
-            ffmpeg_encoder: "h264_nvenc".into(),
-            mode: "gpu",
-            output_format: "h264",
-        },
-        CodecKind::H265 if has_working_encoder(&encoders, "hevc_nvenc").await => EncoderChoice {
-            ffmpeg_encoder: "hevc_nvenc".into(),
-            mode: "gpu",
-            output_format: "hevc",
-        },
-        CodecKind::H264 => EncoderChoice {
-            ffmpeg_encoder: "libx264".into(),
-            mode: "cpu",
-            output_format: "h264",
-        },
-        CodecKind::H265 => EncoderChoice {
-            ffmpeg_encoder: "libx265".into(),
-            mode: "cpu",
-            output_format: "hevc",
-        },
-        CodecKind::Vp8 => EncoderChoice {
-            ffmpeg_encoder: "libvpx".into(),
-            mode: "cpu",
-            output_format: "ivf",
-        },
-    };
-    Ok(choice)
+    for (encoder, mode, output_format) in preferred_encoders(codec) {
+        if has_working_encoder(&encoders, encoder).await {
+            return Ok(EncoderChoice {
+                ffmpeg_encoder: (*encoder).into(),
+                mode,
+                output_format,
+            });
+        }
+    }
+
+    Err(anyhow!(
+        "no working ffmpeg encoder available for requested codec {codec:?}"
+    ))
+}
+
+fn preferred_encoders(codec: CodecKind) -> &'static [(&'static str, &'static str, &'static str)] {
+    match codec {
+        CodecKind::H264 => &[("h264_nvenc", "gpu", "h264"), ("libx264", "cpu", "h264")],
+        CodecKind::H265 => &[("hevc_nvenc", "gpu", "hevc"), ("libx265", "cpu", "hevc")],
+        CodecKind::Vp8 => &[("libvpx", "cpu", "ivf")],
+    }
 }
 
 async fn has_working_encoder(encoders: &str, encoder: &str) -> bool {
@@ -85,6 +93,7 @@ pub fn spawn_capture(
 ) -> Result<tokio::process::Child> {
     let bitrate = format!("{}k", stream.bitrate_kbps);
     let fps = stream.fps.to_string();
+    let gop = video_gop_frames(stream.fps).to_string();
     let mut cmd = Command::new("ffmpeg");
     cmd.env("DISPLAY", &server.display)
         .args([
@@ -115,7 +124,11 @@ pub fn spawn_capture(
             "-pix_fmt",
             "yuv420p",
             "-preset",
-            if encoder.mode == "gpu" { "p1" } else { "ultrafast" },
+            if encoder.mode == "gpu" {
+                "p1"
+            } else {
+                "ultrafast"
+            },
             "-tune",
             "zerolatency",
             "-b:v",
@@ -125,11 +138,9 @@ pub fn spawn_capture(
             "-bufsize",
             &format!("{}k", stream.bitrate_kbps / 2),
             "-g",
-            &fps,
+            &gop,
             "-keyint_min",
-            &fps,
-            "-force_key_frames",
-            "expr:gte(t,n_forced*2)",
+            &gop,
             "-threads",
             "2",
             "-c:v",
@@ -137,26 +148,46 @@ pub fn spawn_capture(
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    match stream.codec {
-        CodecKind::H264 => {
+    match encoder.ffmpeg_encoder.as_str() {
+        "libx264" => {
             cmd.args(["-x264-params", "repeat-headers=1:aud=1"]);
-            if encoder.mode == "gpu" {
-                cmd.args(["-rc", "cbr_ld_hq", "-tune", "ll"]);
-            }
         }
-        CodecKind::H265 => {
+        "h264_nvenc" | "hevc_nvenc" => {
+            cmd.args([
+                "-rc",
+                "cbr_ld_hq",
+                "-tune",
+                "ll",
+                "-zerolatency",
+                "1",
+                "-strict_gop",
+                "1",
+                "-aud",
+                "1",
+            ]);
+        }
+        "libx265" => {
             cmd.args(["-x265-params", "repeat-headers=1:aud=1"]);
         }
-        CodecKind::Vp8 => {
+        "libvpx" => {
             cmd.args(["-deadline", "realtime", "-cpu-used", "8"]);
         }
+        _ => {}
     }
     cmd.args(["-f", encoder.output_format, "pipe:1"]);
     cmd.spawn().context("failed to spawn ffmpeg capture")
 }
 
-pub async fn spawn_audio_capture(server: &ServerConfig) -> Result<tokio::process::Child> {
+fn video_gop_frames(fps: u32) -> u32 {
+    fps.saturating_mul(VIDEO_GOP_SECONDS).max(1)
+}
+
+pub async fn spawn_audio_capture(
+    server: &ServerConfig,
+    config: &AudioStreamConfig,
+) -> Result<tokio::process::Child> {
     let source = ensure_pulse_monitor_source(server).await?;
+    let bitrate = format!("{}k", config.bitrate_kbps);
     let mut cmd = Command::new("ffmpeg");
     cmd.env("DISPLAY", &server.display)
         .args([
@@ -191,7 +222,7 @@ pub async fn spawn_audio_capture(server: &ServerConfig) -> Result<tokio::process
             "-profile:a",
             "aac_low",
             "-b:a",
-            "128k",
+            &bitrate,
             "-f",
             "adts",
             "pipe:1",
@@ -202,7 +233,120 @@ pub async fn spawn_audio_capture(server: &ServerConfig) -> Result<tokio::process
 }
 
 pub async fn warm_audio_stack() -> Result<()> {
-    ensure_pulse_server().await
+    ensure_pulse_server().await?;
+    ensure_virtual_mic_source().await?;
+    Ok(())
+}
+
+pub async fn ensure_virtual_camera_device() -> Result<String> {
+    if let Some(device) = find_virtual_camera_device()? {
+        return Ok(device);
+    }
+
+    let output = Command::new("modprobe")
+        .args([
+            "v4l2loopback",
+            "devices=1",
+            "exclusive_caps=1",
+            &format!("card_label={VIRTUAL_CAMERA_LABEL}"),
+            &format!("video_nr={VIRTUAL_CAMERA_NR}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to run modprobe for v4l2loopback")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "failed to create virtual camera {VIRTUAL_CAMERA_LABEL}: {}",
+            stderr.trim()
+        ));
+    }
+
+    wait_for_virtual_camera_device().await
+}
+
+pub async fn replay_mp4_to_virtual_camera(path: &Path, device: &str) -> Result<()> {
+    let output = Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-re", "-i"])
+        .arg(path)
+        .args([
+            "-map", "0:v:0", "-an", "-sn", "-pix_fmt", "yuv420p", "-f", "v4l2", device,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("failed to relay {} into {device}", path.display()))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "ffmpeg virtual camera relay exited with {}: {}",
+        output.status,
+        stderr.trim()
+    ))
+}
+
+pub async fn spawn_mic_input_injector(server: &ServerConfig) -> Result<MicInputHandle> {
+    ensure_virtual_mic_source().await?;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.env("DISPLAY", &server.display)
+        .args([
+            "-loglevel",
+            "error",
+            "-fflags",
+            "nobuffer",
+            "-avioflags",
+            "direct",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-f",
+            "webm",
+            "-i",
+            "pipe:0",
+            "-vn",
+            "-sn",
+            "-ac",
+            "1",
+            "-ar",
+            "48000",
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "pulse",
+            "-buffer_duration",
+            "15",
+            "-buffer_size",
+            "2048",
+            "-prebuf",
+            "0",
+            "-minreq",
+            "0",
+            "-device",
+            VIRTUAL_MIC_SINK_NAME,
+            "-stream_name",
+            "VibeRDesk Mic Input",
+            "vibe_rdesk_mic_input",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn ffmpeg microphone injector")?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg microphone injector stdin missing"))?;
+    Ok(MicInputHandle { child, stdin })
 }
 
 async fn ffmpeg_list_encoders() -> Result<String> {
@@ -259,6 +403,38 @@ async fn ensure_pulse_monitor_source(server: &ServerConfig) -> Result<String> {
     ensure_virtual_sink(server).await
 }
 
+fn find_virtual_camera_device() -> Result<Option<String>> {
+    let dir = match std::fs::read_dir("/sys/class/video4linux") {
+        Ok(dir) => dir,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to inspect /sys/class/video4linux"),
+    };
+
+    for entry in dir {
+        let entry = entry.context("failed to read video4linux entry")?;
+        let name = std::fs::read_to_string(entry.path().join("name")).unwrap_or_default();
+        if name.trim() != VIRTUAL_CAMERA_LABEL {
+            continue;
+        }
+        let device_name = entry.file_name();
+        return Ok(Some(format!("/dev/{}", device_name.to_string_lossy())));
+    }
+
+    Ok(None)
+}
+
+async fn wait_for_virtual_camera_device() -> Result<String> {
+    for _ in 0..20 {
+        if let Some(device) = find_virtual_camera_device()? {
+            return Ok(device);
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+    Err(anyhow!(
+        "virtual camera {VIRTUAL_CAMERA_LABEL} did not appear; ensure v4l2loopback is installed"
+    ))
+}
+
 async fn default_monitor_source() -> Result<Option<String>> {
     let sink = match pactl(["get-default-sink"]).await {
         Ok(sink) => sink,
@@ -292,11 +468,50 @@ async fn ensure_virtual_sink(server: &ServerConfig) -> Result<String> {
     Ok(format!("{sink_name}.monitor"))
 }
 
+async fn ensure_virtual_mic_source() -> Result<String> {
+    let _ = ensure_pulse_server().await;
+    if source_exists(VIRTUAL_MIC_SOURCE_NAME).await? {
+        return Ok(VIRTUAL_MIC_SOURCE_NAME.into());
+    }
+    if !sink_exists(VIRTUAL_MIC_SINK_NAME).await? {
+        pactl([
+            "load-module",
+            "module-null-sink",
+            &format!("sink_name={VIRTUAL_MIC_SINK_NAME}"),
+            "sink_properties=device.description=VibeRDeskVirtualMicSink",
+        ])
+        .await?;
+        wait_for_sink(VIRTUAL_MIC_SINK_NAME).await?;
+    }
+    if !source_exists(VIRTUAL_MIC_SOURCE_NAME).await? {
+        pactl([
+            "load-module",
+            "module-remap-source",
+            &format!("source_name={VIRTUAL_MIC_SOURCE_NAME}"),
+            &format!("master={VIRTUAL_MIC_SINK_NAME}.monitor"),
+            &format!("source_properties=device.description={VIRTUAL_MIC_SOURCE_NAME}"),
+        ])
+        .await?;
+        wait_for_source(VIRTUAL_MIC_SOURCE_NAME).await?;
+    }
+    Ok(VIRTUAL_MIC_SOURCE_NAME.into())
+}
+
 async fn ensure_pulse_server() -> Result<()> {
     if wait_for_pulse_server().await {
         return Ok(());
     }
-    let _ = run_best_effort("systemctl", &["--user", "start", "pipewire", "pipewire-pulse", "wireplumber"]).await;
+    let _ = run_best_effort(
+        "systemctl",
+        &[
+            "--user",
+            "start",
+            "pipewire",
+            "pipewire-pulse",
+            "wireplumber",
+        ],
+    )
+    .await;
     if wait_for_pulse_server().await {
         return Ok(());
     }
@@ -315,7 +530,9 @@ async fn ensure_pulse_server() -> Result<()> {
     if wait_for_pulse_server().await {
         return Ok(());
     }
-    Err(anyhow!("PulseAudio/PipeWire server is not running and could not be started"))
+    Err(anyhow!(
+        "PulseAudio/PipeWire server is not running and could not be started"
+    ))
 }
 
 async fn wait_for_pulse_server() -> bool {
@@ -330,7 +547,16 @@ async fn wait_for_pulse_server() -> bool {
 
 async fn sink_exists(sink_name: &str) -> Result<bool> {
     let sinks = pactl(["list", "short", "sinks"]).await?;
-    Ok(sinks.lines().any(|line| line.split_whitespace().nth(1) == Some(sink_name)))
+    Ok(sinks
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(sink_name)))
+}
+
+async fn source_exists(source_name: &str) -> Result<bool> {
+    let sources = pactl(["list", "short", "sources"]).await?;
+    Ok(sources
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some(source_name)))
 }
 
 async fn wait_for_sink(sink_name: &str) -> Result<()> {
@@ -343,8 +569,20 @@ async fn wait_for_sink(sink_name: &str) -> Result<()> {
     Err(anyhow!("virtual sink {sink_name} did not appear"))
 }
 
+async fn wait_for_source(source_name: &str) -> Result<()> {
+    for _ in 0..10 {
+        if source_exists(source_name).await? {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+    Err(anyhow!("virtual source {source_name} did not appear"))
+}
+
 async fn move_sink_inputs(sink_name: &str) -> Result<()> {
-    let sink_inputs = pactl(["list", "short", "sink-inputs"]).await.unwrap_or_default();
+    let sink_inputs = pactl(["list", "short", "sink-inputs"])
+        .await
+        .unwrap_or_default();
     for line in sink_inputs.lines() {
         let Some(input_id) = line.split_whitespace().next() else {
             continue;
@@ -364,7 +602,11 @@ async fn pactl<const N: usize>(args: [&str; N]) -> Result<String> {
         .context("failed to run pactl")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("pactl exited with {}: {}", output.status, stderr.trim()));
+        return Err(anyhow!(
+            "pactl exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
     }
     String::from_utf8(output.stdout).context("pactl output was not utf-8")
 }
@@ -392,8 +634,29 @@ async fn run_status_best_effort(program: &str, args: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::settings::CodecKind;
+
     #[tokio::test]
     async fn missing_encoder_is_not_reported_as_working() {
         assert!(!super::has_working_encoder("", "h264_nvenc").await);
+    }
+
+    #[test]
+    fn h265_candidates_never_include_h264() {
+        let candidates = super::preferred_encoders(CodecKind::H265);
+        assert_eq!(candidates[0].0, "hevc_nvenc");
+        assert_eq!(candidates[1].0, "libx265");
+        assert!(
+            candidates
+                .iter()
+                .all(|(encoder, _, _)| !encoder.contains("264"))
+        );
+    }
+
+    #[test]
+    fn video_gop_tracks_two_seconds_of_frames() {
+        assert_eq!(super::video_gop_frames(1), 2);
+        assert_eq!(super::video_gop_frames(16), 32);
+        assert_eq!(super::video_gop_frames(60), 120);
     }
 }

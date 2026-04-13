@@ -1,25 +1,25 @@
 use anyhow::Result;
-use tokio::{
-    io::AsyncReadExt,
-    process::Child,
-    sync::mpsc,
-};
+use tokio::{io::AsyncReadExt, process::Child, sync::broadcast};
 
 use crate::{
     audio::{AdtsParser, AudioFrame},
     ffmpeg::spawn_audio_capture,
-    settings::ServerConfig,
+    settings::{AudioStreamConfig, ServerConfig},
 };
 
 #[derive(Debug)]
 pub struct AudioStreamHandle {
-    pub rx: tokio::sync::mpsc::Receiver<AudioFrame>,
+    pub tx: broadcast::Sender<AudioFrame>,
 }
 
-pub async fn start(server: &ServerConfig) -> Result<(AudioStreamHandle, Child)> {
-    let mut child = spawn_audio_capture(server).await?;
+pub async fn start(
+    server: &ServerConfig,
+    config: &AudioStreamConfig,
+) -> Result<(AudioStreamHandle, Child)> {
+    let mut child = spawn_audio_capture(server, config).await?;
     let mut stdout = child.stdout.take().expect("ffmpeg audio stdout missing");
-    let (tx, rx) = mpsc::channel(24);
+    let (tx, _) = broadcast::channel(256);
+    let stream_tx = tx.clone();
     tokio::spawn(async move {
         let mut parser = AdtsParser::new();
         let mut buf = [0u8; 16 * 1024];
@@ -30,11 +30,9 @@ pub async fn start(server: &ServerConfig) -> Result<(AudioStreamHandle, Child)> 
                 Err(_) => break,
             };
             for frame in parser.push(&buf[..read]) {
-                if tx.send(frame).await.is_err() {
-                    return;
-                }
+                let _ = stream_tx.send(frame);
             }
         }
     });
-    Ok((AudioStreamHandle { rx }, child))
+    Ok((AudioStreamHandle { tx }, child))
 }

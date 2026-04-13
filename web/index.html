@@ -8,109 +8,269 @@
   </head>
   <body>
     <main class="shell">
-      <section class="viewport-card">
-        <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+      <section id="viewport-card" class="viewport-card">
+        <div id="viewport-stage" class="viewport-stage">
+          <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+        </div>
         <div id="status" class="status-pill">Connecting...</div>
+        <div id="stream-warning" class="stream-warning hidden" role="status" aria-live="polite" aria-label="Stream warning">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 4.5l8 14H4l8-14z" />
+            <path d="M12 9v4.5" />
+            <circle cx="12" cy="16.5" r="0.8" />
+          </svg>
+          <span id="stream-warning-text">Stream delayed</span>
+        </div>
       </section>
 
       <section class="bottom-dock">
-        <div class="tool-row">
-          <details id="upload-panel" class="tool-panel upload-panel">
-            <summary id="upload-trigger" class="tool-toggle" aria-label="Uploads and Clipboard">
+        <div class="tool-row tool-row-left">
+          <button id="mic-toggle" class="tool-toggle tool-toggle-left" type="button" aria-label="Enable microphone" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path class="mic-off-slash" d="M5 5l14 14" />
+              <rect x="9" y="3.5" width="6" height="10" rx="3" />
+              <path d="M6.5 10.5a5.5 5.5 0 0 0 11 0" />
+              <path d="M12 16v4.5" />
+              <path d="M8.5 20.5h7" />
+            </svg>
+          </button>
+          <button id="camera-toggle" class="tool-toggle tool-toggle-left" type="button" aria-label="Enable camera uplink" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3.5" y="6.5" width="13" height="11" rx="2.5" />
+              <path d="M16.5 10l4-2.5v9l-4-2.5" />
+            </svg>
+          </button>
+        </div>
+        <div class="tool-row tool-row-right">
+          <details id="control-panel" class="control-panel">
+            <summary id="control-trigger" class="tool-toggle control-toggle" aria-label="Controls">
               <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 16V4M7.5 8.5 12 4l4.5 4.5M5 19h14" />
+                <path d="M4 7h16M4 12h16M4 17h16" />
+                <circle cx="9" cy="7" r="1.8" />
+                <circle cx="15" cy="12" r="1.8" />
+                <circle cx="11" cy="17" r="1.8" />
               </svg>
             </summary>
-            <div class="upload-stack">
-              <button id="upload-action" type="button">Upload File</button>
-              <input id="upload-input" type="file" class="hidden" />
-              <div class="clipboard-stack">
-                <section id="local-clipboard-card" class="clipboard-card secondary">
-                  <div class="clipboard-header">
-                    <div class="clipboard-heading">
-                      <span class="clipboard-title">Local Clipboard</span>
-                      <span id="local-clipboard-meta" class="clipboard-meta">Ready to push remote</span>
-                    </div>
-                    <div class="clipboard-actions">
-                      <button id="local-clipboard-copy-btn" class="clipboard-action secondary" type="button">Copy Text</button>
-                      <button id="local-clipboard-sync-btn" class="clipboard-action" type="button">Push Remote</button>
-                    </div>
-                  </div>
-                  <div class="clipboard-content">
-                    <div id="local-clipboard-text" class="clipboard-text">Empty</div>
-                    <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
-                  </div>
-                </section>
-                <section id="remote-clipboard-card" class="clipboard-card secondary">
-                  <div class="clipboard-header">
-                    <div class="clipboard-heading">
-                      <span class="clipboard-title">Remote Clipboard</span>
-                      <span id="remote-clipboard-meta" class="clipboard-meta">Ready to copy locally</span>
-                    </div>
-                    <div class="clipboard-actions">
-                      <button id="remote-clipboard-copy-btn" class="clipboard-action secondary" type="button">Copy Text</button>
-                      <button id="remote-clipboard-sync-btn" class="clipboard-action" type="button">Copy Local</button>
-                    </div>
-                  </div>
-                  <div class="clipboard-content">
-                    <div id="remote-clipboard-text" class="clipboard-text">Empty</div>
-                    <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
-                  </div>
-                </section>
+            <div class="control-card">
+              <div class="tab-row" role="tablist" aria-label="Control sections">
+                <button id="tab-button-status" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-status" data-tab-target="status">Status</button>
+                <button id="tab-button-view" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-view" data-tab-target="view">View</button>
+                <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Settings</button>
+                <button id="tab-button-transfer" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-transfer" data-tab-target="transfer">Transfer</button>
               </div>
+              <section id="tab-panel-status" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-button-status">
+                <div class="status-grid">
+                  <article class="metric-card metric-card-wide">
+                    <span class="metric-label">Latency</span>
+                    <div class="metric-inline-row">
+                      <strong id="status-latency" class="metric-value">--</strong>
+                      <strong class="metric-value metric-value-inline metric-value-network" aria-label="Network speed">
+                        <span id="status-speed-download">↓ --</span>
+                        <span id="status-speed-upload">↑ --</span>
+                      </strong>
+                    </div>
+                    <span id="status-updated-at" class="metric-meta">Updates every 3s</span>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">CPU</span>
+                    <strong id="status-cpu" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">RAM</span>
+                    <strong id="status-ram" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Swap</span>
+                    <strong id="status-swap" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Encoder</span>
+                    <strong id="encoder-status" class="metric-value">Not connected</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Audio Buffer</span>
+                    <strong id="status-audio-buffer" class="metric-value">--</strong>
+                  </article>
+                </div>
+              </section>
+              <section id="tab-panel-view" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-view" hidden>
+                <div class="view-grid">
+                  <article class="metric-card metric-card-wide">
+                    <span class="metric-label">Zoom</span>
+                    <div class="zoom-controls">
+                      <button id="zoom-out" class="zoom-icon-button" type="button" aria-label="Zoom out">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M6 12h12" />
+                        </svg>
+                      </button>
+                      <strong id="view-zoom-value" class="zoom-value">100%</strong>
+                      <button id="zoom-in" class="zoom-icon-button" type="button" aria-label="Zoom in">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M12 6v12" />
+                          <path d="M6 12h12" />
+                        </svg>
+                      </button>
+                    </div>
+                    <span class="metric-meta">10% step</span>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Current Video</span>
+                    <strong id="view-video-size" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Viewport</span>
+                    <strong id="view-viewport-size" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Window</span>
+                    <strong id="view-window-size" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Remote Screen</span>
+                    <strong id="view-remote-screen-size" class="metric-value">--</strong>
+                  </article>
+                </div>
+              </section>
+              <section id="tab-panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-settings" hidden>
+                <div class="menu-grid">
+                  <label>Codec
+                    <select id="codec">
+                      <option value="h264" selected>H.264</option>
+                      <option value="h265">H.265</option>
+                      <option value="vp8">VP8</option>
+                    </select>
+                  </label>
+                  <label>Bitrate
+                    <input id="bitrate" type="range" min="128" max="12000" step="32" value="4000" />
+                    <span id="bitrate-value">4000 kbps</span>
+                  </label>
+                  <label>Audio playback bitrate
+                    <select id="audio-bitrate">
+                      <option value="16">16 kbps</option>
+                      <option value="24">24 kbps</option>
+                      <option value="32">32 kbps</option>
+                      <option value="48">48 kbps</option>
+                      <option value="64">64 kbps</option>
+                      <option value="96">96 kbps</option>
+                      <option value="128" selected>128 kbps</option>
+                      <option value="160">160 kbps</option>
+                      <option value="192">192 kbps</option>
+                      <option value="256">256 kbps</option>
+                      <option value="320">320 kbps</option>
+                    </select>
+                  </label>
+                  <label>Mic bitrate
+                    <select id="mic-bitrate">
+                      <option value="16">16 kbps</option>
+                      <option value="24">24 kbps</option>
+                      <option value="32">32 kbps</option>
+                      <option value="48">48 kbps</option>
+                      <option value="64">64 kbps</option>
+                      <option value="96">96 kbps</option>
+                      <option value="128">128 kbps</option>
+                      <option value="160">160 kbps</option>
+                      <option value="192">192 kbps</option>
+                      <option value="256">256 kbps</option>
+                      <option value="320" selected>320 kbps</option>
+                    </select>
+                  </label>
+                  <label>FPS
+                    <input id="fps" type="range" min="1" max="60" step="1" value="16" />
+                    <span id="fps-value">16 fps</span>
+                  </label>
+                  <label>Scroll speed
+                    <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
+                    <span id="scroll-speed-value">3 / 10</span>
+                  </label>
+                  <label>Audio latency
+                    <input id="audio-latency" type="range" min="0" max="2000" step="10" value="80" />
+                    <span id="audio-latency-value">80 ms</span>
+                  </label>
+                  <label>Audio clock speed
+                    <input id="audio-clock-rate" type="range" min="0.9" max="1.1" step="0.0005" value="0.9650" />
+                    <span id="audio-clock-rate-value" class="range-value">0.9650x</span>
+                    <span class="toggle-label inline-toggle">
+                      <span>Auto</span>
+                      <input id="audio-clock-auto" type="checkbox" checked />
+                    </span>
+                  </label>
+                  <label>Auto disconnect
+                    <input id="auto-disconnect-minutes" type="number" min="0" max="1440" step="1" value="30" inputmode="numeric" />
+                  </label>
+                  <label>Touch mode
+                    <select id="touch-mode">
+                      <option value="direct_touch">Direct touch</option>
+                      <option value="touchpad">Touchpad</option>
+                    </select>
+                  </label>
+                  <label id="direct-touch-scroll-label" class="toggle-label">
+                    <span>Direct touch one-finger scroll</span>
+                    <input id="direct-touch-scroll" type="checkbox" />
+                  </label>
+                </div>
+                <div class="button-row">
+                  <button id="connect">Connect</button>
+                  <button id="disconnect" class="secondary">Disconnect</button>
+                </div>
+              </section>
+              <section id="tab-panel-transfer" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-transfer" hidden>
+                <div class="upload-stack">
+                  <button id="upload-action" type="button">Upload File</button>
+                  <input id="upload-input" type="file" class="hidden" />
+                </div>
+                <div class="clipboard-stack">
+                  <section id="local-clipboard-card" class="clipboard-card secondary">
+                    <div class="clipboard-header">
+                      <div class="clipboard-heading">
+                        <span class="clipboard-title">Local Clipboard</span>
+                        <span id="local-clipboard-meta" class="clipboard-meta">Ready to paste remotely</span>
+                      </div>
+                      <div class="clipboard-actions">
+                        <button id="local-clipboard-sync-btn" class="clipboard-action" type="button">Paste</button>
+                      </div>
+                    </div>
+                    <div class="clipboard-content">
+                      <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
+                      <div id="local-clipboard-text" class="clipboard-text">Empty</div>
+                    </div>
+                  </section>
+                  <section id="remote-clipboard-card" class="clipboard-card secondary">
+                    <div class="clipboard-header">
+                      <div class="clipboard-heading">
+                        <span class="clipboard-title">Remote Clipboard</span>
+                        <span id="remote-clipboard-meta" class="clipboard-meta">Auto-refresh every 3s</span>
+                      </div>
+                      <div class="clipboard-actions">
+                        <button id="remote-clipboard-sync-btn" class="clipboard-action" type="button">Copy</button>
+                      </div>
+                    </div>
+                    <div class="clipboard-content">
+                      <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
+                      <div id="remote-clipboard-text" class="clipboard-text">Empty</div>
+                    </div>
+                  </section>
+                  <section class="clipboard-history-card secondary">
+                    <div class="clipboard-header">
+                      <div class="clipboard-heading">
+                        <span class="clipboard-title">Clipboard History</span>
+                        <span class="clipboard-meta">Latest 100 old entries</span>
+                      </div>
+                    </div>
+                    <div id="clipboard-history-empty" class="clipboard-history-empty">No history yet</div>
+                    <div id="clipboard-history-list" class="clipboard-history-list"></div>
+                  </section>
+                </div>
+              </section>
             </div>
           </details>
-          <details id="settings-panel" class="settings-panel">
-            <summary class="tool-toggle settings-toggle" aria-label="Settings">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 7h10M18 7h2M4 12h2M10 12h10M4 17h14M22 17h-2" />
-                <circle cx="16" cy="7" r="2" />
-                <circle cx="8" cy="12" r="2" />
-                <circle cx="18" cy="17" r="2" />
-              </svg>
-            </summary>
-            <div class="settings-card">
-              <div class="settings-status">
-                <span class="settings-status-label">Encoder</span>
-                <span id="encoder-status" class="settings-status-value">Not connected</span>
-              </div>
-              <div class="menu-grid">
-                <label>Codec
-                  <select id="codec">
-                    <option value="h264" selected>H.264</option>
-                    <option value="h265">H.265</option>
-                    <option value="vp8">VP8</option>
-                  </select>
-                </label>
-                <label>Bitrate
-                  <input id="bitrate" type="range" min="1000" max="12000" step="250" value="4000" />
-                  <span id="bitrate-value">4000 kbps</span>
-                </label>
-                <label>FPS
-                  <input id="fps" type="range" min="8" max="30" step="1" value="16" />
-                  <span id="fps-value">16 fps</span>
-                </label>
-                <label>Scroll speed
-                  <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
-                  <span id="scroll-speed-value">3 / 10</span>
-                </label>
-                <label>Touch mode
-                  <select id="touch-mode">
-                    <option value="direct_touch">Direct touch</option>
-                    <option value="touchpad">Touchpad</option>
-                  </select>
-                </label>
-                <label id="direct-touch-scroll-label" class="toggle-label">
-                  <span>Direct touch one-finger scroll</span>
-                  <input id="direct-touch-scroll" type="checkbox" />
-                </label>
-              </div>
-              <div class="button-row">
-                <button id="connect">Connect</button>
-                <button id="disconnect" class="secondary">Disconnect</button>
-              </div>
-            </div>
-          </details>
+          <button id="mobile-keyboard-trigger" class="tool-toggle mobile-keyboard-trigger" type="button" aria-label="Show keyboard">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3.5" y="6.5" width="17" height="11" rx="2.5" />
+              <path d="M6.5 10.5h.01M9.5 10.5h.01M12.5 10.5h.01M15.5 10.5h.01M18 10.5h.01" />
+              <path d="M7.5 13.5h.01M10.5 13.5h.01M13.5 13.5h.01M16.5 13.5h.01" />
+              <path d="M8 16.5h8" />
+            </svg>
+          </button>
         </div>
       </section>
     </main>
@@ -127,6 +287,17 @@
       </form>
     </div>
     <div id="toast" class="toast hidden"></div>
+    <textarea
+      id="mobile-keyboard-input"
+      class="mobile-keyboard-input"
+      aria-label="Mobile keyboard input"
+      autocapitalize="off"
+      autocomplete="off"
+      autocorrect="off"
+      spellcheck="false"
+      enterkeyhint="enter"
+      rows="1"
+    ></textarea>
     <script src="/app.js" type="module"></script>
   </body>
 </html>

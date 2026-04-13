@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub enum ServerMessage {
     Hello {
         session_id: String,
+        server_time_ms: u64,
         display: String,
         config: StreamConfig,
         active_encoder: String,
@@ -26,8 +27,15 @@ pub enum ServerMessage {
         codec: CodecKind,
         cpu_usage: f32,
         memory_used_mb: u64,
+        memory_total_mb: u64,
+        swap_used_mb: u64,
+        swap_total_mb: u64,
         net_tx_kbps: f32,
-        latency_ms: u64,
+        net_rx_kbps: f32,
+    },
+    Pong {
+        seq: u64,
+        server_time_ms: u64,
     },
     Error {
         code: &'static str,
@@ -48,9 +56,12 @@ pub enum ClientMessage {
     PointerWheel { delta_y: i32 },
     TouchTap,
     Key { key: String, down: bool },
+    KeyState { pressed_keys: Vec<String> },
+    TextInput { text: String },
     Paste,
+    PasteClipboard { payload: ClipboardPayload },
     ResetInput,
-    Ping { sent_at_ms: u64 },
+    Ping { seq: u64 },
     ClipboardSet { payload: ClipboardPayload },
     ClipboardGet,
 }

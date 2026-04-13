@@ -55,7 +55,7 @@ impl AnnexBParser {
                 frames.push(EncodedFrame {
                     keyframe: contains_keyframe(self.codec, &slice),
                     description_b64: self.description_b64(),
-                    data: annexb_sample_to_length_prefixed(&slice),
+                    data: sample_data(self.codec, &slice),
                 });
             }
         }
@@ -85,12 +85,10 @@ impl AnnexBParser {
                 let pps = self.pps.as_ref()?;
                 Some(STANDARD.encode(avcc_from_sps_pps(sps, pps)))
             }
-            CodecKind::H265 => {
-                let vps = self.vps.as_ref()?;
-                let sps = self.sps.as_ref()?;
-                let pps = self.pps.as_ref()?;
-                Some(STANDARD.encode(hvcc_from_sets(vps, sps, pps)))
-            }
+            // WebCodecs accepts HEVC Annex B access units when no `description`
+            // is provided. That is a better fit for our live elementary stream
+            // than fabricating an hvcC blob from partial parser state.
+            CodecKind::H265 => None,
             CodecKind::Vp8 => None,
         }
     }
@@ -208,7 +206,10 @@ fn nal_type(codec: CodecKind, data: &[u8]) -> Option<u8> {
 }
 
 fn is_aud(codec: CodecKind, nal_type: u8) -> bool {
-    matches!((codec, nal_type), (CodecKind::H264, 9) | (CodecKind::H265, 35))
+    matches!(
+        (codec, nal_type),
+        (CodecKind::H264, 9) | (CodecKind::H265, 35)
+    )
 }
 
 fn contains_keyframe(codec: CodecKind, data: &[u8]) -> bool {
@@ -231,17 +232,12 @@ fn avcc_from_sps_pps(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     out
 }
 
-fn hvcc_from_sets(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut out = vec![
-        1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xf0, 0, 0xfc, 0xfd, 0xf8, 0xf8, 0, 0, 0x0f, 3,
-    ];
-    for (nal_type, unit) in [(32u8, vps), (33u8, sps), (34u8, pps)] {
-        out.push(0x80 | nal_type);
-        out.extend_from_slice(&1u16.to_be_bytes());
-        out.extend_from_slice(&(unit.len() as u16).to_be_bytes());
-        out.extend_from_slice(unit);
+fn sample_data(codec: CodecKind, sample: &[u8]) -> Vec<u8> {
+    match codec {
+        CodecKind::H264 => annexb_sample_to_length_prefixed(sample),
+        CodecKind::H265 => sample.to_vec(),
+        CodecKind::Vp8 => sample.to_vec(),
     }
-    out
 }
 
 #[cfg(test)]
@@ -278,6 +274,27 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(frames[0].keyframe);
         assert!(frames[0].description_b64.is_some());
+    }
+
+    #[test]
+    fn keeps_h265_frames_in_annex_b_without_description() {
+        let mut parser = AnnexBParser::new(CodecKind::H265);
+        let frame1 = [
+            &[0, 0, 0, 1, 0x40, 0x01, 0xaa][..],    // VPS (type 32)
+            &[0, 0, 0, 1, 0x42, 0x01, 0xbb][..],    // SPS (type 33)
+            &[0, 0, 0, 1, 0x44, 0x01, 0xcc][..],    // PPS (type 34)
+            &[0, 0, 0, 1, 0x46, 0x01][..],          // AUD (type 35)
+            &[0, 0, 0, 1, 0x26, 0x01, 1, 2, 3][..], // IDR_W_RADL (type 19)
+            &[0, 0, 0, 1, 0x46, 0x01][..],          // AUD (type 35)
+            &[0, 0, 0, 1, 0x02, 0x01, 4, 5, 6][..], // TRAIL_R (type 1)
+        ]
+        .concat();
+
+        let frames = parser.push(&frame1);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe);
+        assert!(frames[0].description_b64.is_none());
+        assert!(frames[0].data.starts_with(&[0, 0, 0, 1, 0x46, 0x01]));
     }
 
     #[test]

@@ -1,9 +1,11 @@
-mod audio;
-mod audio_streamer;
 mod annexb;
 mod app;
+mod audio;
+mod audio_streamer;
+mod camera;
 mod clipboard;
 mod ffmpeg;
+mod media;
 mod messages;
 mod session;
 mod settings;
