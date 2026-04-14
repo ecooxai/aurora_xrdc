@@ -2,7 +2,8 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     extract::{Multipart, Query, State, ws::WebSocketUpgrade},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
@@ -10,6 +11,7 @@ use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    collections::HashSet,
     future::IntoFuture,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -18,6 +20,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::{
     camera::CameraRelay,
@@ -53,6 +56,7 @@ struct AuthTracker {
 struct AuthTrackerState {
     failed_attempts: u32,
     locked_until: Option<Instant>,
+    session_tokens: HashSet<String>,
 }
 
 impl AuthTracker {
@@ -71,6 +75,85 @@ impl AuthTracker {
         &self,
         expected: &str,
         provided: Option<&str>,
+        session_token: Option<&str>,
+    ) -> Result<(), (StatusCode, String)> {
+        if expected.is_empty() {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server password is not configured".into(),
+            ));
+        }
+
+        if self.session_matches(session_token).await {
+            return Ok(());
+        }
+
+        if let Some(actual) = provided {
+            self.verify_passwd(expected, actual).await?;
+            return Ok(());
+        }
+
+        Err((StatusCode::UNAUTHORIZED, "authentication required".into()))
+    }
+
+    async fn authenticate(
+        &self,
+        expected: &str,
+        provided: &str,
+    ) -> Result<String, (StatusCode, String)> {
+        if expected.is_empty() {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server password is not configured".into(),
+            ));
+        }
+
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+
+        if let Some(locked_until) = state.locked_until {
+            if now < locked_until {
+                let remaining = locked_until.saturating_duration_since(now);
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "too many failed password attempts; try again in {}",
+                        format_duration(remaining)
+                    ),
+                ));
+            }
+            state.locked_until = None;
+            state.failed_attempts = 0;
+        }
+
+        if provided == expected {
+            state.failed_attempts = 0;
+            state.locked_until = None;
+            let token = Uuid::new_v4().to_string();
+            state.session_tokens.insert(token.clone());
+            Ok(token)
+        } else {
+            state.failed_attempts = state.failed_attempts.saturating_add(1);
+            if state.failed_attempts >= 20 {
+                state.failed_attempts = 0;
+                state.locked_until = Some(now + self.lockout_duration);
+                Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many failed password attempts; locked for 1 hour".into(),
+                ))
+            } else {
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    "invalid or missing passwd; start the server with --passwd <password>".into(),
+                ))
+            }
+        }
+    }
+
+    async fn verify_passwd(
+        &self,
+        expected: &str,
+        provided: &str,
     ) -> Result<(), (StatusCode, String)> {
         if expected.is_empty() {
             return Err((
@@ -98,7 +181,7 @@ impl AuthTracker {
         }
 
         match provided {
-            Some(actual) if actual == expected => {
+            actual if actual == expected => {
                 state.failed_attempts = 0;
                 state.locked_until = None;
                 Ok(())
@@ -122,11 +205,23 @@ impl AuthTracker {
             }
         }
     }
+
+    async fn session_matches(&self, token: Option<&str>) -> bool {
+        let state = self.state.lock().await;
+        token
+            .map(|token| state.session_tokens.contains(token))
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct AuthQuery {
     passwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthBody {
+    passwd: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,7 +257,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/app.js", get(js))
         .route("/app.css", get(css))
         .route("/healthz", get(healthz))
-        .route("/api/auth", get(auth))
+        .route("/api/auth", get(auth_check).post(auth_login))
         .route("/api/encoders", get(encoders))
         .route("/ws", get(ws))
         .route("/api/upload", post(upload))
@@ -176,6 +271,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
             "/api/clipboard/remote",
             get(get_remote_clipboard).post(set_remote_clipboard),
         )
+        .layer(middleware::from_fn(cors))
         .with_state(Arc::new(AppState {
             server,
             auth: Arc::new(AuthTracker::new()),
@@ -238,15 +334,33 @@ async fn healthz() -> impl IntoResponse {
     "ok"
 }
 
-async fn auth(
-    Query(auth): Query<AuthQuery>,
+async fn auth_check(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<&'static str, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .require_passwd(&state.server.passwd, None, session_token.as_deref())
         .await?;
     Ok("ok")
+}
+
+async fn auth_login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AuthBody>,
+) -> Result<Response, (StatusCode, String)> {
+    let token = state
+        .auth
+        .authenticate(&state.server.passwd, body.passwd.as_str())
+        .await?;
+    let cookie = HeaderValue::from_str(&format!(
+        "vibe_rdesk_session={token}; Path=/; HttpOnly; SameSite=Lax"
+    ))
+    .map_err(|err| internal_error(err.into()))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, cookie);
+    Ok((StatusCode::OK, headers, "ok").into_response())
 }
 
 #[derive(Debug, Serialize)]
@@ -255,12 +369,18 @@ struct EncodersResponse {
 }
 
 async fn encoders(
+    headers: HeaderMap,
     Query(query): Query<EncodersQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<EncodersResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, query.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
     let codec = query.codec.unwrap_or(CodecKind::H264);
     let options = ffmpeg::available_encoder_options(codec)
@@ -270,13 +390,19 @@ async fn encoders(
 }
 
 async fn ws(
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     Query(query): Query<WsQuery>,
 ) -> Response {
+    let session_token = cookie_session_token(&headers);
     if let Err(response) = state
         .auth
-        .require_passwd(&state.server.passwd, query.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await
     {
         return response.into_response();
@@ -324,13 +450,19 @@ struct CameraStopResponse {
 }
 
 async fn upload(
+    headers: HeaderMap,
     Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            auth.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
     let dir = PathBuf::from(&state.server.upload_dir);
     ensure_upload_dir(&dir).await.map_err(internal_error)?;
@@ -359,13 +491,19 @@ async fn upload(
 }
 
 async fn upload_camera_chunk(
+    headers: HeaderMap,
     Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart,
 ) -> Result<Json<CameraChunkResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            auth.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
 
     let mut session_id = None;
@@ -426,13 +564,19 @@ async fn upload_camera_chunk(
 }
 
 async fn stop_camera(
+    headers: HeaderMap,
     Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
     Json(request): Json<CameraStopRequest>,
 ) -> Result<Json<CameraStopResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            auth.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
 
     state
@@ -445,12 +589,18 @@ async fn stop_camera(
 }
 
 async fn get_remote_clipboard(
+    headers: HeaderMap,
     Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ClipboardPayload>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            auth.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
     let payload = read_remote_clipboard(&state.server.display)
         .await
@@ -459,25 +609,37 @@ async fn get_remote_clipboard(
 }
 
 async fn get_clipboard_history(
+    headers: HeaderMap,
     Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<ClipboardHistoryEntry>>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            auth.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
     let history = read_clipboard_history().await.map_err(internal_error)?;
     Ok(Json(history))
 }
 
 async fn set_clipboard_history(
+    headers: HeaderMap,
     Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
     Json(history): Json<Vec<ClipboardHistoryEntry>>,
 ) -> Result<Json<Vec<ClipboardHistoryEntry>>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            auth.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
     write_clipboard_history(&history)
         .await
@@ -486,13 +648,19 @@ async fn set_clipboard_history(
 }
 
 async fn set_remote_clipboard(
+    headers: HeaderMap,
     Query(auth): Query<AuthQuery>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ClipboardPayload>,
 ) -> Result<Json<ClipboardPayload>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
     state
         .auth
-        .require_passwd(&state.server.passwd, auth.passwd.as_deref())
+        .require_passwd(
+            &state.server.passwd,
+            auth.passwd.as_deref(),
+            session_token.as_deref(),
+        )
         .await?;
     write_remote_clipboard(&state.server.display, &payload)
         .await
@@ -505,6 +673,56 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     (StatusCode::OK, headers, body).into_response()
+}
+
+async fn cors(req: axum::http::Request<axum::body::Body>, next: Next) -> Response {
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    if req.method() == Method::OPTIONS {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        apply_cors_headers(response.headers_mut(), origin.as_deref());
+        return response;
+    }
+
+    let mut response = next.run(req).await;
+    apply_cors_headers(response.headers_mut(), origin.as_deref());
+    response
+}
+
+fn apply_cors_headers(headers: &mut HeaderMap, origin: Option<&str>) {
+    let Some(origin) = origin else {
+        return;
+    };
+    let Ok(origin) = HeaderValue::from_str(origin) else {
+        return;
+    };
+
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        HeaderValue::from_static("true"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type, authorization"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+}
+
+fn cookie_session_token(headers: &HeaderMap) -> Option<String> {
+    let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie.split(';').find_map(|item| {
+        let (name, value) = item.trim().split_once('=')?;
+        (name == "vibe_rdesk_session").then(|| value.to_string())
+    })
 }
 
 fn internal_error(err: anyhow::Error) -> (StatusCode, String) {
@@ -596,14 +814,14 @@ mod tests {
 
         for _ in 0..19 {
             let err = tracker
-                .require_passwd("secret", Some("wrong"))
+                .require_passwd("secret", Some("wrong"), None)
                 .await
                 .unwrap_err();
             assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
         }
 
         let err = tracker
-            .require_passwd("secret", Some("wrong"))
+            .require_passwd("secret", Some("wrong"), None)
             .await
             .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::TOO_MANY_REQUESTS);
@@ -615,19 +833,53 @@ mod tests {
         let tracker = AuthTracker::new_with_lockout(Duration::from_millis(25));
 
         for _ in 0..20 {
-            let _ = tracker.require_passwd("secret", Some("wrong")).await;
+            let _ = tracker.require_passwd("secret", Some("wrong"), None).await;
         }
 
         tokio::time::sleep(Duration::from_millis(30)).await;
 
         tracker
-            .require_passwd("secret", Some("secret"))
+            .require_passwd("secret", Some("secret"), None)
             .await
             .unwrap();
         let err = tracker
-            .require_passwd("secret", Some("wrong"))
+            .require_passwd("secret", Some("wrong"), None)
             .await
             .unwrap_err();
         assert_eq!(err.0, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn successful_auth_issues_session_token() {
+        let tracker = AuthTracker::new();
+        let token = tracker
+            .authenticate("secret", "secret")
+            .await
+            .expect("session token");
+        tracker
+            .require_passwd("secret", None, Some(token.as_str()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn multiple_session_tokens_remain_valid() {
+        let tracker = AuthTracker::new();
+        let first = tracker
+            .authenticate("secret", "secret")
+            .await
+            .expect("first session token");
+        let second = tracker
+            .authenticate("secret", "secret")
+            .await
+            .expect("second session token");
+        tracker
+            .require_passwd("secret", None, Some(first.as_str()))
+            .await
+            .unwrap();
+        tracker
+            .require_passwd("secret", None, Some(second.as_str()))
+            .await
+            .unwrap();
     }
 }

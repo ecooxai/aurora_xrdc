@@ -133,21 +133,30 @@
               </section>
               <section id="tab-panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-settings" hidden>
                 <div class="menu-grid">
-                  <label>Codec
-                    <select id="codec">
+                  <div class="field-group">
+                    <span class="field-label">Codec</span>
+                    <div id="codec-group" class="radio-group" role="radiogroup" aria-label="Codec"></div>
+                    <select id="codec" class="hidden" aria-hidden="true" tabindex="-1">
                       <option value="h264" selected>H.264</option>
                       <option value="h265">H.265</option>
                       <option value="vp8">VP8</option>
                     </select>
-                  </label>
-                  <label>Encoder preference
-                    <select id="encode-preference">
+                  </div>
+                  <div class="field-group">
+                    <span class="field-label">Encoder preference</span>
+                    <div
+                      id="encode-preference-group"
+                      class="radio-group"
+                      role="radiogroup"
+                      aria-label="Encoder preference"
+                    ></div>
+                    <select id="encode-preference" class="hidden" aria-hidden="true" tabindex="-1">
                       <option value="nvidia">NVIDIA auto</option>
                       <option value="gpu" selected>GPU auto</option>
                       <option value="cpu">CPU auto</option>
                     </select>
                     <span id="encode-preference-help" class="field-help">Loading encoder availability...</span>
-                  </label>
+                  </div>
                   <label>Bitrate
                     <input id="bitrate" type="range" min="128" max="12000" step="32" value="4000" />
                     <span id="bitrate-value">4000 kbps</span>
@@ -286,6 +295,10 @@
       <form id="auth-form" class="auth-card">
         <p class="auth-kicker">Protected session</p>
         <h1 id="auth-title">Enter password</h1>
+        <label class="auth-label" for="auth-origin">
+          Server URL
+          <input id="auth-origin" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://localhost:8001" />
+        </label>
         <label class="auth-label" for="auth-passwd">
           Password
           <input id="auth-passwd" type="password" autocomplete="current-password" spellcheck="false" />

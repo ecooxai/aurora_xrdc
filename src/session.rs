@@ -17,8 +17,8 @@ use tracing::{error, warn};
 use crate::{
     audio::AudioFrame,
     clipboard::{read_remote_clipboard, write_remote_clipboard},
-    ffmpeg::{MicInputHandle, read_stderr, run_xdotool, spawn_mic_input_injector},
-    media::MediaHub,
+    ffmpeg::{MicInputHandle, read_stderr, run_xdotool, spawn_mic_input_injector, wake_display},
+    media::{ActiveAudioState, ActiveVideoState, MediaHub},
     messages::{ClientMessage, ServerMessage},
     settings::{AudioStreamConfig, ServerConfig, StreamConfig},
     streamer::StreamFrame,
@@ -29,6 +29,7 @@ const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
 const AUDIO_PACKET_QUEUE_CAPACITY: usize = 128;
+const DISPLAY_WAKE_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn handle_socket(
     socket: WebSocket,
@@ -37,35 +38,33 @@ pub async fn handle_socket(
     config: StreamConfig,
     audio_config: AudioStreamConfig,
 ) -> Result<()> {
+    let mut initial_display_wake_at = None;
+    maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
     let video_stream = media.acquire_video(config.clone()).await?;
     let mut audio_stream = match media.acquire_audio(audio_config).await {
         Ok(stream) => Some(stream),
         Err(_) => None,
     };
+    let initial_video = current_video_state(&video_stream.state_rx)?;
+    let initial_audio = audio_stream
+        .as_ref()
+        .and_then(|stream| stream.state_rx.borrow().clone());
     let (ws_sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
     let (video_tx, video_rx) = watch::channel(None::<Vec<u8>>);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let audio_enabled = audio_stream.is_some();
     let session_id = format!("{:x}", rand_id());
-    out_tx
-        .send(Message::Text(
-            serde_json::to_string(&ServerMessage::Hello {
-                session_id,
-                server_time_ms: current_ms(),
-                display: server.display.clone(),
-                config: config.clone(),
-                active_encoder: video_stream.encoder.ffmpeg_encoder.clone(),
-                encoder_mode: video_stream.encoder.mode,
-                codec_string: config.codec.as_webcodec().into(),
-                description_b64: None,
-                audio_enabled,
-            })?
-            .into(),
-        ))
-        .await?;
-    if !audio_enabled {
+    send_hello(
+        &out_tx,
+        Some(session_id.as_str()),
+        Some(server.display.as_str()),
+        &initial_video,
+        initial_audio.as_ref(),
+        None,
+    )
+    .await?;
+    if initial_audio.is_none() {
         let _ = out_tx
             .send(Message::Text(
                 serde_json::to_string(&ServerMessage::Error {
@@ -77,20 +76,13 @@ pub async fn handle_socket(
             .await;
     }
     let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
-    let stats_task = spawn_stats(
-        out_tx.clone(),
-        config.clone(),
-        video_stream.encoder.ffmpeg_encoder.clone(),
-        video_stream.encoder.mode,
-    );
+    let stats_task = spawn_stats(out_tx.clone(), video_stream.state_rx.clone());
     let send_task = tokio::spawn(forward_frames(
         out_tx.clone(),
         video_tx,
         video_stream.rx.clone(),
-        config.clone(),
-        video_stream.encoder.ffmpeg_encoder.clone(),
-        video_stream.encoder.mode,
-        audio_enabled,
+        video_stream.state_rx.clone(),
+        audio_stream.as_ref().map(|stream| stream.state_rx.clone()),
     ));
     let mut audio_task = audio_stream
         .as_mut()
@@ -100,15 +92,35 @@ pub async fn handle_socket(
         receiver,
         out_tx.clone(),
         server.clone(),
+        media,
         shutdown_rx,
     ));
     let mut writer_task = writer_task;
     let mut send_task = send_task;
 
+    let mut recv_task_completed = false;
+    let mut writer_task_completed = false;
+    let mut send_task_completed = false;
+
     tokio::select! {
-        _ = &mut recv_task => {}
-        _ = &mut writer_task => {}
-        _ = &mut send_task => {}
+        result = &mut recv_task => {
+            recv_task_completed = true;
+            if let Err(err) = result {
+                warn!("websocket receiver task failed: {err}");
+            }
+        }
+        result = &mut writer_task => {
+            writer_task_completed = true;
+            if let Err(err) = result {
+                warn!("websocket writer task failed: {err}");
+            }
+        }
+        result = &mut send_task => {
+            send_task_completed = true;
+            if let Err(err) = result {
+                warn!("websocket sender task failed: {err}");
+            }
+        }
     }
 
     let _ = shutdown_tx.send(true);
@@ -117,17 +129,21 @@ pub async fn handle_socket(
         task.abort();
         let _ = task.await;
     }
-    if !writer_task.is_finished() {
+    if !writer_task_completed && !writer_task.is_finished() {
         writer_task.abort();
     }
-    let _ = writer_task.await;
-    if !send_task.is_finished() {
+    if !writer_task_completed {
+        let _ = writer_task.await;
+    }
+    if !send_task_completed && !send_task.is_finished() {
         send_task.abort();
     }
-    let _ = send_task.await;
-    if recv_task.is_finished() {
-        let _ = recv_task.await;
-    } else if tokio::time::timeout(Duration::from_secs(1), &mut recv_task)
+    if !send_task_completed {
+        let _ = send_task.await;
+    }
+    if !recv_task_completed
+        && !recv_task.is_finished()
+        && tokio::time::timeout(Duration::from_secs(1), &mut recv_task)
         .await
         .is_err()
     {
@@ -141,33 +157,43 @@ async fn forward_frames(
     sender: mpsc::Sender<Message>,
     media_sender: watch::Sender<Option<Vec<u8>>>,
     mut rx: watch::Receiver<Option<StreamFrame>>,
-    config: StreamConfig,
-    encoder: String,
-    mode: &'static str,
-    audio_enabled: bool,
+    mut video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
+    mut audio_state_rx: Option<watch::Receiver<Option<ActiveAudioState>>>,
 ) -> Result<()> {
-    while rx.changed().await.is_ok() {
-        let Some(frame) = rx.borrow_and_update().clone() else {
-            continue;
-        };
-        let _ = media_sender.send(Some(binary_frame(&frame)));
-        if frame.description_b64.is_some() {
-            sender
-                .send(Message::Text(
-                    serde_json::to_string(&ServerMessage::Hello {
-                        session_id: String::new(),
-                        server_time_ms: current_ms(),
-                        display: String::new(),
-                        config: config.clone(),
-                        active_encoder: encoder.clone(),
-                        encoder_mode: mode,
-                        codec_string: frame.codec.as_webcodec().into(),
-                        description_b64: frame.description_b64.clone(),
-                        audio_enabled,
-                    })?
-                    .into(),
-                ))
-                .await?;
+    loop {
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let Some(frame) = rx.borrow_and_update().clone() else {
+                    continue;
+                };
+                let _ = media_sender.send(Some(binary_frame(&frame)));
+                if frame.description_b64.is_some() {
+                    let video_state = current_video_state(&video_state_rx)?;
+                    let audio_state = current_audio_state(audio_state_rx.as_ref());
+                    send_hello(&sender, None, None, &video_state, audio_state.as_ref(), frame.description_b64.clone()).await?;
+                }
+            }
+            changed = video_state_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let Some(video_state) = video_state_rx.borrow_and_update().clone() else {
+                    continue;
+                };
+                let audio_state = current_audio_state(audio_state_rx.as_ref());
+                send_hello(&sender, None, None, &video_state, audio_state.as_ref(), None).await?;
+            }
+            changed = wait_for_audio_state_change(audio_state_rx.as_mut()) => {
+                if changed.is_err() {
+                    break;
+                }
+                let video_state = current_video_state(&video_state_rx)?;
+                let audio_state = current_audio_state(audio_state_rx.as_ref());
+                send_hello(&sender, None, None, &video_state, audio_state.as_ref(), None).await?;
+            }
         }
     }
     Ok(())
@@ -277,23 +303,25 @@ async fn write_socket(
 
 fn spawn_stats(
     sender: mpsc::Sender<Message>,
-    config: StreamConfig,
-    encoder: String,
-    mode: &'static str,
+    video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sampler = StatsSampler::new();
         let mut tick = tokio::time::interval(Duration::from_secs(3));
+        let video_state_rx = video_state_rx;
         loop {
             tick.tick().await;
+            let Some(video_state) = video_state_rx.borrow().clone() else {
+                continue;
+            };
             let sample = sampler.sample();
             let msg = ServerMessage::Stats {
-                capture_fps: config.fps as f32,
-                bitrate_kbps: config.bitrate_kbps,
+                capture_fps: video_state.config.fps as f32,
+                bitrate_kbps: video_state.config.bitrate_kbps,
                 queue_depth: 0,
-                active_encoder: encoder.clone(),
-                encoder_mode: mode,
-                codec: config.codec,
+                active_encoder: video_state.encoder.ffmpeg_encoder.clone(),
+                encoder_mode: video_state.encoder.mode,
+                codec: video_state.config.codec,
                 cpu_usage: sample.cpu_usage,
                 memory_used_mb: sample.memory_used_mb,
                 memory_total_mb: sample.memory_total_mb,
@@ -321,11 +349,13 @@ async fn handle_client(
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
     sender: mpsc::Sender<Message>,
     server: ServerConfig,
+    media: MediaHub,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut pressed_keys = HashSet::new();
     let mut mic_input = MicInputState::Idle;
     let mut last_key_state_at = None;
+    let mut last_display_wake_at = None;
     let mut key_watchdog = tokio::time::interval(KEY_STATE_WATCHDOG_INTERVAL);
     key_watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
@@ -337,9 +367,14 @@ async fn handle_client(
                 match message? {
                     Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(client) => {
+                            if should_wake_display_for_message(&client) {
+                                maybe_wake_display(&server.display, &mut last_display_wake_at)
+                                    .await;
+                            }
                             apply_client_message(
                                 &server.display,
                                 &sender,
+                                &media,
                                 client,
                                 &mut pressed_keys,
                                 &mut last_key_state_at,
@@ -375,9 +410,39 @@ async fn handle_client(
     Ok(())
 }
 
+fn should_wake_display_for_message(message: &ClientMessage) -> bool {
+    matches!(
+        message,
+        ClientMessage::PointerMove { .. }
+            | ClientMessage::PointerAbsolute { .. }
+            | ClientMessage::PointerButton { .. }
+            | ClientMessage::PointerWheel { .. }
+            | ClientMessage::TouchTap
+            | ClientMessage::Key { .. }
+            | ClientMessage::KeyState { .. }
+            | ClientMessage::TextInput { .. }
+            | ClientMessage::Paste
+            | ClientMessage::PasteClipboard { .. }
+            | ClientMessage::ResetInput
+    )
+}
+
+async fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
+    if let Some(last_wake_at) = last_wake_at {
+        if last_wake_at.elapsed() < DISPLAY_WAKE_INTERVAL {
+            return;
+        }
+    }
+    match wake_display(display).await {
+        Ok(()) => *last_wake_at = Some(Instant::now()),
+        Err(err) => warn!("display wake failed: {err}"),
+    }
+}
+
 async fn apply_client_message(
     display: &str,
     sender: &mpsc::Sender<Message>,
+    media: &MediaHub,
     message: ClientMessage,
     pressed_keys: &mut HashSet<String>,
     last_key_state_at: &mut Option<Instant>,
@@ -460,6 +525,14 @@ async fn apply_client_message(
         ClientMessage::ResetInput => {
             reset_input_state(display, pressed_keys).await?;
             *last_key_state_at = None;
+        }
+        ClientMessage::UpdateStreamSettings {
+            config,
+            audio_config,
+        } => {
+            media
+                .update_stream_settings(config.normalized(), audio_config.normalized())
+                .await?;
         }
         ClientMessage::Ping { seq } => {
             sender
@@ -655,6 +728,55 @@ fn current_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn current_video_state(rx: &watch::Receiver<Option<ActiveVideoState>>) -> Result<ActiveVideoState> {
+    rx.borrow()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("shared video state unavailable"))
+}
+
+fn current_audio_state(
+    rx: Option<&watch::Receiver<Option<ActiveAudioState>>>,
+) -> Option<ActiveAudioState> {
+    rx.and_then(|rx| rx.borrow().clone())
+}
+
+async fn wait_for_audio_state_change(
+    rx: Option<&mut watch::Receiver<Option<ActiveAudioState>>>,
+) -> Result<(), watch::error::RecvError> {
+    match rx {
+        Some(rx) => rx.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn send_hello(
+    sender: &mpsc::Sender<Message>,
+    session_id: Option<&str>,
+    display: Option<&str>,
+    video_state: &ActiveVideoState,
+    audio_state: Option<&ActiveAudioState>,
+    description_b64: Option<String>,
+) -> Result<()> {
+    sender
+        .send(Message::Text(
+            serde_json::to_string(&ServerMessage::Hello {
+                session_id: session_id.unwrap_or_default().into(),
+                server_time_ms: current_ms(),
+                display: display.unwrap_or_default().into(),
+                config: video_state.config.clone(),
+                audio_config: audio_state.map(|state| state.config.clone()),
+                active_encoder: video_state.encoder.ffmpeg_encoder.clone(),
+                encoder_mode: video_state.encoder.mode,
+                codec_string: video_state.config.codec.as_webcodec().into(),
+                description_b64,
+                audio_enabled: audio_state.is_some(),
+            })?
+            .into(),
+        ))
+        .await?;
+    Ok(())
 }
 
 fn rand_id() -> u64 {

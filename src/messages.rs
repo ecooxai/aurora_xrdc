@@ -1,6 +1,6 @@
 use crate::{
     clipboard::ClipboardPayload,
-    settings::{CodecKind, StreamConfig},
+    settings::{AudioStreamConfig, CodecKind, StreamConfig},
 };
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +12,7 @@ pub enum ServerMessage {
         server_time_ms: u64,
         display: String,
         config: StreamConfig,
+        audio_config: Option<AudioStreamConfig>,
         active_encoder: String,
         encoder_mode: &'static str,
         codec_string: String,
@@ -50,18 +51,46 @@ pub enum ServerMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
-    PointerMove { dx: f64, dy: f64 },
-    PointerAbsolute { x: i32, y: i32 },
-    PointerButton { button: u8, down: bool },
-    PointerWheel { delta_y: i32 },
+    PointerMove {
+        dx: f64,
+        dy: f64,
+    },
+    PointerAbsolute {
+        x: i32,
+        y: i32,
+    },
+    PointerButton {
+        button: u8,
+        down: bool,
+    },
+    PointerWheel {
+        delta_y: i32,
+    },
     TouchTap,
-    Key { key: String, down: bool },
-    KeyState { pressed_keys: Vec<String> },
-    TextInput { text: String },
+    Key {
+        key: String,
+        down: bool,
+    },
+    KeyState {
+        pressed_keys: Vec<String>,
+    },
+    TextInput {
+        text: String,
+    },
     Paste,
-    PasteClipboard { payload: ClipboardPayload },
+    PasteClipboard {
+        payload: ClipboardPayload,
+    },
     ResetInput,
-    Ping { seq: u64 },
-    ClipboardSet { payload: ClipboardPayload },
+    UpdateStreamSettings {
+        config: StreamConfig,
+        audio_config: AudioStreamConfig,
+    },
+    Ping {
+        seq: u64,
+    },
+    ClipboardSet {
+        payload: ClipboardPayload,
+    },
     ClipboardGet,
 }

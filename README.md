@@ -6,6 +6,7 @@
 
 - H.264 streaming by default.
 - Best-effort H.265 and VP8 streaming.
+- One shared FFmpeg video capture pipeline for all connected browsers, with shared codec/FPS/bitrate changes.
 - Browser-side pointer, click, wheel, and keyboard input.
 - Remote and local clipboard sync.
 - Browser camera uplink as MP4 chunks, replayed into a server-side virtual camera named `viberdeskcamera`.
@@ -53,6 +54,7 @@ If the host cannot create `/dev/video*` automatically, install `v4l2loopback` an
 Open the server URL in a browser after starting the app. The client supports:
 
 - Selecting codec, bitrate, and FPS.
+- Applying stream setting changes globally across connected clients without spawning another video FFmpeg.
 - Capturing pointer and keyboard input when the canvas is active.
 - Clipboard push/pull through the clipboard cards.
 - `?debug=1` for the debug overlay.

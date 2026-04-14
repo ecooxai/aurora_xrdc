@@ -13,22 +13,18 @@ use crate::{
 pub struct StreamFrame {
     pub bytes: Vec<u8>,
     pub keyframe: bool,
-    pub codec: CodecKind,
     pub description_b64: Option<String>,
     pub sent_at_ms: u64,
 }
 
-#[derive(Debug)]
-pub struct StreamHandle {
-    pub rx: watch::Receiver<Option<StreamFrame>>,
-    pub encoder: EncoderChoice,
-}
-
-pub async fn start(server: ServerConfig, config: StreamConfig) -> Result<(StreamHandle, Child)> {
+pub async fn start(
+    server: ServerConfig,
+    config: StreamConfig,
+    tx: watch::Sender<Option<StreamFrame>>,
+) -> Result<(EncoderChoice, Child)> {
     let encoder = choose_encoder(config.codec, config.encode_preference).await?;
     let mut child = spawn_capture(&server, &config, &encoder)?;
     let mut stdout = child.stdout.take().expect("ffmpeg stdout missing");
-    let (tx, rx) = watch::channel(None);
     tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
         let mut h26x = AnnexBParser::new(config.codec);
@@ -44,20 +40,17 @@ pub async fn start(server: ServerConfig, config: StreamConfig) -> Result<(Stream
                 CodecKind::H264 | CodecKind::H265 => h26x.push(&buf[..read]),
             };
             for frame in frames {
-                if tx.send(Some(pack_frame(config.codec, frame))).is_err() {
-                    return;
-                }
+                tx.send_replace(Some(pack_frame(frame)));
             }
         }
     });
-    Ok((StreamHandle { rx, encoder }, child))
+    Ok((encoder, child))
 }
 
-fn pack_frame(codec: CodecKind, frame: EncodedFrame) -> StreamFrame {
+fn pack_frame(frame: EncodedFrame) -> StreamFrame {
     StreamFrame {
         bytes: frame.data,
         keyframe: frame.keyframe,
-        codec,
         description_b64: frame.description_b64,
         sent_at_ms: now_ms(),
     }

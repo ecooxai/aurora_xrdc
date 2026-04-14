@@ -45,11 +45,63 @@ body {
   display: grid;
   gap: 12px;
 }
-label { display: grid; gap: 8px; color: var(--muted); font-size: 0.95rem; }
+label,
+.field-group {
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+.field-label {
+  color: inherit;
+  font: inherit;
+}
 .field-help {
   color: var(--muted);
   font-size: 0.78rem;
   line-height: 1.35;
+}
+.radio-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.radio-chip {
+  position: relative;
+  flex: 1 1 108px;
+  min-width: 0;
+}
+.radio-chip input {
+  position: absolute;
+  opacity: 0;
+  inset: 0;
+  pointer-events: none;
+}
+.radio-chip-label {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease, transform 120ms ease;
+}
+.radio-chip input:checked + .radio-chip-label {
+  background: rgba(141, 230, 255, 0.14);
+  border-color: rgba(141, 230, 255, 0.28);
+  color: var(--text);
+}
+.radio-chip input:focus-visible + .radio-chip-label {
+  border-color: rgba(141, 230, 255, 0.48);
+  box-shadow: 0 0 0 3px rgba(141, 230, 255, 0.12);
+}
+.radio-chip:hover .radio-chip-label {
+  transform: translateY(-1px);
 }
 .field-help.is-warning {
   color: var(--accent-2);
@@ -555,7 +607,8 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   color: var(--text);
 }
 
-.control-card label {
+.control-card label,
+.control-card .field-group {
   gap: 5px;
   font-size: 0.76rem;
 }

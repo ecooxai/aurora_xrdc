@@ -21,7 +21,7 @@ The project currently supports:
 - The capture pipeline targets X11 via `ffmpeg -f x11grab`.
 - GPU preference currently means NVENC when FFmpeg exposes `h264_nvenc` or `hevc_nvenc`; other systems fall back to CPU encode.
 - H.265 browser support depends heavily on the client browser and OS codec stack.
-- The current server spawns one FFmpeg capture pipeline per connected browser session.
+- The current server keeps one shared FFmpeg video capture pipeline for all browser sessions and reapplies stream setting changes to that shared pipeline.
 
 ## Project structure
 

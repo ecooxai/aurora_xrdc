@@ -1,6 +1,6 @@
 const $ = (id) => document.getElementById(id);
-const AUTH_STORAGE_KEY = "vibe_rdesk.passwd";
 const SETTINGS_STORAGE_KEY = "vibe_rdesk.settings";
+const API_ORIGIN_STORAGE_KEY = "vibe_rdesk.api_origin";
 const TOUCH_LONG_PRESS_MS = 1000;
 const TOUCH_MOVE_CANCEL_PX = 14;
 const DIRECT_TOUCH_SCROLL_MULTIPLIER = 3;
@@ -150,7 +150,10 @@ const state = {
   localClipboardUpdatedAt: 0,
   remoteClipboardUpdatedAt: 0,
   clipboardHistory: [],
-  passwd: "",
+  encoderOptionsByCodec: {},
+  apiOrigin: window.location.origin,
+  authenticated: false,
+  sessionPasswd: "",
   connecting: false,
   remoteScreenWidth: null,
   remoteScreenHeight: null,
@@ -166,6 +169,9 @@ const state = {
   highLatencySinceAt: 0,
   reconnectingForLatency: false,
   appliedStreamSettingsKey: "",
+  pendingStreamSettingsKey: "",
+  lastLocalStreamSettingsAt: 0,
+  statusTimer: null,
   autoDisconnectTimer: null,
   lastAutoDisconnectActivityAt: 0,
 };
@@ -179,6 +185,7 @@ const streamWarning = $("stream-warning");
 const streamWarningText = $("stream-warning-text");
 const authModal = $("auth-modal");
 const authForm = $("auth-form");
+const authOriginInput = $("auth-origin");
 const authInput = $("auth-passwd");
 const authError = $("auth-error");
 const controlPanel = $("control-panel");
@@ -188,7 +195,9 @@ const cameraToggle = $("camera-toggle");
 const mobileKeyboardInput = $("mobile-keyboard-input");
 const encoderStatus = $("encoder-status");
 const codecSelect = $("codec");
+const codecGroup = $("codec-group");
 const encodePreferenceSelect = $("encode-preference");
+const encodePreferenceGroup = $("encode-preference-group");
 const encodePreferenceHelp = $("encode-preference-help");
 const bitrateInput = $("bitrate");
 const bitrateValue = $("bitrate-value");
@@ -275,9 +284,23 @@ const MOBILE_KEYBOARD_SPECIAL_KEYS = new Set([
   "PageDown",
 ]);
 
-function setStatus(text) {
+function clearStatusTimer() {
+  if (!state.statusTimer) return;
+  clearTimeout(state.statusTimer);
+  state.statusTimer = null;
+}
+
+function setStatus(text, { hideAfterMs = 0 } = {}) {
+  clearStatusTimer();
   status.textContent = text;
   status.classList.toggle("hidden", text === "Connected");
+  if (hideAfterMs > 0) {
+    state.statusTimer = setTimeout(() => {
+      state.statusTimer = null;
+      if (status.textContent !== text) return;
+      setStatus(state.socket?.readyState === WebSocket.OPEN ? "Connected" : "Disconnected");
+    }, hideAfterMs);
+  }
 }
 
 function setStreamWarning(message = "") {
@@ -495,18 +518,76 @@ function streamReconnectSettingsKey(settings = readSettingsFromControls()) {
 
 function markAppliedStreamSettings(settings) {
   state.appliedStreamSettingsKey = streamReconnectSettingsKey(settings);
+  if (state.pendingStreamSettingsKey === state.appliedStreamSettingsKey) {
+    state.pendingStreamSettingsKey = "";
+  }
 }
 
-function reconnectForSettings(reason) {
+function syncPendingStreamSettings(settings = readSettingsFromControls()) {
+  const nextKey = streamReconnectSettingsKey(settings);
+  if (state.appliedStreamSettingsKey && nextKey === state.appliedStreamSettingsKey) {
+    state.pendingStreamSettingsKey = "";
+    return;
+  }
+  state.pendingStreamSettingsKey = nextKey;
+  state.lastLocalStreamSettingsAt = performance.now();
+}
+
+function syncServerStreamSettings(streamConfig, audioConfig) {
+  const incoming = normalizeSettings({
+    codec: streamConfig?.codec,
+    encodePreference: streamConfig?.encode_preference,
+    bitrate: streamConfig?.bitrate_kbps,
+    audioBitrateKbps: audioConfig?.bitrate_kbps,
+    fps: streamConfig?.fps,
+  });
+  const current = readSettingsFromControls();
+  const currentKey = streamReconnectSettingsKey(current);
+  const incomingKey = streamReconnectSettingsKey(incoming);
+  if (incomingKey === currentKey) {
+    markAppliedStreamSettings(incoming);
+    return;
+  }
+  const recentlyChangedLocally = state.lastLocalStreamSettingsAt > 0
+    && performance.now() - state.lastLocalStreamSettingsAt < SETTINGS_RECONNECT_DELAY_MS;
+  if (recentlyChangedLocally) {
+    return;
+  }
+  if (state.pendingStreamSettingsKey && incomingKey !== state.pendingStreamSettingsKey) {
+    return;
+  }
+  const next = {
+    ...current,
+    codec: incoming.codec,
+    encodePreference: incoming.encodePreference,
+    bitrate: incoming.bitrate,
+    audioBitrateKbps: incoming.audioBitrateKbps,
+    fps: incoming.fps,
+  };
+  applySettings(next);
+  const applied = readSettingsFromControls();
+  saveSettings(applied);
+  markAppliedStreamSettings(applied);
+}
+
+function pushSharedStreamSettings(reason) {
   if (state.connecting) return;
+  if (state.socket?.readyState !== WebSocket.OPEN) return;
   clearSettingsReconnectTimer();
-  showToast("settings_reconnect", reason);
-  closeConnection({ manual: false, preserveStatus: true });
-  setStatus("Reconnecting...");
-  setTimeout(() => {
-    if (state.connecting) return;
-    void connect();
-  }, 150);
+  const settings = readSettingsFromControls();
+  send({
+    type: "update_stream_settings",
+    config: {
+      codec: settings.codec,
+      encode_preference: settings.encodePreference,
+      bitrate_kbps: settings.bitrate,
+      fps: settings.fps,
+    },
+    audio_config: {
+      bitrate_kbps: settings.audioBitrateKbps,
+    },
+  });
+  setStatus(reason, { hideAfterMs: 3000 });
 }
 
 function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
@@ -517,6 +598,9 @@ function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
   }
   const nextKey = streamReconnectSettingsKey(settings);
   if (!state.appliedStreamSettingsKey || nextKey === state.appliedStreamSettingsKey) {
+    if (nextKey === state.appliedStreamSettingsKey) {
+      state.pendingStreamSettingsKey = "";
+    }
     clearSettingsReconnectTimer();
     return;
   }
@@ -526,7 +610,7 @@ function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
     if (state.socket?.readyState !== WebSocket.OPEN || state.connecting) return;
     const latestSettings = readSettingsFromControls();
     if (streamReconnectSettingsKey(latestSettings) === state.appliedStreamSettingsKey) return;
-    reconnectForSettings("Reconnect to apply stream settings");
+    pushSharedStreamSettings("Applying shared stream settings...");
   }, SETTINGS_RECONNECT_DELAY_MS);
 }
 
@@ -572,19 +656,25 @@ toast.addEventListener("click", async () => {
   }
 });
 
-function loadStoredPassword() {
-  try {
-    return localStorage.getItem(AUTH_STORAGE_KEY) || "";
-  } catch {
-    return "";
-  }
+function apiUrl(path) {
+  return new URL(path, state.apiOrigin || window.location.origin);
 }
 
-function savePassword(passwd) {
+function webSocketUrl(path) {
+  const url = apiUrl(path);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url;
+}
+
+async function probeAuth() {
   try {
-    localStorage.setItem(AUTH_STORAGE_KEY, passwd);
+    const response = await fetch(apiUrl("/api/auth"), {
+      cache: "no-store",
+      credentials: "include",
+    });
+    return response.ok;
   } catch {
-    // Ignore storage failures; the session still works for this visit.
+    return false;
   }
 }
 
@@ -594,6 +684,34 @@ function clampControlValue(control, value, fallback) {
   const min = Number(control.min);
   const max = Number(control.max);
   return Math.min(max, Math.max(min, numeric));
+}
+
+function normalizeApiOrigin(value) {
+  const fallback = window.location.origin;
+  if (typeof value !== "string") return fallback;
+  const trimmed = value.trim();
+  if (!trimmed) return fallback;
+  try {
+    return new URL(trimmed, fallback).origin;
+  } catch {
+    return fallback;
+  }
+}
+
+function loadStoredApiOrigin() {
+  try {
+    return localStorage.getItem(API_ORIGIN_STORAGE_KEY) || window.location.origin;
+  } catch {
+    return window.location.origin;
+  }
+}
+
+function saveApiOrigin(origin) {
+  try {
+    localStorage.setItem(API_ORIGIN_STORAGE_KEY, normalizeApiOrigin(origin));
+  } catch {
+    // Ignore storage failures; the session still works for this visit.
+  }
 }
 
 function normalizeSettings(settings = {}) {
@@ -634,6 +752,48 @@ function normalizeSettings(settings = {}) {
     ),
     viewZoomPercent: clampZoomPercent(settings.viewZoomPercent),
   };
+}
+
+function renderRadioGroupFromSelect(group, selectEl, name) {
+  if (!group || !selectEl) return;
+  const fragment = document.createDocumentFragment();
+  Array.from(selectEl.options).forEach((option, index) => {
+    if (typeof option.value !== "string" || option.value.length === 0) return;
+    const chip = document.createElement("label");
+    chip.className = "radio-chip";
+
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = name;
+    input.id = `${selectEl.id}-radio-${index}`;
+    input.value = option.value;
+    input.checked = option.value === selectEl.value;
+    input.addEventListener("change", () => {
+      if (!input.checked || selectEl.value === input.value) return;
+      selectEl.value = input.value;
+      selectEl.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    const text = document.createElement("span");
+    text.className = "radio-chip-label";
+    text.textContent = option.textContent?.trim() || option.value;
+
+    chip.append(input, text);
+    fragment.appendChild(chip);
+  });
+  group.replaceChildren(fragment);
+}
+
+function renderCodecOptions() {
+  renderRadioGroupFromSelect(codecGroup, codecSelect, "codec-choice");
+}
+
+function renderEncodePreferenceRadioGroup() {
+  renderRadioGroupFromSelect(
+    encodePreferenceGroup,
+    encodePreferenceSelect,
+    "encode-preference-choice",
+  );
 }
 
 function readSettingsFromControls() {
@@ -705,7 +865,8 @@ function renderCameraToggle() {
 function applySettings(settings) {
   const normalized = normalizeSettings(settings);
   codecSelect.value = normalized.codec;
-  renderEncodePreferenceOptions(defaultEncodeOptionsForCodec(normalized.codec), normalized.encodePreference);
+  renderCodecOptions();
+  renderEncodePreferenceOptions(encodeOptionsForCodec(normalized.codec), normalized.encodePreference);
   bitrateInput.value = String(normalized.bitrate);
   audioBitrateSelect.value = String(normalized.audioBitrateKbps);
   micBitrateSelect.value = String(normalized.micBitrateKbps);
@@ -729,6 +890,7 @@ function persistCurrentSettings() {
   const settings = readSettingsFromControls();
   renderSettingsValues(settings);
   syncTouchModeControls(settings);
+  syncPendingStreamSettings(settings);
   saveSettings(settings);
   syncAutoDisconnectTimer(settings);
   maybeScheduleSettingsReconnect(settings);
@@ -759,17 +921,6 @@ function noteAutoDisconnectActivity(message) {
   syncAutoDisconnectTimer();
 }
 
-function getPassword() {
-  return state.passwd || authInput.value.trim();
-}
-
-function authUrl(path) {
-  const url = new URL(path, window.location.href);
-  const passwd = getPassword();
-  if (passwd) url.searchParams.set("passwd", passwd);
-  return url;
-}
-
 function defaultEncodePreferenceForCodec(codec) {
   return codec === "vp8" ? "cpu" : "gpu";
 }
@@ -782,6 +933,13 @@ function defaultEncodeOptionsForCodec(codec) {
   }
   options.push({ value: "cpu", label: "CPU auto" });
   return options;
+}
+
+function encodeOptionsForCodec(codec) {
+  const cached = state.encoderOptionsByCodec?.[codec];
+  return Array.isArray(cached) && cached.length > 0
+    ? cached
+    : defaultEncodeOptionsForCodec(codec);
 }
 
 function normalizeEncodePreferenceForCodec(value, codec) {
@@ -820,6 +978,7 @@ function renderEncodePreferenceOptions(
   const fallbackValue = encodePreferenceSelect.options[0]?.value || defaultEncodePreferenceForCodec(codecSelect.value);
   const nextValue = normalizeEncodePreferenceForCodec(preferredValue, codecSelect.value);
   encodePreferenceSelect.value = allowedValues.has(nextValue) ? nextValue : fallbackValue;
+  renderEncodePreferenceRadioGroup();
   renderEncodePreferenceHelp(fallbackOptions, codecSelect.value);
 }
 
@@ -846,7 +1005,7 @@ function renderEncodePreferenceHelp(options = defaultEncodeOptionsForCodec(codec
     encodePreferenceHelp.classList.remove("is-warning");
     return;
   }
-  if (!getPassword()) {
+  if (!state.authenticated) {
     encodePreferenceHelp.textContent = "Enter the server password to load ffmpeg encoder availability.";
     encodePreferenceHelp.classList.remove("is-warning");
     return;
@@ -861,11 +1020,11 @@ async function refreshEncodePreferenceOptions(
   { silent = false } = {},
 ) {
   let options = defaultEncodeOptionsForCodec(codec);
-  if (getPassword()) {
+  if (state.authenticated) {
     try {
-      const url = authUrl("/api/encoders");
+      const url = apiUrl("/api/encoders");
       url.searchParams.set("codec", codec);
-      const response = await fetch(url, { cache: "no-store" });
+      const response = await fetch(url, { cache: "no-store", credentials: "include" });
       if (!response.ok) {
         throw new Error(await response.text().catch(() => "Failed to load encoders"));
       }
@@ -879,6 +1038,7 @@ async function refreshEncodePreferenceOptions(
       }
     }
   }
+  state.encoderOptionsByCodec[codec] = options;
   renderEncodePreferenceOptions(options, preferredValue);
 }
 
@@ -886,16 +1046,10 @@ async function handleCodecSettingChange() {
   const preferredValue = encodePreferenceSelect.value;
   await refreshEncodePreferenceOptions(codecSelect.value, preferredValue, { silent: true });
   persistCurrentSettings();
-  if (state.socket?.readyState === WebSocket.OPEN && !state.connecting && !state.reconnectingForLatency) {
-    reconnectForSettings("Reconnect to apply stream settings");
-  }
 }
 
 function handleEncoderSettingChange() {
   persistCurrentSettings();
-  if (state.socket?.readyState === WebSocket.OPEN && !state.connecting && !state.reconnectingForLatency) {
-    reconnectForSettings("Reconnect to apply stream settings");
-  }
 }
 
 async function getVideoCodecSupport(codec) {
@@ -987,9 +1141,15 @@ function clearAuthPrompt() {
 }
 
 async function verifyPassword(passwd) {
-  const url = new URL("/api/auth", window.location.href);
-  url.searchParams.set("passwd", passwd);
-  const response = await fetch(url, { cache: "no-store" });
+  const response = await fetch(apiUrl("/api/auth"), {
+    cache: "no-store",
+    credentials: "include",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ passwd }),
+  });
   if (!response.ok) {
     const message = await response.text().catch(() => "");
     throw new Error(message || "Authentication failed");
@@ -997,7 +1157,10 @@ async function verifyPassword(passwd) {
 }
 
 async function loadClipboardHistory() {
-  const response = await fetch(authUrl("/api/clipboard/history"), { cache: "no-store" });
+  const response = await fetch(apiUrl("/api/clipboard/history"), {
+    cache: "no-store",
+    credentials: "include",
+  });
   if (!response.ok) {
     throw new Error(await response.text().catch(() => "Failed to load clipboard history"));
   }
@@ -1006,8 +1169,9 @@ async function loadClipboardHistory() {
 }
 
 async function saveClipboardHistory() {
-  const response = await fetch(authUrl("/api/clipboard/history"), {
+  const response = await fetch(apiUrl("/api/clipboard/history"), {
     method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(state.clipboardHistory),
   });
@@ -1016,23 +1180,34 @@ async function saveClipboardHistory() {
   }
 }
 
+function isAuthFailureMessage(message) {
+  if (typeof message !== "string") return false;
+  const lower = message.toLowerCase();
+  return lower.includes("authentication required")
+    || lower.includes("invalid or missing passwd")
+    || lower.includes("authentication failed");
+}
+
 async function connect() {
   if (state.connecting) return;
-  const passwd = authInput.value.trim();
-  if (!passwd) {
+  state.apiOrigin = normalizeApiOrigin(authOriginInput.value || state.apiOrigin);
+  saveApiOrigin(state.apiOrigin);
+  const needsLogin = !state.authenticated;
+  const passwd = authInput.value.trim() || state.sessionPasswd;
+  if (needsLogin && !passwd) {
     setAuthPrompt("Enter the server password.");
     return;
   }
   state.connecting = true;
   try {
-    setStatus("Authenticating...");
-    await verifyPassword(passwd);
-    savePassword(passwd);
-    state.passwd = passwd;
-    clearAuthPrompt();
-    await refreshEncodePreferenceOptions(codecSelect.value, loadStoredSettings().encodePreference, { silent: true });
+    if (needsLogin) {
+      setStatus("Authenticating...");
+      await verifyPassword(passwd);
+      state.authenticated = true;
+      state.sessionPasswd = passwd;
+      clearAuthPrompt();
+    }
     closeConnection({ manual: false, preserveStatus: true });
-    await loadClipboardHistory();
     state.manualDisconnect = false;
     clearTimeout(state.reconnectTimer);
     void primeAudioPlayback();
@@ -1043,7 +1218,6 @@ async function connect() {
       audioBitrateKbps,
       fps,
     } = readSettingsFromControls();
-    const requestedStreamSettings = { codec, encodePreference, bitrate, audioBitrateKbps, fps };
     const videoCodecSupport = await getVideoCodecSupport(codec);
     if (!videoCodecSupport.supported) {
       setStatus("Disconnected");
@@ -1060,25 +1234,34 @@ async function connect() {
     state.netWindowBytes = 0;
     state.netKbps = 0;
     state.lastNetAt = performance.now();
-    const url = new URL("/ws", window.location.href);
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    const url = webSocketUrl("/ws");
     url.searchParams.set("codec", codec);
     url.searchParams.set("encode_preference", encodePreference);
     url.searchParams.set("bitrate_kbps", bitrate);
     url.searchParams.set("audio_bitrate_kbps", audioBitrateKbps);
     url.searchParams.set("fps", fps);
-    url.searchParams.set("passwd", passwd);
+    if (state.sessionPasswd) {
+      url.searchParams.set("passwd", state.sessionPasswd);
+    }
     setStatus("Connecting...");
     setEncoderStatus("Connecting...");
     state.socket = new WebSocket(url);
     state.socket.binaryType = "arraybuffer";
     state.socket.onopen = () => {
-      markAppliedStreamSettings(requestedStreamSettings);
+      state.appliedStreamSettingsKey = "";
       state.reconnectAttempt = 0;
       state.reconnectingForLatency = false;
       state.highLatencySinceAt = 0;
       setStreamWarning("");
       setStatus("Connected");
+      void refreshEncodePreferenceOptions(
+        codecSelect.value,
+        loadStoredSettings().encodePreference,
+        { silent: true },
+      );
+      void loadClipboardHistory().catch((error) => {
+        showToast("history_load_failed", error.message || String(error));
+      });
       startKeyStateSync();
       startPing();
       startRemoteClipboardPolling();
@@ -1089,11 +1272,14 @@ async function connect() {
       }
       maybeScheduleSettingsReconnect();
     };
-    state.socket.onclose = () => {
+    state.socket.onclose = (event) => {
       setStatus("Disconnected");
       stopKeyStateSync();
       clearInterval(startPing.timer);
       stopRemoteClipboardPolling();
+      if (!state.manualDisconnect && event.code && event.code !== 1000) {
+        showToast("ws_closed", `WebSocket closed (${event.code})`);
+      }
       if (!state.manualDisconnect) scheduleReconnect();
     };
     state.socket.onerror = () => showToast("ws_error", "WebSocket error");
@@ -1105,8 +1291,15 @@ async function connect() {
       }
     };
   } catch (error) {
-    showToast("auth_failed", error.message || String(error));
-    setAuthPrompt(error.message || "Authentication failed");
+    const message = error.message || String(error);
+    if (needsLogin || isAuthFailureMessage(message)) {
+      state.authenticated = false;
+      showToast("auth_failed", message);
+      setAuthPrompt(message || "Authentication failed");
+    } else {
+      showToast("connect_failed", message);
+      if (!state.manualDisconnect) scheduleReconnect();
+    }
     setStatus(state.socket?.readyState === WebSocket.OPEN ? "Connected" : "Disconnected");
   } finally {
     state.connecting = false;
@@ -1232,6 +1425,9 @@ function handleServerMessage(message) {
     updateServerClockOffset(message.server_time_ms);
     if (message.session_id) {
       state.sessionId = message.session_id;
+    }
+    if (message.config) {
+      syncServerStreamSettings(message.config, message.audio_config);
     }
     const codecStringChanged = typeof message.codec_string === "string"
       && message.codec_string !== state.codecString;
@@ -2054,8 +2250,9 @@ async function uploadCameraChunk(blob, seq) {
   formData.append("session_id", state.sessionId);
   formData.append("seq", String(seq));
   formData.append("file", blob, `camera_${seq}.mp4`);
-  const response = await fetch(authUrl("/api/camera/chunk"), {
+  const response = await fetch(apiUrl("/api/camera/chunk"), {
     method: "POST",
+    credentials: "include",
     body: formData,
   });
   if (!response.ok) {
@@ -2101,8 +2298,9 @@ function queueCameraChunkUpload(blob) {
 
 async function notifyCameraStop() {
   if (!state.sessionId) return;
-  const response = await fetch(authUrl("/api/camera/stop"), {
+  const response = await fetch(apiUrl("/api/camera/stop"), {
     method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: state.sessionId }),
   });
@@ -2999,7 +3197,7 @@ function pushClipboardHistory(side, payload) {
     state.clipboardHistory.length = CLIPBOARD_HISTORY_LIMIT;
   }
   renderClipboardHistory();
-  if (!state.passwd) {
+  if (!state.authenticated) {
     return;
   }
   void saveClipboardHistory().catch((error) => {
@@ -3149,7 +3347,11 @@ async function uploadSelectedFile() {
   formData.append("file", file, file.name);
   try {
     setStatus("Uploading...");
-    const response = await fetch(authUrl("/api/upload"), { method: "POST", body: formData });
+    const response = await fetch(apiUrl("/api/upload"), {
+      method: "POST",
+      credentials: "include",
+      body: formData,
+    });
     if (!response.ok) {
       throw new Error(await response.text());
     }
@@ -3192,14 +3394,26 @@ function initControls() {
     event.preventDefault();
     void connect();
   });
+  authOriginInput.addEventListener("input", () => {
+    state.apiOrigin = normalizeApiOrigin(authOriginInput.value);
+    saveApiOrigin(state.apiOrigin);
+    authError.textContent = "";
+    authError.classList.add("hidden");
+  });
   authInput.addEventListener("input", () => {
     authError.textContent = "";
     authError.classList.add("hidden");
   });
+  renderCodecOptions();
+  renderEncodePreferenceRadioGroup();
   codecSelect.addEventListener("change", () => {
+    renderCodecOptions();
     void handleCodecSettingChange();
   });
-  encodePreferenceSelect.addEventListener("change", handleEncoderSettingChange);
+  encodePreferenceSelect.addEventListener("change", () => {
+    renderEncodePreferenceRadioGroup();
+    handleEncoderSettingChange();
+  });
   bitrateInput.addEventListener("input", persistCurrentSettings);
   bitrateInput.addEventListener("change", persistCurrentSettings);
   audioBitrateSelect.addEventListener("change", persistCurrentSettings);
@@ -3440,15 +3654,22 @@ applyCanvasZoom();
 resetStatusMetrics();
 initControls();
 void removeServiceWorker();
-state.passwd = loadStoredPassword();
-authInput.value = state.passwd;
 renderMicToggle();
 renderCameraToggle();
 setInterval(renderAudioBufferMetric, 500);
 setInterval(monitorConnectionHealth, HEALTH_WATCHDOG_INTERVAL_MS);
-if (state.passwd) {
-  clearAuthPrompt();
-  void connect();
-} else {
-  setAuthPrompt();
+state.apiOrigin = loadStoredApiOrigin();
+authOriginInput.value = state.apiOrigin;
+authInput.value = "";
+
+async function bootstrapAuth() {
+  state.authenticated = await probeAuth();
+  if (state.authenticated) {
+    clearAuthPrompt();
+    void connect();
+  } else {
+    setAuthPrompt();
+  }
 }
+
+void bootstrapAuth();

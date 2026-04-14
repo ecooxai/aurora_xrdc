@@ -7,18 +7,13 @@ use crate::{
     settings::{AudioStreamConfig, ServerConfig},
 };
 
-#[derive(Debug)]
-pub struct AudioStreamHandle {
-    pub tx: broadcast::Sender<AudioFrame>,
-}
-
 pub async fn start(
     server: &ServerConfig,
     config: &AudioStreamConfig,
-) -> Result<(AudioStreamHandle, Child)> {
+    tx: broadcast::Sender<AudioFrame>,
+) -> Result<Child> {
     let mut child = spawn_audio_capture(server, config).await?;
     let mut stdout = child.stdout.take().expect("ffmpeg audio stdout missing");
-    let (tx, _) = broadcast::channel(256);
     let stream_tx = tx.clone();
     tokio::spawn(async move {
         let mut parser = AdtsParser::new();
@@ -34,5 +29,5 @@ pub async fn start(
             }
         }
     });
-    Ok((AudioStreamHandle { tx }, child))
+    Ok(child)
 }

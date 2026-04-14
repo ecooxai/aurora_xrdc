@@ -714,6 +714,30 @@ where
     }
 }
 
+pub async fn wake_display(display: &str) -> Result<()> {
+    run_xset(display, ["s", "reset"]).await?;
+    run_xset(display, ["dpms", "force", "on"]).await?;
+    Ok(())
+}
+
+async fn run_xset<I, S>(display: &str, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let status = Command::new("xset")
+        .env("DISPLAY", display)
+        .args(args)
+        .status()
+        .await
+        .context("failed to run xset")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("xset exited with {}", status))
+    }
+}
+
 pub async fn read_stderr(child: &mut tokio::process::Child) -> String {
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
