@@ -175,6 +175,12 @@ fn default_encoder_options(codec: CodecKind) -> Vec<AvailableEncoderOption> {
     let mut options = Vec::new();
     if codec != CodecKind::Vp8 {
         options.push(AvailableEncoderOption {
+            value: EncodePreference::Nvidia,
+            label: "NVIDIA auto".into(),
+            mode: "gpu",
+            ffmpeg_encoder: None,
+        });
+        options.push(AvailableEncoderOption {
             value: EncodePreference::Gpu,
             label: "GPU auto".into(),
             mode: "gpu",
@@ -209,8 +215,10 @@ fn preferred_encoders(
     }
 
     match (codec, encode_preference) {
+        (CodecKind::H264, EncodePreference::Nvidia) => H264_GPU_ENCODERS.to_vec(),
         (CodecKind::H264, EncodePreference::Gpu) => H264_GPU_ENCODERS.to_vec(),
         (CodecKind::H264, EncodePreference::Cpu) => H264_CPU_ENCODERS.to_vec(),
+        (CodecKind::H265, EncodePreference::Nvidia) => H265_GPU_ENCODERS.to_vec(),
         (CodecKind::H265, EncodePreference::Gpu) => H265_GPU_ENCODERS.to_vec(),
         (CodecKind::H265, EncodePreference::Cpu) => H265_CPU_ENCODERS.to_vec(),
         (CodecKind::Vp8, _) => VP8_ENCODERS.to_vec(),
@@ -412,16 +420,6 @@ fn append_gop_args(cmd: &mut Command, gop: &str, backend: EncoderBackend) {
 
 fn append_encoder_specific_args(cmd: &mut Command, encoder: &str) {
     match encoder {
-        "libx264" => {
-            cmd.args([
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-x264-params",
-                "repeat-headers=1:aud=1",
-            ]);
-        }
         "h264_nvenc" | "hevc_nvenc" => {
             cmd.args([
                 "-preset",
@@ -436,6 +434,16 @@ fn append_encoder_specific_args(cmd: &mut Command, encoder: &str) {
                 "1",
                 "-aud",
                 "1",
+            ]);
+        }
+        "libx264" => {
+            cmd.args([
+                "-preset",
+                "ultrafast",
+                "-tune",
+                "zerolatency",
+                "-x264-params",
+                "repeat-headers=1:aud=1",
             ]);
         }
         "libx265" => {
@@ -996,6 +1004,20 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].ffmpeg_encoder, "libx264");
         assert_eq!(candidates[0].mode, "cpu");
+    }
+
+    #[test]
+    fn nvidia_preference_uses_nvenc_for_h264() {
+        let candidates = super::preferred_encoders(CodecKind::H264, EncodePreference::Nvidia);
+        assert_eq!(candidates[0].ffmpeg_encoder, "h264_nvenc");
+        assert!(candidates.len() > 1);
+    }
+
+    #[test]
+    fn nvidia_preference_uses_nvenc_for_h265() {
+        let candidates = super::preferred_encoders(CodecKind::H265, EncodePreference::Nvidia);
+        assert_eq!(candidates[0].ffmpeg_encoder, "hevc_nvenc");
+        assert!(candidates.len() > 1);
     }
 
     #[test]

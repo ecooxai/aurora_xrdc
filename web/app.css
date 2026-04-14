@@ -46,6 +46,14 @@ body {
   gap: 12px;
 }
 label { display: grid; gap: 8px; color: var(--muted); font-size: 0.95rem; }
+.field-help {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+.field-help.is-warning {
+  color: var(--accent-2);
+}
 .range-meta {
   display: flex;
   align-items: center;

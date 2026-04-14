@@ -140,11 +140,13 @@
                       <option value="vp8">VP8</option>
                     </select>
                   </label>
-                  <label>Encoder
+                  <label>Encoder preference
                     <select id="encode-preference">
+                      <option value="nvidia">NVIDIA auto</option>
                       <option value="gpu" selected>GPU auto</option>
                       <option value="cpu">CPU auto</option>
                     </select>
+                    <span id="encode-preference-help" class="field-help">Loading encoder availability...</span>
                   </label>
                   <label>Bitrate
                     <input id="bitrate" type="range" min="128" max="12000" step="32" value="4000" />

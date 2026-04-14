@@ -16,6 +16,8 @@ pub enum EncodePreference {
     #[default]
     Gpu,
     Cpu,
+    #[serde(rename = "nvidia")]
+    Nvidia,
     #[serde(rename = "h264_nvenc")]
     H264Nvenc,
     #[serde(rename = "h264_qsv")]
@@ -42,6 +44,7 @@ impl EncodePreference {
             CodecKind::H264 => match self {
                 Self::Gpu
                 | Self::Cpu
+                | Self::Nvidia
                 | Self::H264Nvenc
                 | Self::H264Qsv
                 | Self::H264Vaapi
@@ -52,6 +55,7 @@ impl EncodePreference {
             CodecKind::H265 => match self {
                 Self::Gpu
                 | Self::Cpu
+                | Self::Nvidia
                 | Self::HevcNvenc
                 | Self::HevcQsv
                 | Self::HevcVaapi
@@ -151,7 +155,7 @@ impl ServerConfig {
         Self {
             bind: bind
                 .and_then(|value| value.into_string().ok())
-                .unwrap_or_else(|| "0.0.0.0:8001".into()),
+                .unwrap_or_else(|| default_bind(8001)),
             display: display
                 .and_then(|value| value.into_string().ok())
                 .unwrap_or_else(|| ":0.0".into()),
@@ -237,10 +241,30 @@ fn parse_port(value: &str) -> Result<u16> {
 }
 
 fn bind_with_port(bind: &str, port: u16) -> String {
-    match bind.rsplit_once(':') {
-        Some((host, _)) if !host.is_empty() => format!("{host}:{port}"),
-        _ => format!("0.0.0.0:{port}"),
+    let binds = split_bind_list(bind);
+    if binds.is_empty() {
+        return default_bind(port);
     }
+
+    binds
+        .into_iter()
+        .map(|bind| match bind.rsplit_once(':') {
+            Some((host, _)) if !host.is_empty() => format!("{host}:{port}"),
+            _ => format!("0.0.0.0:{port}"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn default_bind(port: u16) -> String {
+    format!("0.0.0.0:{port},[::]:{port}")
+}
+
+fn split_bind_list(bind: &str) -> Vec<&str> {
+    bind.split(',')
+        .map(str::trim)
+        .filter(|bind| !bind.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -282,6 +306,30 @@ mod tests {
     }
 
     #[test]
+    fn nvidia_preference_is_preserved_for_supported_codecs() {
+        let cfg = StreamConfig {
+            codec: CodecKind::H264,
+            bitrate_kbps: 4_000,
+            fps: 16,
+            encode_preference: EncodePreference::Nvidia,
+        }
+        .normalized();
+        assert_eq!(cfg.encode_preference, EncodePreference::Nvidia);
+    }
+
+    #[test]
+    fn nvidia_preference_falls_back_for_vp8() {
+        let cfg = StreamConfig {
+            codec: CodecKind::Vp8,
+            bitrate_kbps: 4_000,
+            fps: 16,
+            encode_preference: EncodePreference::Nvidia,
+        }
+        .normalized();
+        assert_eq!(cfg.encode_preference, EncodePreference::Cpu);
+    }
+
+    #[test]
     fn audio_stream_config_clamps_values() {
         let cfg = AudioStreamConfig { bitrate_kbps: 999 }.normalized();
         assert_eq!(cfg.bitrate_kbps, 320);
@@ -297,7 +345,7 @@ mod tests {
             None,
             Some(PathBuf::from("/tmp/vibe-rdesk-home")),
         );
-        assert_eq!(cfg.bind, "0.0.0.0:8001");
+        assert_eq!(cfg.bind, "0.0.0.0:8001,[::]:8001");
         assert_eq!(cfg.display, ":0.0");
         assert_eq!(cfg.upload_dir, "/tmp/vibe-rdesk-home/Desktop");
         assert!(cfg.passwd.is_empty());
@@ -310,7 +358,7 @@ mod tests {
             ServerConfig::from_env_with(None, None, None, None),
         )
         .unwrap();
-        assert_eq!(cfg.bind, "0.0.0.0:9000");
+        assert_eq!(cfg.bind, "0.0.0.0:9000,[::]:9000");
         assert_eq!(cfg.passwd, "secret");
     }
 
@@ -326,9 +374,10 @@ mod tests {
 
     #[test]
     fn server_config_keeps_host_when_port_overridden() {
-        let mut cfg = ServerConfig::from_env_with(Some("127.0.0.1:3000".into()), None, None, None);
+        let mut cfg =
+            ServerConfig::from_env_with(Some("127.0.0.1:3000,[::1]:3000".into()), None, None, None);
         cfg.bind = super::bind_with_port(&cfg.bind, 8001);
-        assert_eq!(cfg.bind, "127.0.0.1:8001");
+        assert_eq!(cfg.bind, "127.0.0.1:8001,[::1]:8001");
     }
 
     #[test]

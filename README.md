@@ -27,7 +27,7 @@
 cargo run -- --passwd <password>
 ```
 
-The server listens on `0.0.0.0:8001` by default.
+The server listens on `0.0.0.0:8001` and `[::]:8001` by default.
 
 ## Configuration
 
@@ -38,7 +38,7 @@ The server listens on `0.0.0.0:8001` by default.
 
 ### Environment variables
 
-- `VIBE_RDESK_BIND`: bind address, defaults to `0.0.0.0:8001`.
+- `VIBE_RDESK_BIND`: bind address list, defaults to `0.0.0.0:8001,[::]:8001`.
 - `DISPLAY`: X11 display, defaults to `:0.0`.
 - `VIBE_RDESK_UPLOAD_DIR`: upload directory, defaults to `~/Desktop`. A leading `~/` is expanded against the server user's home directory.
 

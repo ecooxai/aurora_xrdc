@@ -49,6 +49,7 @@ const SETTINGS_RECONNECT_DELAY_MS = 3000;
 const KNOWN_ENCODE_PREFERENCE_VALUES = new Set([
   "gpu",
   "cpu",
+  "nvidia",
   "h264_nvenc",
   "h264_qsv",
   "h264_vaapi",
@@ -188,6 +189,7 @@ const mobileKeyboardInput = $("mobile-keyboard-input");
 const encoderStatus = $("encoder-status");
 const codecSelect = $("codec");
 const encodePreferenceSelect = $("encode-preference");
+const encodePreferenceHelp = $("encode-preference-help");
 const bitrateInput = $("bitrate");
 const bitrateValue = $("bitrate-value");
 const audioBitrateSelect = $("audio-bitrate");
@@ -775,6 +777,7 @@ function defaultEncodePreferenceForCodec(codec) {
 function defaultEncodeOptionsForCodec(codec) {
   const options = [];
   if (codec !== "vp8") {
+    options.push({ value: "nvidia", label: "NVIDIA auto" });
     options.push({ value: "gpu", label: "GPU auto" });
   }
   options.push({ value: "cpu", label: "CPU auto" });
@@ -787,9 +790,9 @@ function normalizeEncodePreferenceForCodec(value, codec) {
     : defaultEncodePreferenceForCodec(codec);
   const allowedValues = new Set(
     codec === "h264"
-      ? ["gpu", "cpu", "h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
+      ? ["nvidia", "gpu", "cpu", "h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
       : codec === "h265"
-        ? ["gpu", "cpu", "hevc_nvenc", "hevc_qsv", "hevc_vaapi", "libx265"]
+        ? ["nvidia", "gpu", "cpu", "hevc_nvenc", "hevc_qsv", "hevc_vaapi", "libx265"]
         : ["cpu", "libvpx"],
   );
   if (allowedValues.has(preferred)) return preferred;
@@ -817,6 +820,39 @@ function renderEncodePreferenceOptions(
   const fallbackValue = encodePreferenceSelect.options[0]?.value || defaultEncodePreferenceForCodec(codecSelect.value);
   const nextValue = normalizeEncodePreferenceForCodec(preferredValue, codecSelect.value);
   encodePreferenceSelect.value = allowedValues.has(nextValue) ? nextValue : fallbackValue;
+  renderEncodePreferenceHelp(fallbackOptions, codecSelect.value);
+}
+
+function renderEncodePreferenceHelp(options = defaultEncodeOptionsForCodec(codecSelect.value), codec = codecSelect.value) {
+  if (!encodePreferenceHelp) return;
+  const exactEncoders = Array.isArray(options)
+    ? options
+        .map((option) => option?.ffmpeg_encoder)
+        .filter((encoder) => typeof encoder === "string" && encoder.length > 0)
+    : [];
+  const nvidiaEncoders = exactEncoders.filter((encoder) => encoder.includes("nvenc"));
+  if (nvidiaEncoders.length > 0) {
+    encodePreferenceHelp.textContent = `Detected NVIDIA encoder${nvidiaEncoders.length > 1 ? "s" : ""}: ${nvidiaEncoders.join(", ")}.`;
+    encodePreferenceHelp.classList.remove("is-warning");
+    return;
+  }
+  if (exactEncoders.length > 0) {
+    encodePreferenceHelp.textContent = `Detected ffmpeg encoders: ${exactEncoders.join(", ")}.`;
+    encodePreferenceHelp.classList.remove("is-warning");
+    return;
+  }
+  if (codec === "vp8") {
+    encodePreferenceHelp.textContent = "VP8 uses libvpx on this host.";
+    encodePreferenceHelp.classList.remove("is-warning");
+    return;
+  }
+  if (!getPassword()) {
+    encodePreferenceHelp.textContent = "Enter the server password to load ffmpeg encoder availability.";
+    encodePreferenceHelp.classList.remove("is-warning");
+    return;
+  }
+  encodePreferenceHelp.textContent = "No exact GPU encoder detected; auto mode will fall back to CPU or other available backends.";
+  encodePreferenceHelp.classList.add("is-warning");
 }
 
 async function refreshEncodePreferenceOptions(

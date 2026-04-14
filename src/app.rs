@@ -6,8 +6,12 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    future::IntoFuture,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -178,10 +182,44 @@ pub async fn run(server: ServerConfig) -> Result<()> {
             camera,
             media,
         }));
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    info!("listening on http://{bind}");
-    axum::serve(listener, app).await?;
+    let listeners = bind
+        .split(',')
+        .map(str::trim)
+        .filter(|bind| !bind.is_empty())
+        .map(bind_listener)
+        .collect::<Result<Vec<_>>>()?;
+    let listen_urls = listeners
+        .iter()
+        .map(|listener| listener.local_addr().map(|addr| format!("http://{addr}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    info!("listening on {}", listen_urls.join(", "));
+    try_join_all(
+        listeners
+            .into_iter()
+            .map(|listener| axum::serve(listener, app.clone()).into_future()),
+    )
+    .await?;
     Ok(())
+}
+
+fn bind_listener(bind: &str) -> Result<tokio::net::TcpListener> {
+    let addr: SocketAddr = bind.parse()?;
+    let socket = match addr {
+        SocketAddr::V4(_) => Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?,
+        SocketAddr::V6(_) => {
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_only_v6(true)?;
+            socket
+        }
+    };
+
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+
+    let listener = std::net::TcpListener::from(socket);
+    listener.set_nonblocking(true)?;
+    Ok(tokio::net::TcpListener::from_std(listener)?)
 }
 
 async fn index() -> impl IntoResponse {
@@ -264,7 +302,7 @@ async fn ws(
         )
         .await
         {
-            let _ = err;
+            warn!(error = %err, "websocket session ended with an error");
         }
     })
 }
