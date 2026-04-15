@@ -232,6 +232,11 @@ struct EncodersQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct CodecsQuery {
+    passwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct WsQuery {
     codec: Option<CodecKind>,
     bitrate_kbps: Option<u32>,
@@ -266,6 +271,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/video_renderer_worker.js", get(video_renderer_worker_js))
         .route("/healthz", get(healthz))
         .route("/api/auth", get(auth_check).post(auth_login))
+        .route("/api/codecs", get(codecs))
         .route("/api/encoders", get(encoders))
         .route("/ws", get(ws))
         .route("/api/upload", post(upload))
@@ -422,6 +428,11 @@ struct EncodersResponse {
     options: Vec<ffmpeg::AvailableEncoderOption>,
 }
 
+#[derive(Debug, Serialize)]
+struct CodecsResponse {
+    options: Vec<ffmpeg::AvailableCodecOption>,
+}
+
 async fn encoders(
     headers: HeaderMap,
     Query(query): Query<EncodersQuery>,
@@ -441,6 +452,26 @@ async fn encoders(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     Ok(Json(EncodersResponse { options }))
+}
+
+async fn codecs(
+    headers: HeaderMap,
+    Query(query): Query<CodecsQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CodecsResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
+    state
+        .auth
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
+        .await?;
+    let options = ffmpeg::available_codec_options()
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    Ok(Json(CodecsResponse { options }))
 }
 
 async fn ws(

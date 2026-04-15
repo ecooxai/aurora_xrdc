@@ -48,6 +48,13 @@ const AUDIO_DRIFT_INTEGRAL_MAX = 0.03;
 const AUTO_DISCONNECT_DISABLED_MINUTES = 0;
 const AUTO_DISCONNECT_ACTIVITY_REFRESH_MS = 1000;
 const SETTINGS_RECONNECT_DELAY_MS = 3000;
+const DEFAULT_CODEC_OPTIONS = [
+  { value: "h264", label: "H.264" },
+  { value: "h265", label: "H.265" },
+  { value: "vp8", label: "VP8" },
+  { value: "vp9", label: "VP9" },
+  { value: "av1", label: "AV1" },
+];
 const KNOWN_ENCODE_PREFERENCE_VALUES = new Set([
   "gpu",
   "cpu",
@@ -61,8 +68,24 @@ const KNOWN_ENCODE_PREFERENCE_VALUES = new Set([
   "hevc_vaapi",
   "libx265",
   "libvpx",
+  "vp9_qsv",
+  "vp9_vaapi",
+  "libvpx-vp9",
+  "av1_nvenc",
+  "av1_qsv",
+  "av1_vaapi",
+  "libsvtav1",
+  "libaom-av1",
 ]);
-const CPU_ENCODE_PREFERENCE_VALUES = new Set(["cpu", "libx264", "libx265", "libvpx"]);
+const CPU_ENCODE_PREFERENCE_VALUES = new Set([
+  "cpu",
+  "libx264",
+  "libx265",
+  "libvpx",
+  "libvpx-vp9",
+  "libsvtav1",
+  "libaom-av1",
+]);
 const AUTO_DISCONNECT_ACTIVITY_MESSAGE_TYPES = new Set([
   "key",
   "key_state",
@@ -275,6 +298,8 @@ const VIDEO_CODEC_STRINGS = {
   h264: "avc1.64001f",
   h265: "hvc1.1.6.L93.B0",
   vp8: "vp8",
+  vp9: "vp09.00.10.08",
+  av1: "av01.0.08M.08",
 };
 const MOBILE_KEYBOARD_SPECIAL_KEYS = new Set([
   "Backspace",
@@ -750,6 +775,7 @@ function normalizeSettings(settings = {}) {
   const allowedAudioBitrates = new Set(Array.from(audioBitrateSelect.options, (option) => Number(option.value)));
   const allowedMicBitrates = new Set(Array.from(micBitrateSelect.options, (option) => Number(option.value)));
   const allowedTouchModes = new Set(Array.from(touchModeSelect.options, (option) => option.value));
+  const defaultCodec = codecSelect.options[0]?.value || "h264";
   const defaultBitrate = Number(bitrateInput.value);
   const defaultAudioBitrate = Number(audioBitrateSelect.value);
   const defaultMicBitrate = Number(micBitrateSelect.value);
@@ -757,7 +783,7 @@ function normalizeSettings(settings = {}) {
   const defaultScrollSpeed = Number(scrollSpeedInput.value);
   const defaultAudioClockRate = Number(audioClockRateInput.value);
   const defaultAutoDisconnectMinutes = Number(autoDisconnectMinutesInput.value);
-  const codec = allowedCodecs.has(settings.codec) ? settings.codec : codecSelect.value;
+  const codec = allowedCodecs.has(settings.codec) ? settings.codec : defaultCodec;
   return {
     codec,
     encodePreference: normalizeEncodePreferenceForCodec(settings.encodePreference, codec),
@@ -783,6 +809,36 @@ function normalizeSettings(settings = {}) {
     ),
     viewZoomPercent: clampZoomPercent(settings.viewZoomPercent),
   };
+}
+
+function normalizeCodecOptions(options = DEFAULT_CODEC_OPTIONS) {
+  const normalized = [];
+  const seen = new Set();
+  for (const option of options) {
+    if (typeof option?.value !== "string" || option.value.length === 0 || seen.has(option.value)) continue;
+    seen.add(option.value);
+    normalized.push({
+      value: option.value,
+      label: typeof option?.label === "string" && option.label.length > 0 ? option.label : option.value.toUpperCase(),
+    });
+  }
+  return normalized.length > 0 ? normalized : DEFAULT_CODEC_OPTIONS;
+}
+
+function setCodecOptions(options = DEFAULT_CODEC_OPTIONS, preferredValue = codecSelect.value) {
+  const nextOptions = normalizeCodecOptions(options);
+  codecSelect.replaceChildren();
+  for (const option of nextOptions) {
+    const element = document.createElement("option");
+    element.value = option.value;
+    element.textContent = option.label;
+    codecSelect.appendChild(element);
+  }
+  const allowedValues = new Set(Array.from(codecSelect.options, (option) => option.value));
+  codecSelect.value = allowedValues.has(preferredValue)
+    ? preferredValue
+    : (codecSelect.options[0]?.value || "h264");
+  renderCodecOptions();
 }
 
 function renderRadioGroupFromSelect(group, selectEl, name) {
@@ -917,14 +973,19 @@ function applySettings(settings) {
   applyCanvasZoom();
 }
 
-function persistCurrentSettings() {
-  const settings = readSettingsFromControls();
+function persistResolvedSettings(settings, { scheduleReconnect = true } = {}) {
   renderSettingsValues(settings);
   syncTouchModeControls(settings);
   syncPendingStreamSettings(settings);
   saveSettings(settings);
   syncAutoDisconnectTimer(settings);
-  maybeScheduleSettingsReconnect(settings);
+  if (scheduleReconnect) {
+    maybeScheduleSettingsReconnect(settings);
+  }
+}
+
+function persistCurrentSettings() {
+  persistResolvedSettings(readSettingsFromControls());
 }
 
 function clearAutoDisconnectTimer() {
@@ -955,6 +1016,8 @@ function noteAutoDisconnectActivity(message) {
 function defaultEncodePreferenceForCodec(codec) {
   if (codec === "h265") return "libx265";
   if (codec === "vp8") return "libvpx";
+  if (codec === "vp9") return "libvpx-vp9";
+  if (codec === "av1") return "libsvtav1";
   return "libx264";
 }
 
@@ -969,6 +1032,22 @@ function defaultEncodeOptionsForCodec(codec) {
   }
   if (codec === "vp8") {
     return [{ value: "libvpx", label: "libvpx" }];
+  }
+  if (codec === "vp9") {
+    return [
+      { value: "vp9_qsv", label: "vp9_qsv" },
+      { value: "vp9_vaapi", label: "vp9_vaapi" },
+      { value: "libvpx-vp9", label: "libvpx-vp9" },
+    ];
+  }
+  if (codec === "av1") {
+    return [
+      { value: "av1_nvenc", label: "av1_nvenc" },
+      { value: "av1_qsv", label: "av1_qsv" },
+      { value: "av1_vaapi", label: "av1_vaapi" },
+      { value: "libsvtav1", label: "libsvtav1" },
+      { value: "libaom-av1", label: "libaom-av1" },
+    ];
   }
   return [
     { value: "h264_nvenc", label: "h264_nvenc" },
@@ -994,7 +1073,11 @@ function normalizeEncodePreferenceForCodec(value, codec) {
       ? ["h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
       : codec === "h265"
         ? ["hevc_nvenc", "hevc_qsv", "hevc_vaapi", "libx265"]
-        : ["libvpx"],
+        : codec === "vp8"
+          ? ["libvpx"]
+          : codec === "vp9"
+            ? ["vp9_qsv", "vp9_vaapi", "libvpx-vp9"]
+            : ["av1_nvenc", "av1_qsv", "av1_vaapi", "libsvtav1", "libaom-av1"],
   );
   if (allowedValues.has(preferred)) return preferred;
   return defaultEncodePreferenceForCodec(codec);
@@ -1055,6 +1138,37 @@ function renderEncodePreferenceHelp(options = defaultEncodeOptionsForCodec(codec
   encodePreferenceHelp.classList.add("is-warning");
 }
 
+async function refreshCodecOptions(
+  preferredValue = codecSelect.value,
+  { silent = false } = {},
+) {
+  let options = DEFAULT_CODEC_OPTIONS;
+  if (state.authenticated) {
+    try {
+      const response = await fetch(apiUrl("/api/codecs"), {
+        cache: "no-store",
+        credentials: "include",
+      });
+      if (!response.ok) {
+        throw new Error(await response.text().catch(() => "Failed to load codecs"));
+      }
+      const body = await response.json();
+      if (Array.isArray(body?.options) && body.options.length > 0) {
+        options = body.options;
+      }
+    } catch (error) {
+      if (!silent) {
+        showToast("codec_options_failed", error.message || String(error));
+      }
+    }
+  }
+  const previousValue = codecSelect.value;
+  setCodecOptions(options, preferredValue);
+  if (previousValue !== codecSelect.value && preferredValue === previousValue && !silent) {
+    showToast("codec_unavailable", `${preferredValue.toUpperCase()} is not available on this server`);
+  }
+}
+
 async function refreshEncodePreferenceOptions(
   codec = codecSelect.value,
   preferredValue = encodePreferenceSelect.value,
@@ -1083,10 +1197,30 @@ async function refreshEncodePreferenceOptions(
   renderEncodePreferenceOptions(options, preferredValue);
 }
 
+async function disconnectIfSelectedCodecIsUnsupported(settings = readSettingsFromControls()) {
+  if (state.socket?.readyState !== WebSocket.OPEN) return true;
+  const videoCodecSupport = await getVideoCodecSupport(settings.codec);
+  if (videoCodecSupport.supported) {
+    return true;
+  }
+  clearSettingsReconnectTimer();
+  state.pendingStreamSettingsKey = "";
+  persistResolvedSettings(settings, { scheduleReconnect: false });
+  showToast("codec_unsupported", `${videoCodecSupport.message}. Disconnected.`);
+  disconnect();
+  return false;
+}
+
 async function handleCodecSettingChange() {
+  const provisionalSettings = readSettingsFromControls();
+  syncPendingStreamSettings(provisionalSettings);
   const preferredValue = encodePreferenceSelect.value;
   await refreshEncodePreferenceOptions(codecSelect.value, preferredValue, { silent: true });
-  persistCurrentSettings();
+  const settings = readSettingsFromControls();
+  if (!(await disconnectIfSelectedCodecIsUnsupported(settings))) {
+    return;
+  }
+  persistResolvedSettings(settings);
 }
 
 function handleEncoderSettingChange() {
@@ -1108,6 +1242,12 @@ function videoCodecCandidates(codecOrCodecString) {
   if (!codecOrCodecString) return [];
   if (codecOrCodecString === "h265") {
     return ["hvc1.1.6.L93.B0", "hev1.1.6.L93.B0"];
+  }
+  if (codecOrCodecString === "vp9") {
+    return ["vp09.00.10.08", "vp09.00.10.08.01.01.01.01.00"];
+  }
+  if (codecOrCodecString === "av1") {
+    return ["av01.0.08M.08", "av01.0.05M.08"];
   }
   if (VIDEO_CODEC_STRINGS[codecOrCodecString]) {
     return [VIDEO_CODEC_STRINGS[codecOrCodecString]];
@@ -1250,6 +1390,7 @@ async function connect() {
       savePasswd(passwd);
       clearAuthPrompt();
     }
+    await refreshCodecOptions(readSettingsFromControls().codec, { silent: true });
     closeConnection({ manual: false, preserveStatus: true });
     state.manualDisconnect = false;
     clearTimeout(state.reconnectTimer);
@@ -1297,6 +1438,7 @@ async function connect() {
       state.highLatencySinceAt = 0;
       setStreamWarning("");
       setStatus("Connected");
+      void refreshCodecOptions(codecSelect.value, { silent: true });
       void refreshEncodePreferenceOptions(
         codecSelect.value,
         loadStoredSettings().encodePreference,
@@ -1527,7 +1669,8 @@ async function setupDecoder() {
     state.decoder?.close();
     state.decoder = null;
     state.decoderConfigKey = "";
-    showToast("decoder_config_failed", `Decoder does not support ${state.codecString}`);
+    showToast("decoder_config_failed", `Decoder does not support ${state.codecString}. Disconnected.`);
+    disconnect();
     return;
   }
   const selectedCodecString = codecSupport.codecString;

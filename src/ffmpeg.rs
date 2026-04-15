@@ -31,6 +31,12 @@ pub struct AvailableEncoderOption {
     pub ffmpeg_encoder: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AvailableCodecOption {
+    pub value: CodecKind,
+    pub label: &'static str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncoderBackend {
     Cpu,
@@ -134,6 +140,82 @@ const VP8_ENCODERS: &[EncoderProfile] = &[EncoderProfile {
     backend: EncoderBackend::Cpu,
 }];
 
+const VP9_GPU_ENCODERS: &[EncoderProfile] = &[
+    EncoderProfile {
+        ffmpeg_encoder: "vp9_qsv",
+        mode: "gpu",
+        output_format: "ivf",
+        backend: EncoderBackend::IntelQsv,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "vp9_vaapi",
+        mode: "gpu",
+        output_format: "ivf",
+        backend: EncoderBackend::Vaapi,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "libvpx-vp9",
+        mode: "cpu",
+        output_format: "ivf",
+        backend: EncoderBackend::Cpu,
+    },
+];
+
+const VP9_CPU_ENCODERS: &[EncoderProfile] = &[EncoderProfile {
+    ffmpeg_encoder: "libvpx-vp9",
+    mode: "cpu",
+    output_format: "ivf",
+    backend: EncoderBackend::Cpu,
+}];
+
+const AV1_GPU_ENCODERS: &[EncoderProfile] = &[
+    EncoderProfile {
+        ffmpeg_encoder: "av1_nvenc",
+        mode: "gpu",
+        output_format: "ivf",
+        backend: EncoderBackend::NvidiaNvenc,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "av1_qsv",
+        mode: "gpu",
+        output_format: "ivf",
+        backend: EncoderBackend::IntelQsv,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "av1_vaapi",
+        mode: "gpu",
+        output_format: "ivf",
+        backend: EncoderBackend::Vaapi,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "libsvtav1",
+        mode: "cpu",
+        output_format: "ivf",
+        backend: EncoderBackend::Cpu,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "libaom-av1",
+        mode: "cpu",
+        output_format: "ivf",
+        backend: EncoderBackend::Cpu,
+    },
+];
+
+const AV1_CPU_ENCODERS: &[EncoderProfile] = &[
+    EncoderProfile {
+        ffmpeg_encoder: "libsvtav1",
+        mode: "cpu",
+        output_format: "ivf",
+        backend: EncoderBackend::Cpu,
+    },
+    EncoderProfile {
+        ffmpeg_encoder: "libaom-av1",
+        mode: "cpu",
+        output_format: "ivf",
+        backend: EncoderBackend::Cpu,
+    },
+];
+
 pub async fn choose_encoder(
     codec: CodecKind,
     encode_preference: EncodePreference,
@@ -173,6 +255,26 @@ pub async fn available_encoder_options(codec: CodecKind) -> Result<Vec<Available
     Ok(options)
 }
 
+pub async fn available_codec_options() -> Result<Vec<AvailableCodecOption>> {
+    let encoders = ffmpeg_list_encoders().await?;
+    let mut options = Vec::new();
+    for codec in [
+        CodecKind::H264,
+        CodecKind::H265,
+        CodecKind::Vp8,
+        CodecKind::Vp9,
+        CodecKind::Av1,
+    ] {
+        if !available_profiles(codec, &encoders).await.is_empty() {
+            options.push(AvailableCodecOption {
+                value: codec,
+                label: codec.label(),
+            });
+        }
+    }
+    Ok(options)
+}
+
 async fn available_profiles(codec: CodecKind, encoders: &str) -> Vec<EncoderProfile> {
     let mut profiles = Vec::new();
     for profile in all_profiles(codec) {
@@ -199,6 +301,12 @@ fn preferred_encoders(
         (CodecKind::H265, EncodePreference::Gpu) => H265_GPU_ENCODERS.to_vec(),
         (CodecKind::H265, EncodePreference::Cpu) => H265_CPU_ENCODERS.to_vec(),
         (CodecKind::Vp8, _) => VP8_ENCODERS.to_vec(),
+        (CodecKind::Vp9, EncodePreference::Gpu) => VP9_GPU_ENCODERS.to_vec(),
+        (CodecKind::Vp9, EncodePreference::Cpu) => VP9_CPU_ENCODERS.to_vec(),
+        (CodecKind::Vp9, _) => VP9_GPU_ENCODERS.to_vec(),
+        (CodecKind::Av1, EncodePreference::Nvidia) => AV1_GPU_ENCODERS.to_vec(),
+        (CodecKind::Av1, EncodePreference::Gpu) => AV1_GPU_ENCODERS.to_vec(),
+        (CodecKind::Av1, EncodePreference::Cpu) => AV1_CPU_ENCODERS.to_vec(),
         _ => Vec::new(),
     }
 }
@@ -208,6 +316,8 @@ fn all_profiles(codec: CodecKind) -> &'static [EncoderProfile] {
         CodecKind::H264 => H264_GPU_ENCODERS,
         CodecKind::H265 => H265_GPU_ENCODERS,
         CodecKind::Vp8 => VP8_ENCODERS,
+        CodecKind::Vp9 => VP9_GPU_ENCODERS,
+        CodecKind::Av1 => AV1_GPU_ENCODERS,
     }
 }
 
@@ -236,6 +346,14 @@ fn specific_ffmpeg_encoder(
         (CodecKind::H265, EncodePreference::HevcVaapi) => Some("hevc_vaapi"),
         (CodecKind::H265, EncodePreference::Libx265) => Some("libx265"),
         (CodecKind::Vp8, EncodePreference::Libvpx) => Some("libvpx"),
+        (CodecKind::Vp9, EncodePreference::Vp9Qsv) => Some("vp9_qsv"),
+        (CodecKind::Vp9, EncodePreference::Vp9Vaapi) => Some("vp9_vaapi"),
+        (CodecKind::Vp9, EncodePreference::LibvpxVp9) => Some("libvpx-vp9"),
+        (CodecKind::Av1, EncodePreference::Av1Nvenc) => Some("av1_nvenc"),
+        (CodecKind::Av1, EncodePreference::Av1Qsv) => Some("av1_qsv"),
+        (CodecKind::Av1, EncodePreference::Av1Vaapi) => Some("av1_vaapi"),
+        (CodecKind::Av1, EncodePreference::LibSvtAv1) => Some("libsvtav1"),
+        (CodecKind::Av1, EncodePreference::LibAomAv1) => Some("libaom-av1"),
         _ => None,
     }
 }
@@ -251,6 +369,14 @@ fn specific_preference(ffmpeg_encoder: &str) -> Option<EncodePreference> {
         "hevc_vaapi" => Some(EncodePreference::HevcVaapi),
         "libx265" => Some(EncodePreference::Libx265),
         "libvpx" => Some(EncodePreference::Libvpx),
+        "vp9_qsv" => Some(EncodePreference::Vp9Qsv),
+        "vp9_vaapi" => Some(EncodePreference::Vp9Vaapi),
+        "libvpx-vp9" => Some(EncodePreference::LibvpxVp9),
+        "av1_nvenc" => Some(EncodePreference::Av1Nvenc),
+        "av1_qsv" => Some(EncodePreference::Av1Qsv),
+        "av1_vaapi" => Some(EncodePreference::Av1Vaapi),
+        "libsvtav1" => Some(EncodePreference::LibSvtAv1),
+        "libaom-av1" => Some(EncodePreference::LibAomAv1),
         _ => None,
     }
 }
@@ -397,7 +523,7 @@ fn append_gop_args(cmd: &mut Command, gop: &str, backend: EncoderBackend) {
 
 fn append_encoder_specific_args(cmd: &mut Command, encoder: &str) {
     match encoder {
-        "h264_nvenc" | "hevc_nvenc" => {
+        "h264_nvenc" | "hevc_nvenc" | "av1_nvenc" => {
             cmd.args([
                 "-preset",
                 "p1",
@@ -433,7 +559,7 @@ fn append_encoder_specific_args(cmd: &mut Command, encoder: &str) {
                 "repeat-headers=1:aud=1",
             ]);
         }
-        "h264_qsv" | "hevc_qsv" => {
+        "h264_qsv" | "hevc_qsv" | "vp9_qsv" | "av1_qsv" => {
             cmd.args([
                 "-preset",
                 "veryfast",
@@ -443,9 +569,27 @@ fn append_encoder_specific_args(cmd: &mut Command, encoder: &str) {
                 "1",
             ]);
         }
-        "h264_vaapi" | "hevc_vaapi" => {}
+        "h264_vaapi" | "hevc_vaapi" | "vp9_vaapi" | "av1_vaapi" => {}
         "libvpx" => {
             cmd.args(["-deadline", "realtime", "-cpu-used", "8"]);
+        }
+        "libvpx-vp9" => {
+            cmd.args(["-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1"]);
+        }
+        "libsvtav1" => {
+            cmd.args(["-preset", "12", "-svtav1-params", "scd=0:lookahead=0"]);
+        }
+        "libaom-av1" => {
+            cmd.args([
+                "-cpu-used",
+                "8",
+                "-usage",
+                "realtime",
+                "-row-mt",
+                "1",
+                "-tiles",
+                "2x1",
+            ]);
         }
         _ => {}
     }
@@ -463,9 +607,9 @@ fn append_bitstream_filter_args(cmd: &mut Command, output_format: &str) {
 
 fn encoder_backend(encoder: &str) -> EncoderBackend {
     match encoder {
-        "h264_nvenc" | "hevc_nvenc" => EncoderBackend::NvidiaNvenc,
-        "h264_qsv" | "hevc_qsv" => EncoderBackend::IntelQsv,
-        "h264_vaapi" | "hevc_vaapi" => EncoderBackend::Vaapi,
+        "h264_nvenc" | "hevc_nvenc" | "av1_nvenc" => EncoderBackend::NvidiaNvenc,
+        "h264_qsv" | "hevc_qsv" | "vp9_qsv" | "av1_qsv" => EncoderBackend::IntelQsv,
+        "h264_vaapi" | "hevc_vaapi" | "vp9_vaapi" | "av1_vaapi" => EncoderBackend::Vaapi,
         _ => EncoderBackend::Cpu,
     }
 }
@@ -1127,6 +1271,20 @@ mod tests {
         let candidates = super::preferred_encoders(CodecKind::H264, EncodePreference::H264Qsv);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].ffmpeg_encoder, "h264_qsv");
+    }
+
+    #[test]
+    fn vp9_cpu_preference_uses_libvpx_vp9() {
+        let candidates = super::preferred_encoders(CodecKind::Vp9, EncodePreference::Cpu);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].ffmpeg_encoder, "libvpx-vp9");
+    }
+
+    #[test]
+    fn av1_nvidia_preference_uses_av1_nvenc_first() {
+        let candidates = super::preferred_encoders(CodecKind::Av1, EncodePreference::Nvidia);
+        assert_eq!(candidates[0].ffmpeg_encoder, "av1_nvenc");
+        assert!(candidates.len() > 1);
     }
 
     #[test]

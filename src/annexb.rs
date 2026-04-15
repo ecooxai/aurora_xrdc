@@ -92,7 +92,7 @@ impl AnnexBParser {
             // is provided. That is a better fit for our live elementary stream
             // than fabricating an hvcC blob from partial parser state.
             CodecKind::H265 => None,
-            CodecKind::Vp8 => None,
+            CodecKind::Vp8 | CodecKind::Vp9 | CodecKind::Av1 => None,
         }
     }
 }
@@ -204,7 +204,7 @@ fn nal_type(codec: CodecKind, data: &[u8]) -> Option<u8> {
     Some(match codec {
         CodecKind::H264 => first & 0x1f,
         CodecKind::H265 => (first >> 1) & 0x3f,
-        CodecKind::Vp8 => return None,
+        CodecKind::Vp8 | CodecKind::Vp9 | CodecKind::Av1 => return None,
     })
 }
 
@@ -249,7 +249,7 @@ fn sample_data(codec: CodecKind, sample: &[u8]) -> Vec<u8> {
     match codec {
         CodecKind::H264 => annexb_sample_to_length_prefixed(sample),
         CodecKind::H265 => sample.to_vec(),
-        CodecKind::Vp8 => sample.to_vec(),
+        CodecKind::Vp8 | CodecKind::Vp9 | CodecKind::Av1 => sample.to_vec(),
     }
 }
 

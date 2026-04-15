@@ -511,17 +511,18 @@ fn drain_pointer_motion_messages(
         match receiver.next().now_or_never() {
             None => return Ok(false),
             Some(None) => return Ok(true),
-            Some(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text)
-            {
-                Ok(client) if is_pointer_motion_message(&client) => {
-                    push_pointer_motion_command(motions, &client);
+            Some(Some(Ok(Message::Text(text)))) => {
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(client) if is_pointer_motion_message(&client) => {
+                        push_pointer_motion_command(motions, &client);
+                    }
+                    Ok(_) => {
+                        *pending_message = Some(Message::Text(text));
+                        return Ok(false);
+                    }
+                    Err(err) => warn!("invalid client message: {err}"),
                 }
-                Ok(_) => {
-                    *pending_message = Some(Message::Text(text));
-                    return Ok(false);
-                }
-                Err(err) => warn!("invalid client message: {err}"),
-            },
+            }
             Some(Some(Ok(message))) => {
                 *pending_message = Some(message);
                 return Ok(false);
@@ -562,12 +563,7 @@ async fn apply_client_message(
             } else {
                 run_xdotool(
                     display,
-                    [
-                        "mousemove_relative",
-                        "--",
-                        &dx.to_string(),
-                        &dy.to_string(),
-                    ],
+                    ["mousemove_relative", "--", &dx.to_string(), &dy.to_string()],
                 )
                 .await?;
             }
@@ -859,18 +855,18 @@ mod tests {
 
     #[test]
     fn pointer_motion_does_not_trigger_display_wake() {
-        assert!(!should_wake_display_for_message(&ClientMessage::PointerMove {
-            dx: 5.0,
-            dy: -3.0,
-        }));
-        assert!(!should_wake_display_for_message(&ClientMessage::PointerAbsolute {
-            x: 320,
-            y: 240,
-        }));
-        assert!(should_wake_display_for_message(&ClientMessage::PointerButton {
-            button: 1,
-            down: true,
-        }));
+        assert!(!should_wake_display_for_message(
+            &ClientMessage::PointerMove { dx: 5.0, dy: -3.0 }
+        ));
+        assert!(!should_wake_display_for_message(
+            &ClientMessage::PointerAbsolute { x: 320, y: 240 }
+        ));
+        assert!(should_wake_display_for_message(
+            &ClientMessage::PointerButton {
+                button: 1,
+                down: true,
+            }
+        ));
     }
 
     #[test]

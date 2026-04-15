@@ -8,6 +8,8 @@ pub enum CodecKind {
     H264,
     H265,
     Vp8,
+    Vp9,
+    Av1,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,6 +38,22 @@ pub enum EncodePreference {
     Libx265,
     #[serde(rename = "libvpx")]
     Libvpx,
+    #[serde(rename = "vp9_qsv")]
+    Vp9Qsv,
+    #[serde(rename = "vp9_vaapi")]
+    Vp9Vaapi,
+    #[serde(rename = "libvpx-vp9")]
+    LibvpxVp9,
+    #[serde(rename = "av1_nvenc")]
+    Av1Nvenc,
+    #[serde(rename = "av1_qsv")]
+    Av1Qsv,
+    #[serde(rename = "av1_vaapi")]
+    Av1Vaapi,
+    #[serde(rename = "libsvtav1")]
+    LibSvtAv1,
+    #[serde(rename = "libaom-av1")]
+    LibAomAv1,
 }
 
 impl EncodePreference {
@@ -49,8 +67,19 @@ impl EncodePreference {
                 | Self::H264Qsv
                 | Self::H264Vaapi
                 | Self::Libx264 => self,
-                Self::Libx265 | Self::Libvpx => Self::Cpu,
-                Self::HevcNvenc | Self::HevcQsv | Self::HevcVaapi => Self::Gpu,
+                Self::Libx265
+                | Self::Libvpx
+                | Self::LibvpxVp9
+                | Self::LibSvtAv1
+                | Self::LibAomAv1 => Self::Cpu,
+                Self::HevcNvenc
+                | Self::HevcQsv
+                | Self::HevcVaapi
+                | Self::Vp9Qsv
+                | Self::Vp9Vaapi
+                | Self::Av1Nvenc
+                | Self::Av1Qsv
+                | Self::Av1Vaapi => Self::Gpu,
             },
             CodecKind::H265 => match self {
                 Self::Gpu
@@ -60,12 +89,47 @@ impl EncodePreference {
                 | Self::HevcQsv
                 | Self::HevcVaapi
                 | Self::Libx265 => self,
-                Self::Libx264 | Self::Libvpx => Self::Cpu,
-                Self::H264Nvenc | Self::H264Qsv | Self::H264Vaapi => Self::Gpu,
+                Self::Libx264
+                | Self::Libvpx
+                | Self::LibvpxVp9
+                | Self::LibSvtAv1
+                | Self::LibAomAv1 => Self::Cpu,
+                Self::H264Nvenc
+                | Self::H264Qsv
+                | Self::H264Vaapi
+                | Self::Vp9Qsv
+                | Self::Vp9Vaapi
+                | Self::Av1Nvenc
+                | Self::Av1Qsv
+                | Self::Av1Vaapi => Self::Gpu,
             },
             CodecKind::Vp8 => match self {
                 Self::Cpu | Self::Libvpx => self,
                 _ => Self::Cpu,
+            },
+            CodecKind::Vp9 => match self {
+                Self::Gpu | Self::Cpu | Self::Vp9Qsv | Self::Vp9Vaapi | Self::LibvpxVp9 => self,
+                Self::Nvidia | Self::HevcNvenc | Self::H264Nvenc | Self::Av1Nvenc => Self::Gpu,
+                _ => Self::Cpu,
+            },
+            CodecKind::Av1 => match self {
+                Self::Gpu
+                | Self::Cpu
+                | Self::Nvidia
+                | Self::Av1Nvenc
+                | Self::Av1Qsv
+                | Self::Av1Vaapi
+                | Self::LibSvtAv1
+                | Self::LibAomAv1 => self,
+                Self::Libx264 | Self::Libx265 | Self::Libvpx | Self::LibvpxVp9 => Self::Cpu,
+                Self::H264Nvenc
+                | Self::H264Qsv
+                | Self::H264Vaapi
+                | Self::HevcNvenc
+                | Self::HevcQsv
+                | Self::HevcVaapi
+                | Self::Vp9Qsv
+                | Self::Vp9Vaapi => Self::Gpu,
             },
         }
     }
@@ -77,6 +141,18 @@ impl CodecKind {
             Self::H264 => "avc1.64001f",
             Self::H265 => "hvc1.1.6.L93.B0",
             Self::Vp8 => "vp8",
+            Self::Vp9 => "vp09.00.10.08",
+            Self::Av1 => "av01.0.08M.08",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::H265 => "H.265",
+            Self::Vp8 => "VP8",
+            Self::Vp9 => "VP9",
+            Self::Av1 => "AV1",
         }
     }
 }
@@ -327,6 +403,18 @@ mod tests {
         }
         .normalized();
         assert_eq!(cfg.encode_preference, EncodePreference::Cpu);
+    }
+
+    #[test]
+    fn av1_keeps_explicit_av1_encoder_preference() {
+        let cfg = StreamConfig {
+            codec: CodecKind::Av1,
+            bitrate_kbps: 4_000,
+            fps: 16,
+            encode_preference: EncodePreference::Av1Qsv,
+        }
+        .normalized();
+        assert_eq!(cfg.encode_preference, EncodePreference::Av1Qsv);
     }
 
     #[test]

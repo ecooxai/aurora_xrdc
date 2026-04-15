@@ -36,7 +36,7 @@ pub async fn start(
                 Err(_) => break,
             };
             let frames = match config.codec {
-                CodecKind::Vp8 => ivf.push(&buf[..read]),
+                CodecKind::Vp8 | CodecKind::Vp9 | CodecKind::Av1 => ivf.push(&buf[..read]),
                 CodecKind::H264 | CodecKind::H265 => h26x.push(&buf[..read]),
             };
             for frame in frames {

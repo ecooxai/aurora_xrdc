@@ -3,7 +3,9 @@ use x11rb::{
     NONE,
     connection::Connection,
     protocol::{
-        xproto::{BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as XProtoConnectionExt, Window},
+        xproto::{
+            BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, ConnectionExt as XProtoConnectionExt, Window,
+        },
         xtest::ConnectionExt as XTestConnectionExt,
     },
     rust_connection::RustConnection,
@@ -16,8 +18,8 @@ pub struct X11InputInjector {
 
 impl X11InputInjector {
     pub fn connect(display: &str) -> Result<Self> {
-        let (connection, screen_num) =
-            x11rb::connect(Some(display)).with_context(|| format!("failed to connect to X11 display {display}"))?;
+        let (connection, screen_num) = x11rb::connect(Some(display))
+            .with_context(|| format!("failed to connect to X11 display {display}"))?;
         connection
             .xtest_get_version(2, 2)
             .context("failed to query XTEST extension")?
@@ -65,7 +67,9 @@ impl X11InputInjector {
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.connection.flush().context("failed to flush X11 input requests")
+        self.connection
+            .flush()
+            .context("failed to flush X11 input requests")
     }
 
     fn queue_pointer_button(&self, button: u8, down: bool) -> Result<()> {
