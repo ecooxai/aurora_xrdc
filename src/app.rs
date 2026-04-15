@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -252,6 +252,12 @@ pub async fn run(server: ServerConfig) -> Result<()> {
     if let Err(err) = ffmpeg::warm_audio_stack().await {
         warn!("audio bootstrap failed during startup: {err}");
     }
+    let state = Arc::new(AppState {
+        server,
+        auth: Arc::new(AuthTracker::new()),
+        camera,
+        media: media.clone(),
+    });
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(js))
@@ -272,12 +278,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
             get(get_remote_clipboard).post(set_remote_clipboard),
         )
         .layer(middleware::from_fn(cors))
-        .with_state(Arc::new(AppState {
-            server,
-            auth: Arc::new(AuthTracker::new()),
-            camera,
-            media,
-        }));
+        .with_state(state);
     let listeners = bind
         .split(',')
         .map(str::trim)
@@ -289,12 +290,26 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .map(|listener| listener.local_addr().map(|addr| format!("http://{addr}")))
         .collect::<Result<Vec<_>, _>>()?;
     info!("listening on {}", listen_urls.join(", "));
-    try_join_all(
-        listeners
-            .into_iter()
-            .map(|listener| axum::serve(listener, app.clone()).into_future()),
-    )
-    .await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+    let result = try_join_all(listeners.into_iter().map(|listener| {
+        let app = app.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.changed().await;
+                })
+                .into_future()
+                .await
+        }
+    }))
+    .await;
+    media.shutdown().await;
+    result?;
     Ok(())
 }
 
@@ -316,6 +331,36 @@ fn bind_listener(bind: &str) -> Result<tokio::net::TcpListener> {
     let listener = std::net::TcpListener::from(socket);
     listener.set_nonblocking(true)?;
     Ok(tokio::net::TcpListener::from_std(listener)?)
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            warn!("failed to install ctrl-c handler: {err}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        match signal(SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => warn!("failed to install SIGTERM handler: {err}"),
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    info!("shutdown signal received");
 }
 
 async fn index() -> impl IntoResponse {

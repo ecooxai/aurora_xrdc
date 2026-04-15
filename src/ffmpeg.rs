@@ -12,6 +12,7 @@ use tokio::{
     process::{ChildStdin, Command},
     time::{Duration, sleep},
 };
+use tracing::warn;
 
 use crate::settings::{AudioStreamConfig, CodecKind, EncodePreference, ServerConfig, StreamConfig};
 
@@ -56,6 +57,7 @@ const VIRTUAL_MIC_SINK_NAME: &str = "vibe_rdesk_virtual_mic_sink";
 const VIRTUAL_CAMERA_LABEL: &str = "viberdeskcamera";
 const VIRTUAL_CAMERA_NR: &str = "42";
 const VIDEO_GOP_SECONDS: u32 = 2;
+const DISPLAY_WAKE_RETRY_DELAY: Duration = Duration::from_millis(150);
 
 const H264_GPU_ENCODERS: &[EncoderProfile] = &[
     EncoderProfile {
@@ -715,9 +717,21 @@ where
 }
 
 pub async fn wake_display(display: &str) -> Result<()> {
-    run_xset(display, ["s", "reset"]).await?;
-    run_xset(display, ["dpms", "force", "on"]).await?;
-    Ok(())
+    let mut woke = false;
+    let mut errors = Vec::new();
+
+    woke |= wake_display_once(display, &mut errors).await;
+    sleep(DISPLAY_WAKE_RETRY_DELAY).await;
+    woke |= wake_display_once(display, &mut errors).await;
+
+    if woke {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "all display wake attempts failed: {}",
+            errors.join("; ")
+        ))
+    }
 }
 
 async fn run_xset<I, S>(display: &str, args: I) -> Result<()>
@@ -736,6 +750,95 @@ where
     } else {
         Err(anyhow!("xset exited with {}", status))
     }
+}
+
+async fn wake_display_once(display: &str, errors: &mut Vec<String>) -> bool {
+    let mut woke = false;
+    record_wake_result(
+        "xset s reset",
+        run_xset(display, ["s", "reset"]).await,
+        &mut woke,
+        errors,
+    );
+    record_wake_result(
+        "xset dpms force on",
+        run_xset(display, ["dpms", "force", "on"]).await,
+        &mut woke,
+        errors,
+    );
+    record_wake_result(
+        "dbus-send org.freedesktop.ScreenSaver.SimulateUserActivity",
+        run_dbus_send(
+            display,
+            [
+                "--session",
+                "--type=method_call",
+                "--dest=org.freedesktop.ScreenSaver",
+                "/ScreenSaver",
+                "org.freedesktop.ScreenSaver.SimulateUserActivity",
+            ],
+        )
+        .await,
+        &mut woke,
+        errors,
+    );
+    record_wake_result(
+        "dbus-send org.gnome.ScreenSaver.SimulateUserActivity",
+        run_dbus_send(
+            display,
+            [
+                "--session",
+                "--type=method_call",
+                "--dest=org.gnome.ScreenSaver",
+                "/org/gnome/ScreenSaver",
+                "org.gnome.ScreenSaver.SimulateUserActivity",
+            ],
+        )
+        .await,
+        &mut woke,
+        errors,
+    );
+    record_wake_result(
+        "xdotool pointer wiggle",
+        wiggle_pointer(display).await,
+        &mut woke,
+        errors,
+    );
+    woke
+}
+
+fn record_wake_result(step: &str, result: Result<()>, woke: &mut bool, errors: &mut Vec<String>) {
+    match result {
+        Ok(()) => *woke = true,
+        Err(err) => {
+            warn!(step, "display wake step failed: {err}");
+            errors.push(format!("{step}: {err}"));
+        }
+    }
+}
+
+async fn run_dbus_send<I, S>(display: &str, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let status = Command::new("dbus-send")
+        .env("DISPLAY", display)
+        .args(args)
+        .status()
+        .await
+        .context("failed to run dbus-send")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("dbus-send exited with {}", status))
+    }
+}
+
+async fn wiggle_pointer(display: &str) -> Result<()> {
+    run_xdotool(display, ["mousemove_relative", "--sync", "--", "1", "0"]).await?;
+    run_xdotool(display, ["mousemove_relative", "--sync", "--", "-1", "0"]).await?;
+    Ok(())
 }
 
 pub async fn read_stderr(child: &mut tokio::process::Child) -> String {

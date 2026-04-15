@@ -139,6 +139,11 @@ impl MediaHub {
         self.audio.update_config(audio_config).await?;
         Ok(())
     }
+
+    pub async fn shutdown(&self) {
+        self.video.shutdown().await;
+        self.audio.shutdown().await;
+    }
 }
 
 impl VideoHub {
@@ -149,7 +154,7 @@ impl VideoHub {
             runtime.configured = true;
         }
         runtime.subscribers += 1;
-        if let Err(err) = self.ensure_active(&mut runtime).await {
+        if let Err(err) = self.ensure_active(&mut runtime, true).await {
             runtime.subscribers = runtime.subscribers.saturating_sub(1);
             return Err(err);
         }
@@ -166,31 +171,60 @@ impl VideoHub {
         let mut runtime = self.runtime.lock().await;
         runtime.desired_config = config;
         runtime.configured = true;
-        self.ensure_active(&mut runtime).await
+        self.ensure_active(&mut runtime, false).await
     }
 
-    async fn ensure_active(&self, runtime: &mut VideoRuntime) -> Result<()> {
+    async fn ensure_active(
+        &self,
+        runtime: &mut VideoRuntime,
+        restart_on_acquire: bool,
+    ) -> Result<()> {
         let desired = runtime.desired_config.clone();
+        let mut active_exited = false;
         if let Some(active) = runtime.active.as_ref() {
-            if active.state.config == desired {
-                return Ok(());
+            let active_config = active.state.config.clone();
+            let child = Arc::clone(&active.child);
+            if video_child_running(child, &active_config).await {
+                if active_config == desired && !restart_on_acquire {
+                    return Ok(());
+                }
+            } else {
+                active_exited = true;
+                warn!(config = ?active_config, "shared video capture exited; restarting on next connect");
             }
         }
 
         if let Some(active) = runtime.active.take() {
-            info!(
-                old = ?active.state.config,
-                new = ?desired,
-                "restarting shared video capture"
-            );
+            if restart_on_acquire {
+                info!(
+                    old = ?active.state.config,
+                    new = ?desired,
+                    "restarting shared video capture for webclient connect"
+                );
+            } else {
+                info!(
+                    old = ?active.state.config,
+                    new = ?desired,
+                    "restarting shared video capture"
+                );
+            }
             self.state.send_replace(None);
             self.frames.send_replace(None);
-            shutdown_child(
-                "video",
-                Some(&active.state.config),
-                Arc::clone(&active.child),
-            )
-            .await;
+            if active_exited {
+                drain_video_child(
+                    "video",
+                    Some(&active.state.config),
+                    Arc::clone(&active.child),
+                )
+                .await;
+            } else {
+                shutdown_child(
+                    "video",
+                    Some(&active.state.config),
+                    Arc::clone(&active.child),
+                )
+                .await;
+            }
         } else if runtime.subscribers == 0 {
             return Ok(());
         } else {
@@ -253,6 +287,29 @@ impl VideoHub {
             .await;
         }
     }
+
+    async fn shutdown(&self) {
+        let removed = {
+            let mut runtime = self.runtime.lock().await;
+            runtime.subscribers = 0;
+            let removed = runtime.active.take();
+            self.state.send_replace(None);
+            self.frames.send_replace(None);
+            removed
+        };
+        if let Some(active) = removed {
+            info!(
+                config = ?active.state.config,
+                "stopping shared video capture for server shutdown"
+            );
+            shutdown_child(
+                "video",
+                Some(&active.state.config),
+                Arc::clone(&active.child),
+            )
+            .await;
+        }
+    }
 }
 
 impl AudioHub {
@@ -263,7 +320,7 @@ impl AudioHub {
             runtime.configured = true;
         }
         runtime.subscribers += 1;
-        if let Err(err) = self.ensure_active(&mut runtime).await {
+        if let Err(err) = self.ensure_active(&mut runtime, true).await {
             runtime.subscribers = runtime.subscribers.saturating_sub(1);
             return Err(err);
         }
@@ -280,25 +337,49 @@ impl AudioHub {
         let mut runtime = self.runtime.lock().await;
         runtime.desired_config = config;
         runtime.configured = true;
-        self.ensure_active(&mut runtime).await
+        self.ensure_active(&mut runtime, false).await
     }
 
-    async fn ensure_active(&self, runtime: &mut AudioRuntime) -> Result<()> {
+    async fn ensure_active(
+        &self,
+        runtime: &mut AudioRuntime,
+        restart_on_acquire: bool,
+    ) -> Result<()> {
         let desired = runtime.desired_config.clone();
+        let mut active_exited = false;
         if let Some(active) = runtime.active.as_ref() {
-            if active.state.config == desired {
-                return Ok(());
+            let active_config = active.state.config.clone();
+            let child = Arc::clone(&active.child);
+            if audio_child_running(child, &active_config).await {
+                if active_config == desired && !restart_on_acquire {
+                    return Ok(());
+                }
+            } else {
+                active_exited = true;
+                warn!(config = ?active_config, "shared audio capture exited; restarting on next connect");
             }
         }
 
         if let Some(active) = runtime.active.take() {
-            info!(
-                old = ?active.state.config,
-                new = ?desired,
-                "restarting shared audio capture"
-            );
+            if restart_on_acquire {
+                info!(
+                    old = ?active.state.config,
+                    new = ?desired,
+                    "restarting shared audio capture for webclient connect"
+                );
+            } else {
+                info!(
+                    old = ?active.state.config,
+                    new = ?desired,
+                    "restarting shared audio capture"
+                );
+            }
             self.state.send_replace(None);
-            shutdown_audio_child(Arc::clone(&active.child), &active.state.config).await;
+            if active_exited {
+                drain_audio_child(Arc::clone(&active.child), &active.state.config).await;
+            } else {
+                shutdown_audio_child(Arc::clone(&active.child), &active.state.config).await;
+            }
         } else if runtime.subscribers == 0 {
             return Ok(());
         } else {
@@ -348,6 +429,23 @@ impl AudioHub {
         };
         if let Some(active) = removed {
             info!(config = ?active.state.config, "stopping shared audio capture");
+            shutdown_audio_child(Arc::clone(&active.child), &active.state.config).await;
+        }
+    }
+
+    async fn shutdown(&self) {
+        let removed = {
+            let mut runtime = self.runtime.lock().await;
+            runtime.subscribers = 0;
+            let removed = runtime.active.take();
+            self.state.send_replace(None);
+            removed
+        };
+        if let Some(active) = removed {
+            info!(
+                config = ?active.state.config,
+                "stopping shared audio capture for server shutdown"
+            );
             shutdown_audio_child(Arc::clone(&active.child), &active.state.config).await;
         }
     }
@@ -408,5 +506,87 @@ async fn shutdown_audio_child(child: Arc<Mutex<Child>>, config: &AudioStreamConf
             stderr = stderr.trim(),
             "capture stderr"
         );
+    }
+}
+
+async fn drain_video_child(kind: &str, config: Option<&StreamConfig>, child: Arc<Mutex<Child>>) {
+    let mut child = child.lock().await;
+    let stderr = read_stderr(&mut child).await;
+    if !stderr.trim().is_empty() {
+        warn!(
+            kind = kind,
+            ?config,
+            stderr = stderr.trim(),
+            "capture stderr"
+        );
+    }
+}
+
+async fn drain_audio_child(child: Arc<Mutex<Child>>, config: &AudioStreamConfig) {
+    let mut child = child.lock().await;
+    let stderr = read_stderr(&mut child).await;
+    if !stderr.trim().is_empty() {
+        warn!(
+            kind = "audio",
+            ?config,
+            stderr = stderr.trim(),
+            "capture stderr"
+        );
+    }
+}
+
+async fn video_child_running(child: Arc<Mutex<Child>>, config: &StreamConfig) -> bool {
+    let mut child = child.lock().await;
+    match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => {
+            warn!(kind = "video", ?config, %status, "capture process already exited");
+            let stderr = read_stderr(&mut child).await;
+            if !stderr.trim().is_empty() {
+                warn!(
+                    kind = "video",
+                    ?config,
+                    stderr = stderr.trim(),
+                    "capture stderr after exit"
+                );
+            }
+            false
+        }
+        Err(err) => {
+            warn!(
+                kind = "video",
+                ?config,
+                "capture liveness check failed: {err}"
+            );
+            false
+        }
+    }
+}
+
+async fn audio_child_running(child: Arc<Mutex<Child>>, config: &AudioStreamConfig) -> bool {
+    let mut child = child.lock().await;
+    match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => {
+            warn!(kind = "audio", ?config, %status, "capture process already exited");
+            let stderr = read_stderr(&mut child).await;
+            if !stderr.trim().is_empty() {
+                warn!(
+                    kind = "audio",
+                    ?config,
+                    stderr = stderr.trim(),
+                    "capture stderr after exit"
+                );
+            }
+            false
+        }
+        Err(err) => {
+            warn!(
+                kind = "audio",
+                ?config,
+                "capture liveness check failed: {err}"
+            );
+            false
+        }
     }
 }

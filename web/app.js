@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 const SETTINGS_STORAGE_KEY = "vibe_rdesk.settings";
 const API_ORIGIN_STORAGE_KEY = "vibe_rdesk.api_origin";
+const PASSWD_STORAGE_KEY = "vibe_rdesk.passwd";
 const TOUCH_LONG_PRESS_MS = 1000;
 const TOUCH_MOVE_CANCEL_PX = 14;
 const DIRECT_TOUCH_SCROLL_MULTIPLIER = 3;
@@ -714,6 +715,22 @@ function saveApiOrigin(origin) {
   }
 }
 
+function loadStoredPasswd() {
+  try {
+    return localStorage.getItem(PASSWD_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function savePasswd(passwd) {
+  try {
+    localStorage.setItem(PASSWD_STORAGE_KEY, passwd);
+  } catch {
+    // Ignore storage failures; the session still works for this visit.
+  }
+}
+
 function normalizeSettings(settings = {}) {
   const allowedCodecs = new Set(Array.from(codecSelect.options, (option) => option.value));
   const allowedAudioBitrates = new Set(Array.from(audioBitrateSelect.options, (option) => Number(option.value)));
@@ -922,7 +939,7 @@ function noteAutoDisconnectActivity(message) {
 }
 
 function defaultEncodePreferenceForCodec(codec) {
-  return codec === "vp8" ? "cpu" : "gpu";
+  return "cpu";
 }
 
 function defaultEncodeOptionsForCodec(codec) {
@@ -1205,6 +1222,8 @@ async function connect() {
       await verifyPassword(passwd);
       state.authenticated = true;
       state.sessionPasswd = passwd;
+      authInput.value = passwd;
+      savePasswd(passwd);
       clearAuthPrompt();
     }
     closeConnection({ manual: false, preserveStatus: true });
@@ -3660,7 +3679,8 @@ setInterval(renderAudioBufferMetric, 500);
 setInterval(monitorConnectionHealth, HEALTH_WATCHDOG_INTERVAL_MS);
 state.apiOrigin = loadStoredApiOrigin();
 authOriginInput.value = state.apiOrigin;
-authInput.value = "";
+state.sessionPasswd = loadStoredPasswd();
+authInput.value = state.sessionPasswd;
 
 async function bootstrapAuth() {
   state.authenticated = await probeAuth();

@@ -14,8 +14,8 @@ pub enum CodecKind {
 #[serde(rename_all = "lowercase")]
 pub enum EncodePreference {
     #[default]
-    Gpu,
     Cpu,
+    Gpu,
     #[serde(rename = "nvidia")]
     Nvidia,
     #[serde(rename = "h264_nvenc")]
@@ -96,7 +96,7 @@ impl Default for StreamConfig {
             codec: CodecKind::H264,
             bitrate_kbps: 4_000,
             fps: 16,
-            encode_preference: EncodePreference::Gpu,
+            encode_preference: EncodePreference::Cpu,
         }
     }
 }
@@ -286,10 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_config_defaults_to_gpu_preference() {
+    fn stream_config_defaults_to_cpu_preference() {
         assert_eq!(
             StreamConfig::default().encode_preference,
-            EncodePreference::Gpu
+            EncodePreference::Cpu
         );
     }
 

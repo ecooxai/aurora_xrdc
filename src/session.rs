@@ -29,7 +29,7 @@ const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
 const AUDIO_PACKET_QUEUE_CAPACITY: usize = 128;
-const DISPLAY_WAKE_INTERVAL: Duration = Duration::from_secs(2);
+const DISPLAY_WAKE_INTERVAL: Duration = Duration::from_millis(350);
 
 pub async fn handle_socket(
     socket: WebSocket,
@@ -144,8 +144,8 @@ pub async fn handle_socket(
     if !recv_task_completed
         && !recv_task.is_finished()
         && tokio::time::timeout(Duration::from_secs(1), &mut recv_task)
-        .await
-        .is_err()
+            .await
+            .is_err()
     {
         recv_task.abort();
         let _ = recv_task.await;
