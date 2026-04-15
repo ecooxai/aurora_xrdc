@@ -138,6 +138,7 @@ const state = {
   touchScrollLastY: null,
   inputCaptured: false,
   pressedKeys: new Set(),
+  modifierChordKeys: new Set(),
   keyStateSyncTimer: 0,
   pendingPointer: null,
   pointerRaf: 0,
@@ -2587,15 +2588,46 @@ function resetKeys() {
     send({ type: "key", key, down: false });
   }
   state.pressedKeys.clear();
+  state.modifierChordKeys.clear();
   sendPressedKeyState();
 }
 
 function releasePressedKey(key) {
+  state.modifierChordKeys.delete(key);
   if (!state.pressedKeys.has(key)) return false;
   state.pressedKeys.delete(key);
   send({ type: "key", key, down: false });
   sendPressedKeyState();
   return true;
+}
+
+function keyLogicalModifier(key) {
+  if (key === "Control_L" || key === "Control_R") return "Control";
+  if (key === "Super_L" || key === "Super_R") return "Meta";
+  if (key === "Alt_L" || key === "Alt_R") return "Alt";
+  if (key === "Shift_L" || key === "Shift_R") return "Shift";
+  return null;
+}
+
+function hasShortcutModifier(event) {
+  return modifierLogicalState(event, "Alt") || modifierLogicalState(event, "Meta");
+}
+
+function trackModifierChordKey(event, key) {
+  if (keyLogicalModifier(key)) return;
+  if (hasShortcutModifier(event)) {
+    state.modifierChordKeys.add(key);
+    return;
+  }
+  state.modifierChordKeys.delete(key);
+}
+
+function releaseStaleModifierChordKeys(event, { exceptKey = null } = {}) {
+  if (state.modifierChordKeys.size === 0 || hasShortcutModifier(event)) return;
+  for (const key of [...state.modifierChordKeys]) {
+    if (key === exceptKey) continue;
+    releasePressedKey(key);
+  }
 }
 
 function modifierLogicalState(event, modifier) {
@@ -2615,7 +2647,7 @@ function releaseModifierKeys(keys) {
   }
 }
 
-function synchronizeModifierState(event, { pressMissing = false } = {}) {
+function synchronizeModifierState(event, { pressMissing = false, skipLogical = null } = {}) {
   const modifiers = [
     {
       logical: "Control",
@@ -2644,6 +2676,7 @@ function synchronizeModifierState(event, { pressMissing = false } = {}) {
       continue;
     }
     if (!pressMissing) continue;
+    if (modifier.logical === skipLogical) continue;
     if (modifier.keys.some((key) => state.pressedKeys.has(key))) continue;
     state.pressedKeys.add(modifier.fallback);
     send({ type: "key", key: modifier.fallback, down: true });
@@ -3591,9 +3624,13 @@ function initControls() {
       return;
     }
     if (!shouldHandleKeyboard(event)) return;
-    synchronizeModifierState(event, { pressMissing: true });
     const key = normalizeKey(event);
     if (!key) return;
+    releaseStaleModifierChordKeys(event, { exceptKey: key });
+    synchronizeModifierState(event, {
+      pressMissing: true,
+      skipLogical: keyLogicalModifier(key),
+    });
     if (!event.repeat && state.pressedKeys.has(key)) {
       logInputState("keydown-duplicate", event, { normalizedKey: key });
       event.preventDefault();
@@ -3601,6 +3638,7 @@ function initControls() {
     }
     if (!event.repeat) {
       state.pressedKeys.add(key);
+      trackModifierChordKey(event, key);
     }
     logInputState("keydown", event, { normalizedKey: key });
     send({ type: "key", key, down: true });
@@ -3613,6 +3651,7 @@ function initControls() {
     const key = normalizeKey(event);
     if (!key) return;
     const released = releasePressedKey(key);
+    releaseStaleModifierChordKeys(event, { exceptKey: key });
     synchronizeModifierState(event);
     if (released) {
       event.preventDefault();
