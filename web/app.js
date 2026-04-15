@@ -1053,6 +1053,21 @@ function defaultEncodeOptionsForCodec(codec) {
   ];
 }
 
+function fallbackEncodePreferenceForCodec(codec, options = defaultEncodeOptionsForCodec(codec)) {
+  const defaultPreference = defaultEncodePreferenceForCodec(codec);
+  const allowedValues = new Set(
+    Array.isArray(options)
+      ? options
+          .map((option) => option?.value)
+          .filter((value) => typeof value === "string" && value.length > 0)
+      : [],
+  );
+  if (allowedValues.has(defaultPreference)) {
+    return defaultPreference;
+  }
+  return options?.[0]?.value || defaultPreference;
+}
+
 function encodeOptionsForCodec(codec) {
   const cached = state.encoderOptionsByCodec?.[codec];
   return Array.isArray(cached) && cached.length > 0
@@ -1095,7 +1110,7 @@ function renderEncodePreferenceOptions(
     encodePreferenceSelect.appendChild(element);
   }
   const allowedValues = new Set(Array.from(encodePreferenceSelect.options, (option) => option.value));
-  const fallbackValue = encodePreferenceSelect.options[0]?.value || defaultEncodePreferenceForCodec(codecSelect.value);
+  const fallbackValue = fallbackEncodePreferenceForCodec(codecSelect.value, fallbackOptions);
   const nextValue = normalizeEncodePreferenceForCodec(preferredValue, codecSelect.value);
   encodePreferenceSelect.value = allowedValues.has(nextValue) ? nextValue : fallbackValue;
   renderEncodePreferenceRadioGroup();
@@ -1387,6 +1402,12 @@ async function connect() {
       clearAuthPrompt();
     }
     await refreshCodecOptions(readSettingsFromControls().codec, { silent: true });
+    const settingsBeforeConnect = readSettingsFromControls();
+    await refreshEncodePreferenceOptions(
+      settingsBeforeConnect.codec,
+      settingsBeforeConnect.encodePreference,
+      { silent: true },
+    );
     closeConnection({ manual: false, preserveStatus: true });
     state.manualDisconnect = false;
     clearTimeout(state.reconnectTimer);
