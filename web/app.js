@@ -147,6 +147,7 @@ const state = {
   audioClockAutoLastIncreaseAt: 0,
   audioClockAutoLastIncreaseLead: 0,
   audioClockAutoLastSlowTuneAt: 0,
+  decoderRecovering: false,
   waitingForKeyframe: true,
   frameCount: 0,
   bytesReceived: 0,
@@ -1518,6 +1519,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   resetAudioPlayback();
   state.decoderConfigKey = "";
   state.audioConfigKey = "";
+  state.decoderRecovering = false;
   state.audioEnabled = false;
   state.sessionId = "";
   state.waitingForKeyframe = true;
@@ -1679,7 +1681,9 @@ async function setupDecoder() {
     output: (frame) => {
       queueVideoFrameForRender(frame);
     },
-    error: (err) => showToast("decoder_error", err.message || String(err)),
+    error: (err) => {
+      recoverVideoDecoder(err?.message || String(err), { toastCode: "decoder_error" });
+    },
   });
   const config = { codec: selectedCodecString, optimizeForLatency: true };
   if (state.description) config.description = state.description;
@@ -1694,6 +1698,34 @@ async function setupDecoder() {
     state.decoderConfigKey = "";
     showToast("decoder_config_failed", error.message || String(error));
   }
+}
+
+function recoverVideoDecoder(reason = "", { toastCode = "decoder_error" } = {}) {
+  if (state.decoderRecovering) return;
+  state.decoderRecovering = true;
+  cancelVideoFrameRender();
+  clearPendingVideoFrame();
+  clearWorkerVideoFrame();
+  state.renderingVideoFrame = false;
+  const decoder = state.decoder;
+  state.decoder = null;
+  state.decoderConfigKey = "";
+  state.waitingForKeyframe = true;
+  try {
+    decoder?.close();
+  } catch {
+    // Some decoder failures already close the instance internally.
+  }
+  if (reason) {
+    showToast(toastCode, reason);
+  }
+  queueMicrotask(async () => {
+    try {
+      await setupDecoder();
+    } finally {
+      state.decoderRecovering = false;
+    }
+  });
 }
 
 function clearPendingVideoFrame() {
@@ -1783,15 +1815,7 @@ function updateVideoSurfaceSize(width, height) {
 }
 
 function resetVideoDecoderForLiveCatchup() {
-  cancelVideoFrameRender();
-  clearPendingVideoFrame();
-  clearWorkerVideoFrame();
-  state.renderingVideoFrame = false;
-  state.decoder?.close();
-  state.decoder = null;
-  state.decoderConfigKey = "";
-  void setupDecoder();
-  state.waitingForKeyframe = true;
+  recoverVideoDecoder();
 }
 
 function queueVideoFrameForRender(frame) {
@@ -1802,8 +1826,9 @@ function queueVideoFrameForRender(frame) {
     return;
   }
   if (state.pendingVideoFrame) {
+    // Keep only the latest decoded frame for the next paint. This is normal
+    // queue coalescing and should not be surfaced as delayed playback.
     state.pendingVideoFrame.close();
-    markStaleDrop("Dropping delayed video");
   }
   state.pendingVideoFrame = frame;
   scheduleVideoFrameRender();
@@ -1902,7 +1927,7 @@ function handleVideoFrame(buffer, view) {
       data: bytes,
     }));
   } catch (error) {
-    showToast("decode_submit_failed", error.message || String(error));
+    recoverVideoDecoder(error?.message || String(error), { toastCode: "decode_submit_failed" });
   }
 }
 
