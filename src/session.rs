@@ -459,9 +459,6 @@ fn should_wake_display_for_message(message: &ClientMessage) -> bool {
         ClientMessage::PointerButton { .. }
             | ClientMessage::PointerWheel { .. }
             | ClientMessage::TouchTap
-            | ClientMessage::Key { .. }
-            | ClientMessage::KeyState { .. }
-            | ClientMessage::TextInput { .. }
             | ClientMessage::Paste
             | ClientMessage::PasteClipboard { .. }
             | ClientMessage::ResetInput
@@ -866,6 +863,20 @@ mod tests {
                 down: true,
             }
         ));
+    }
+
+    #[test]
+    fn keyboard_input_does_not_trigger_display_wake() {
+        assert!(!should_wake_display_for_message(&ClientMessage::Key {
+            key: "a".to_string(),
+            down: true,
+        }));
+        assert!(!should_wake_display_for_message(&ClientMessage::KeyState {
+            pressed_keys: vec!["Shift_L".to_string()],
+        }));
+        assert!(!should_wake_display_for_message(&ClientMessage::TextInput {
+            text: "hello".to_string(),
+        }));
     }
 
     #[test]
