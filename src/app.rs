@@ -37,6 +37,7 @@ use crate::{
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
+const VIDEO_RENDERER_WORKER_JS: &str = include_str!("../web/video_renderer_worker.js");
 
 #[derive(Clone)]
 struct AppState {
@@ -262,6 +263,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/", get(index))
         .route("/app.js", get(js))
         .route("/app.css", get(css))
+        .route("/video_renderer_worker.js", get(video_renderer_worker_js))
         .route("/healthz", get(healthz))
         .route("/api/auth", get(auth_check).post(auth_login))
         .route("/api/encoders", get(encoders))
@@ -373,6 +375,13 @@ async fn js() -> Response {
 
 async fn css() -> Response {
     asset("text/css; charset=utf-8", APP_CSS)
+}
+
+async fn video_renderer_worker_js() -> Response {
+    asset(
+        "application/javascript; charset=utf-8",
+        VIDEO_RENDERER_WORKER_JS,
+    )
 }
 
 async fn healthz() -> impl IntoResponse {

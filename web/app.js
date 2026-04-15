@@ -14,7 +14,8 @@ const LIVE_MEDIA_MAX_AGE_MS = 1000;
 const MEDIA_STALL_RESET_MS = 1000;
 const HIGH_LATENCY_RECONNECT_MS = 1500;
 const HIGH_LATENCY_RECONNECT_GRACE_MS = 5000;
-const HEALTH_WATCHDOG_INTERVAL_MS = 250;
+const HEALTH_WATCHDOG_INTERVAL_MS = 1000;
+const ENABLE_VIDEO_RENDER_WORKER = false;
 const KEY_STATE_SYNC_INTERVAL_MS = 500;
 const MAX_VIDEO_DECODE_QUEUE = 4;
 const MAX_AUDIO_DECODE_QUEUE = 24;
@@ -104,6 +105,8 @@ const state = {
   audioEnabled: false,
   pendingVideoFrame: null,
   renderingVideoFrame: false,
+  videoRenderRaf: 0,
+  videoRenderWorker: null,
   audioNextTime: 0,
   pendingEncodedAudioFrames: [],
   pendingAudioBuffers: [],
@@ -141,10 +144,13 @@ const state = {
   modifierChordKeys: new Set(),
   keyStateSyncTimer: 0,
   pendingPointer: null,
+  pendingPointerDirty: false,
   pointerRaf: 0,
   pendingRelativePointer: null,
   relativePointerRaf: 0,
   wheelAccumulator: 0,
+  pendingWheelSteps: 0,
+  wheelRaf: 0,
   localClipboard: { text: null, image_png_b64: null },
   remoteClipboard: { text: null, image_png_b64: null },
   localClipboardSig: "",
@@ -181,7 +187,7 @@ const state = {
 const status = $("status");
 const viewportCard = $("viewport-card");
 const canvas = $("screen");
-const ctx = canvas.getContext("2d", { alpha: false });
+let ctx = null;
 const toast = $("toast");
 const streamWarning = $("stream-warning");
 const streamWarningText = $("stream-warning-text");
@@ -369,6 +375,9 @@ function currentBufferedAudioSeconds() {
 }
 
 function renderAudioBufferMetric() {
+  if (!document.getElementById("tab-panel-status")?.classList.contains("is-active")) {
+    return;
+  }
   if (!state.audioEnabled) {
     statusAudioBuffer.textContent = "--";
     return;
@@ -553,6 +562,10 @@ function syncServerStreamSettings(streamConfig, audioConfig) {
   const recentlyChangedLocally = state.lastLocalStreamSettingsAt > 0
     && performance.now() - state.lastLocalStreamSettingsAt < SETTINGS_RECONNECT_DELAY_MS;
   if (recentlyChangedLocally) {
+    return;
+  }
+  if (!state.appliedStreamSettingsKey) {
+    markAppliedStreamSettings(incoming);
     return;
   }
   if (state.pendingStreamSettingsKey && incomingKey !== state.pendingStreamSettingsKey) {
@@ -940,17 +953,29 @@ function noteAutoDisconnectActivity(message) {
 }
 
 function defaultEncodePreferenceForCodec(codec) {
-  return "cpu";
+  if (codec === "h265") return "libx265";
+  if (codec === "vp8") return "libvpx";
+  return "libx264";
 }
 
 function defaultEncodeOptionsForCodec(codec) {
-  const options = [];
-  if (codec !== "vp8") {
-    options.push({ value: "nvidia", label: "NVIDIA auto" });
-    options.push({ value: "gpu", label: "GPU auto" });
+  if (codec === "h265") {
+    return [
+      { value: "hevc_nvenc", label: "hevc_nvenc" },
+      { value: "hevc_qsv", label: "hevc_qsv" },
+      { value: "hevc_vaapi", label: "hevc_vaapi" },
+      { value: "libx265", label: "libx265" },
+    ];
   }
-  options.push({ value: "cpu", label: "CPU auto" });
-  return options;
+  if (codec === "vp8") {
+    return [{ value: "libvpx", label: "libvpx" }];
+  }
+  return [
+    { value: "h264_nvenc", label: "h264_nvenc" },
+    { value: "h264_qsv", label: "h264_qsv" },
+    { value: "h264_vaapi", label: "h264_vaapi" },
+    { value: "libx264", label: "libx264" },
+  ];
 }
 
 function encodeOptionsForCodec(codec) {
@@ -966,15 +991,13 @@ function normalizeEncodePreferenceForCodec(value, codec) {
     : defaultEncodePreferenceForCodec(codec);
   const allowedValues = new Set(
     codec === "h264"
-      ? ["nvidia", "gpu", "cpu", "h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
+      ? ["h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
       : codec === "h265"
-        ? ["nvidia", "gpu", "cpu", "hevc_nvenc", "hevc_qsv", "hevc_vaapi", "libx265"]
-        : ["cpu", "libvpx"],
+        ? ["hevc_nvenc", "hevc_qsv", "hevc_vaapi", "libx265"]
+        : ["libvpx"],
   );
   if (allowedValues.has(preferred)) return preferred;
-  return codec === "vp8" || CPU_ENCODE_PREFERENCE_VALUES.has(preferred)
-    ? "cpu"
-    : defaultEncodePreferenceForCodec(codec);
+  return defaultEncodePreferenceForCodec(codec);
 }
 
 function renderEncodePreferenceOptions(
@@ -1028,7 +1051,7 @@ function renderEncodePreferenceHelp(options = defaultEncodeOptionsForCodec(codec
     encodePreferenceHelp.classList.remove("is-warning");
     return;
   }
-  encodePreferenceHelp.textContent = "No exact GPU encoder detected; auto mode will fall back to CPU or other available backends.";
+  encodePreferenceHelp.textContent = "No exact ffmpeg encoder detected for this codec on the server.";
   encodePreferenceHelp.classList.add("is-warning");
 }
 
@@ -1347,7 +1370,9 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   stopRemoteClipboardPolling();
   stopMicrophoneCapture();
   void stopCameraCapture({ notifyServer: true, keepEnabled: false });
+  cancelVideoFrameRender();
   clearPendingVideoFrame();
+  clearWorkerVideoFrame();
   state.renderingVideoFrame = false;
   state.decoder?.close();
   state.decoder = null;
@@ -1540,8 +1565,89 @@ function clearPendingVideoFrame() {
   }
 }
 
+function clearWorkerVideoFrame() {
+  state.videoRenderWorker?.postMessage({ type: "clear" });
+}
+
+function disableVideoRenderWorker() {
+  const worker = state.videoRenderWorker;
+  if (!worker) return;
+  worker.removeEventListener("message", handleVideoRenderWorkerMessage);
+  worker.terminate();
+  state.videoRenderWorker = null;
+}
+
+function cancelVideoFrameRender() {
+  if (!state.videoRenderRaf) return;
+  cancelAnimationFrame(state.videoRenderRaf);
+  state.videoRenderRaf = 0;
+}
+
+function ensureCanvasContext() {
+  if (ctx) return ctx;
+  ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+  if (!ctx) {
+    throw new Error("Canvas 2D context is unavailable");
+  }
+  return ctx;
+}
+
+function handleVideoRenderWorkerMessage(event) {
+  const message = event.data;
+  if (!message || typeof message !== "object") return;
+  if (message.type === "error") {
+    disableVideoRenderWorker();
+    showToast(message.code || "video_worker_error", message.message || "Video worker failed");
+  }
+}
+
+function initVideoRenderer() {
+  if (!ENABLE_VIDEO_RENDER_WORKER) return;
+  if (state.videoRenderWorker) return;
+  if (
+    typeof Worker === "undefined"
+    || typeof OffscreenCanvas === "undefined"
+    || typeof canvas.transferControlToOffscreen !== "function"
+  ) {
+    return;
+  }
+  try {
+    const worker = new Worker(new URL("./video_renderer_worker.js", window.location.href));
+    worker.addEventListener("message", handleVideoRenderWorkerMessage);
+    worker.addEventListener("error", (event) => {
+      disableVideoRenderWorker();
+      showToast("video_worker_error", event.message || "Video worker failed");
+    });
+    const offscreenCanvas = canvas.transferControlToOffscreen();
+    worker.postMessage({ type: "init", canvas: offscreenCanvas }, [offscreenCanvas]);
+    state.videoRenderWorker = worker;
+  } catch (error) {
+    disableVideoRenderWorker();
+    showToast("video_worker_unavailable", error.message || String(error));
+  }
+}
+
+function updateVideoSurfaceSize(width, height) {
+  const remoteSizeChanged = (
+    state.remoteScreenWidth !== width
+    || state.remoteScreenHeight !== height
+  );
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+    state.videoRenderWorker?.postMessage({ type: "resize", width, height });
+  }
+  if (remoteSizeChanged) {
+    state.remoteScreenWidth = width;
+    state.remoteScreenHeight = height;
+    applyCanvasZoom();
+  }
+}
+
 function resetVideoDecoderForLiveCatchup() {
+  cancelVideoFrameRender();
   clearPendingVideoFrame();
+  clearWorkerVideoFrame();
   state.renderingVideoFrame = false;
   state.decoder?.close();
   state.decoder = null;
@@ -1551,59 +1657,58 @@ function resetVideoDecoderForLiveCatchup() {
 }
 
 function queueVideoFrameForRender(frame) {
+  updateVideoSurfaceSize(frame.displayWidth, frame.displayHeight);
+  if (state.videoRenderWorker) {
+    state.frameCount += 1;
+    state.videoRenderWorker.postMessage({ type: "frame", frame }, [frame]);
+    return;
+  }
   if (state.pendingVideoFrame) {
     state.pendingVideoFrame.close();
     markStaleDrop("Dropping delayed video");
   }
   state.pendingVideoFrame = frame;
-  if (!state.renderingVideoFrame) {
+  scheduleVideoFrameRender();
+}
+
+function scheduleVideoFrameRender() {
+  if (state.videoRenderRaf || state.renderingVideoFrame) return;
+  state.videoRenderRaf = requestAnimationFrame(() => {
+    state.videoRenderRaf = 0;
     void renderLatestVideoFrame();
-  }
+  });
 }
 
 async function renderLatestVideoFrame() {
   if (state.renderingVideoFrame) return;
+  const frame = state.pendingVideoFrame;
+  if (!frame) return;
+  state.pendingVideoFrame = null;
   state.renderingVideoFrame = true;
   try {
-    while (state.pendingVideoFrame) {
-      const frame = state.pendingVideoFrame;
-      state.pendingVideoFrame = null;
-      const sentAtMs = Number(frame.timestamp ?? 0) / 1000;
-      if (estimateMediaAgeMs(sentAtMs) > LIVE_MEDIA_MAX_AGE_MS) {
-        frame.close();
-        markStaleDrop("Dropping delayed video");
-        continue;
-      }
-      await drawFrame(frame);
-      frame.close();
+    const sentAtMs = Number(frame.timestamp ?? 0) / 1000;
+    if (estimateMediaAgeMs(sentAtMs) > LIVE_MEDIA_MAX_AGE_MS) {
+      markStaleDrop("Dropping delayed video");
+      return;
     }
+    await drawFrame(frame);
   } finally {
+    frame.close();
     state.renderingVideoFrame = false;
     if (state.pendingVideoFrame) {
-      void renderLatestVideoFrame();
+      scheduleVideoFrameRender();
     }
   }
 }
 
 async function drawFrame(frame) {
-  const remoteSizeChanged = (
-    state.remoteScreenWidth !== frame.displayWidth
-    || state.remoteScreenHeight !== frame.displayHeight
-  );
-  if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-    canvas.width = frame.displayWidth;
-    canvas.height = frame.displayHeight;
-  }
-  if (remoteSizeChanged) {
-    state.remoteScreenWidth = frame.displayWidth;
-    state.remoteScreenHeight = frame.displayHeight;
-    applyCanvasZoom();
-  }
+  const renderContext = ensureCanvasContext();
+  updateVideoSurfaceSize(frame.displayWidth, frame.displayHeight);
   try {
-    ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    renderContext.drawImage(frame, 0, 0, canvas.width, canvas.height);
   } catch {
     const bitmap = await createImageBitmap(frame);
-    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    renderContext.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
     bitmap.close();
   }
   state.frameCount += 1;
@@ -2528,7 +2633,7 @@ function requestRemoteClipboard() {
 }
 
 function sendPressedKeyState() {
-  if (!state.inputCaptured && state.pressedKeys.size === 0) return;
+  if (state.pressedKeys.size === 0) return;
   send({ type: "key_state", pressed_keys: [...state.pressedKeys] });
 }
 
@@ -2859,8 +2964,20 @@ function handleMobileKeyboardKeydown(event) {
   tapRemoteKey(key);
 }
 
-function flushWheel(direction) {
-  send({ type: "pointer_wheel", delta_y: direction });
+function flushQueuedWheel() {
+  state.wheelRaf = 0;
+  const steps = state.pendingWheelSteps;
+  state.pendingWheelSteps = 0;
+  if (!steps) return;
+  const direction = steps > 0 ? 1 : -1;
+  for (let i = 0; i < Math.abs(steps); i += 1) {
+    send({ type: "pointer_wheel", delta_y: direction });
+  }
+}
+
+function scheduleWheelFlush() {
+  if (state.wheelRaf) return;
+  state.wheelRaf = requestAnimationFrame(flushQueuedWheel);
 }
 
 function queueWheel(deltaY) {
@@ -2876,22 +2993,30 @@ function queueWheel(deltaY) {
     state.wheelAccumulator += threshold;
     steps -= 1;
   }
-  const clampedSteps = Math.max(-3, Math.min(3, steps));
-  for (let i = 0; i < Math.abs(clampedSteps); i += 1) {
-    flushWheel(clampedSteps > 0 ? 1 : -1);
+  if (!steps) return;
+  state.pendingWheelSteps += Math.max(-4, Math.min(4, steps));
+  scheduleWheelFlush();
+}
+
+function flushPointerFrame() {
+  state.pointerRaf = 0;
+  const point = state.pendingPointer;
+  const dirty = state.pendingPointerDirty;
+  state.pendingPointerDirty = false;
+  if (dirty && point) {
+    send({ type: "pointer_absolute", x: point.x, y: point.y });
   }
+}
+
+function ensurePointerFrameLoop() {
+  if (state.pointerRaf) return;
+  state.pointerRaf = requestAnimationFrame(flushPointerFrame);
 }
 
 function queuePointerMove(x, y) {
   state.pendingPointer = { x, y };
-  if (state.pointerRaf) return;
-  state.pointerRaf = requestAnimationFrame(() => {
-    state.pointerRaf = 0;
-    const point = state.pendingPointer;
-    state.pendingPointer = null;
-    if (!point) return;
-    send({ type: "pointer_absolute", x: point.x, y: point.y });
-  });
+  state.pendingPointerDirty = true;
+  ensurePointerFrameLoop();
 }
 
 function queueRelativePointerMove(dx, dy) {
@@ -2923,6 +3048,12 @@ function clientPointToCanvas(clientX, clientY) {
 
 function pointerToCanvas(event) {
   return clientPointToCanvas(event.clientX, event.clientY);
+}
+
+function queuePointerEvent(event) {
+  const point = pointerToCanvas(event);
+  if (!point) return;
+  queuePointerMove(point.x, point.y);
 }
 
 function clientDeltaToRemote(dx, dy) {
@@ -2960,7 +3091,10 @@ function resetTouchInteraction() {
   state.touchDragPointerId = null;
   state.touchScrollLastY = null;
   state.pendingPointer = null;
+  state.pendingPointerDirty = false;
   state.pendingRelativePointer = null;
+  state.pendingWheelSteps = 0;
+  state.wheelAccumulator = 0;
   if (state.pointerRaf) {
     cancelAnimationFrame(state.pointerRaf);
     state.pointerRaf = 0;
@@ -2968,6 +3102,10 @@ function resetTouchInteraction() {
   if (state.relativePointerRaf) {
     cancelAnimationFrame(state.relativePointerRaf);
     state.relativePointerRaf = 0;
+  }
+  if (state.wheelRaf) {
+    cancelAnimationFrame(state.wheelRaf);
+    state.wheelRaf = 0;
   }
 }
 
@@ -3580,19 +3718,22 @@ function initControls() {
     });
     queuePointerMove(point.x, point.y);
     if (event.button === 0 || event.button === 2 || event.button === 1) {
+      if (state.pointerRaf) {
+        cancelAnimationFrame(state.pointerRaf);
+        state.pointerRaf = 0;
+      }
+      flushPointerFrame();
       send({ type: "pointer_button", button: event.button + 1, down: true });
       event.preventDefault();
     }
   });
-  canvas.addEventListener("pointermove", (event) => {
+  const mousePointerEventName = "onpointerrawupdate" in window ? "pointerrawupdate" : "pointermove";
+  canvas.addEventListener(mousePointerEventName, (event) => {
     if (isTouchPointer(event)) {
       handleTouchPointerMove(event);
       return;
     }
-    const point = pointerToCanvas(event);
-    if (!point) return;
-    synchronizeModifierState(event);
-    queuePointerMove(point.x, point.y);
+    queuePointerEvent(event);
   });
   canvas.addEventListener("pointerup", (event) => {
     synchronizeModifierState(event);
@@ -3710,11 +3851,12 @@ setActiveTab("status");
 applySettings(loadStoredSettings());
 applyCanvasZoom();
 resetStatusMetrics();
+initVideoRenderer();
 initControls();
 void removeServiceWorker();
 renderMicToggle();
 renderCameraToggle();
-setInterval(renderAudioBufferMetric, 500);
+setInterval(renderAudioBufferMetric, 1000);
 setInterval(monitorConnectionHealth, HEALTH_WATCHDOG_INTERVAL_MS);
 state.apiOrigin = loadStoredApiOrigin();
 authOriginInput.value = state.apiOrigin;

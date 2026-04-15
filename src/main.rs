@@ -11,6 +11,7 @@ mod session;
 mod settings;
 mod streamer;
 mod system_stats;
+mod x11_input;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;

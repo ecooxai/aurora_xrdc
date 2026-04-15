@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use tokio::{
     io::AsyncWriteExt,
     process::Child,
@@ -23,6 +23,7 @@ use crate::{
     settings::{AudioStreamConfig, ServerConfig, StreamConfig},
     streamer::StreamFrame,
     system_stats::StatsSampler,
+    x11_input::X11InputInjector,
 };
 
 const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -30,6 +31,12 @@ const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
 const AUDIO_PACKET_QUEUE_CAPACITY: usize = 128;
 const DISPLAY_WAKE_INTERVAL: Duration = Duration::from_millis(350);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PointerMotionCommand {
+    Absolute { x: i32, y: i32 },
+    Relative { dx: i32, dy: i32 },
+}
 
 pub async fn handle_socket(
     socket: WebSocket,
@@ -356,30 +363,66 @@ async fn handle_client(
     let mut mic_input = MicInputState::Idle;
     let mut last_key_state_at = None;
     let mut last_display_wake_at = None;
+    let input_injector = match X11InputInjector::connect(&server.display) {
+        Ok(injector) => Some(injector),
+        Err(err) => {
+            warn!("persistent X11 input unavailable, falling back to xdotool: {err}");
+            None
+        }
+    };
+    let mut pending_message = None;
     let mut key_watchdog = tokio::time::interval(KEY_STATE_WATCHDOG_INTERVAL);
     key_watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            message = receiver.next() => {
+            message = async {
+                if let Some(message) = pending_message.take() {
+                    Some(Ok(message))
+                } else {
+                    receiver.next().await
+                }
+            } => {
                 let Some(message) = message else {
                     break;
                 };
                 match message? {
                     Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(client) => {
-                            if should_wake_display_for_message(&client) {
-                                maybe_wake_display(&server.display, &mut last_display_wake_at)
-                                    .await;
+                            let receiver_closed = if is_pointer_motion_message(&client) {
+                                let mut motions = Vec::new();
+                                push_pointer_motion_command(&mut motions, &client);
+                                let receiver_closed = drain_pointer_motion_messages(
+                                    &mut receiver,
+                                    &mut pending_message,
+                                    &mut motions,
+                                )?;
+                                apply_pointer_motion_batch(
+                                    &server.display,
+                                    input_injector.as_ref(),
+                                    &motions,
+                                )
+                                .await?;
+                                receiver_closed
+                            } else {
+                                if should_wake_display_for_message(&client) {
+                                    maybe_wake_display(&server.display, &mut last_display_wake_at)
+                                        .await;
+                                }
+                                apply_client_message(
+                                    &server.display,
+                                    input_injector.as_ref(),
+                                    &sender,
+                                    &media,
+                                    client,
+                                    &mut pressed_keys,
+                                    &mut last_key_state_at,
+                                )
+                                .await?;
+                                false
+                            };
+                            if receiver_closed {
+                                break;
                             }
-                            apply_client_message(
-                                &server.display,
-                                &sender,
-                                &media,
-                                client,
-                                &mut pressed_keys,
-                                &mut last_key_state_at,
-                            )
-                            .await?
                         }
                         Err(err) => warn!("invalid client message: {err}"),
                     },
@@ -405,7 +448,7 @@ async fn handle_client(
             }
         }
     }
-    reset_input_state(&server.display, &mut pressed_keys).await?;
+    reset_input_state(&server.display, input_injector.as_ref(), &mut pressed_keys).await?;
     shutdown_mic_input(&mut mic_input).await;
     Ok(())
 }
@@ -413,9 +456,7 @@ async fn handle_client(
 fn should_wake_display_for_message(message: &ClientMessage) -> bool {
     matches!(
         message,
-        ClientMessage::PointerMove { .. }
-            | ClientMessage::PointerAbsolute { .. }
-            | ClientMessage::PointerButton { .. }
+        ClientMessage::PointerButton { .. }
             | ClientMessage::PointerWheel { .. }
             | ClientMessage::TouchTap
             | ClientMessage::Key { .. }
@@ -425,6 +466,69 @@ fn should_wake_display_for_message(message: &ClientMessage) -> bool {
             | ClientMessage::PasteClipboard { .. }
             | ClientMessage::ResetInput
     )
+}
+
+fn is_pointer_motion_message(message: &ClientMessage) -> bool {
+    matches!(
+        message,
+        ClientMessage::PointerMove { .. } | ClientMessage::PointerAbsolute { .. }
+    )
+}
+
+fn push_pointer_motion_command(commands: &mut Vec<PointerMotionCommand>, message: &ClientMessage) {
+    match message {
+        ClientMessage::PointerAbsolute { x, y } => {
+            commands.clear();
+            commands.push(PointerMotionCommand::Absolute { x: *x, y: *y });
+        }
+        ClientMessage::PointerMove { dx, dy } => {
+            let dx = dx.round() as i32;
+            let dy = dy.round() as i32;
+            if dx == 0 && dy == 0 {
+                return;
+            }
+            match commands.last_mut() {
+                Some(PointerMotionCommand::Relative {
+                    dx: existing_dx,
+                    dy: existing_dy,
+                }) => {
+                    *existing_dx += dx;
+                    *existing_dy += dy;
+                }
+                _ => commands.push(PointerMotionCommand::Relative { dx, dy }),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn drain_pointer_motion_messages(
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    pending_message: &mut Option<Message>,
+    motions: &mut Vec<PointerMotionCommand>,
+) -> Result<bool> {
+    loop {
+        match receiver.next().now_or_never() {
+            None => return Ok(false),
+            Some(None) => return Ok(true),
+            Some(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<ClientMessage>(&text)
+            {
+                Ok(client) if is_pointer_motion_message(&client) => {
+                    push_pointer_motion_command(motions, &client);
+                }
+                Ok(_) => {
+                    *pending_message = Some(Message::Text(text));
+                    return Ok(false);
+                }
+                Err(err) => warn!("invalid client message: {err}"),
+            },
+            Some(Some(Ok(message))) => {
+                *pending_message = Some(message);
+                return Ok(false);
+            }
+            Some(Some(Err(err))) => return Err(err.into()),
+        }
+    }
 }
 
 async fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
@@ -441,6 +545,7 @@ async fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
 
 async fn apply_client_message(
     display: &str,
+    input_injector: Option<&X11InputInjector>,
     sender: &mpsc::Sender<Message>,
     media: &MediaHub,
     message: ClientMessage,
@@ -449,30 +554,54 @@ async fn apply_client_message(
 ) -> Result<()> {
     match message {
         ClientMessage::PointerMove { dx, dy } => {
-            run_xdotool(
-                display,
-                [
-                    "mousemove_relative",
-                    "--",
-                    &dx.round().to_string(),
-                    &dy.round().to_string(),
-                ],
-            )
-            .await?;
+            let dx = dx.round() as i32;
+            let dy = dy.round() as i32;
+            if let Some(input_injector) = input_injector {
+                input_injector.queue_pointer_relative(dx, dy)?;
+                input_injector.flush()?;
+            } else {
+                run_xdotool(
+                    display,
+                    [
+                        "mousemove_relative",
+                        "--",
+                        &dx.to_string(),
+                        &dy.to_string(),
+                    ],
+                )
+                .await?;
+            }
         }
         ClientMessage::PointerAbsolute { x, y } => {
-            run_xdotool(display, ["mousemove", &x.to_string(), &y.to_string()]).await?;
+            if let Some(input_injector) = input_injector {
+                input_injector.queue_pointer_absolute(x, y)?;
+                input_injector.flush()?;
+            } else {
+                run_xdotool(display, ["mousemove", &x.to_string(), &y.to_string()]).await?;
+            }
         }
         ClientMessage::PointerButton { button, down } => {
-            let action = if down { "mousedown" } else { "mouseup" };
-            run_xdotool(display, [action, &button.to_string()]).await?;
+            if let Some(input_injector) = input_injector {
+                input_injector.pointer_button(button, down)?;
+            } else {
+                let action = if down { "mousedown" } else { "mouseup" };
+                run_xdotool(display, [action, &button.to_string()]).await?;
+            }
         }
         ClientMessage::PointerWheel { delta_y } => {
-            let button = if delta_y < 0 { "4" } else { "5" };
-            run_xdotool(display, ["click", button]).await?;
+            let button = if delta_y < 0 { 4 } else { 5 };
+            if let Some(input_injector) = input_injector {
+                input_injector.pointer_click(button)?;
+            } else {
+                run_xdotool(display, ["click", &button.to_string()]).await?;
+            }
         }
         ClientMessage::TouchTap => {
-            run_xdotool(display, ["click", "1"]).await?;
+            if let Some(input_injector) = input_injector {
+                input_injector.pointer_click(1)?;
+            } else {
+                run_xdotool(display, ["click", "1"]).await?;
+            }
         }
         ClientMessage::Key { key, down } => {
             if down {
@@ -502,7 +631,7 @@ async fn apply_client_message(
             type_remote_text(display, &text).await?;
         }
         ClientMessage::Paste => {
-            reset_input_state(display, pressed_keys).await?;
+            reset_input_state(display, input_injector, pressed_keys).await?;
             *last_key_state_at = None;
             run_xdotool(display, ["key", "ctrl+v"]).await?;
         }
@@ -518,12 +647,12 @@ async fn apply_client_message(
                     .into(),
                 ))
                 .await?;
-            reset_input_state(display, pressed_keys).await?;
+            reset_input_state(display, input_injector, pressed_keys).await?;
             *last_key_state_at = None;
             run_xdotool(display, ["key", "ctrl+v"]).await?;
         }
         ClientMessage::ResetInput => {
-            reset_input_state(display, pressed_keys).await?;
+            reset_input_state(display, input_injector, pressed_keys).await?;
             *last_key_state_at = None;
         }
         ClientMessage::UpdateStreamSettings {
@@ -562,6 +691,55 @@ async fn apply_client_message(
         }
     }
     Ok(())
+}
+
+async fn apply_pointer_motion_batch(
+    display: &str,
+    input_injector: Option<&X11InputInjector>,
+    motions: &[PointerMotionCommand],
+) -> Result<()> {
+    if motions.is_empty() {
+        return Ok(());
+    }
+    if let Some(input_injector) = input_injector {
+        for motion in motions {
+            match motion {
+                PointerMotionCommand::Absolute { x, y } => {
+                    input_injector.queue_pointer_absolute(*x, *y)?;
+                }
+                PointerMotionCommand::Relative { dx, dy } => {
+                    if *dx == 0 && *dy == 0 {
+                        continue;
+                    }
+                    input_injector.queue_pointer_relative(*dx, *dy)?;
+                }
+            }
+        }
+        return input_injector.flush();
+    }
+    let mut args = Vec::new();
+    for motion in motions {
+        match motion {
+            PointerMotionCommand::Absolute { x, y } => {
+                args.push("mousemove".to_string());
+                args.push(x.to_string());
+                args.push(y.to_string());
+            }
+            PointerMotionCommand::Relative { dx, dy } => {
+                if *dx == 0 && *dy == 0 {
+                    continue;
+                }
+                args.push("mousemove_relative".to_string());
+                args.push("--".to_string());
+                args.push(dx.to_string());
+                args.push(dy.to_string());
+            }
+        }
+    }
+    if args.is_empty() {
+        return Ok(());
+    }
+    run_xdotool(display, &args).await
 }
 
 fn key_chord_rank(key: &str) -> usize {
@@ -628,9 +806,17 @@ async fn release_pressed_keys(display: &str, pressed_keys: &mut HashSet<String>)
     Ok(())
 }
 
-async fn reset_input_state(display: &str, pressed_keys: &mut HashSet<String>) -> Result<()> {
-    for button in ["1", "2", "3", "4", "5"] {
-        run_xdotool(display, ["mouseup", button]).await?;
+async fn reset_input_state(
+    display: &str,
+    input_injector: Option<&X11InputInjector>,
+    pressed_keys: &mut HashSet<String>,
+) -> Result<()> {
+    if let Some(input_injector) = input_injector {
+        input_injector.release_all_buttons()?;
+    } else {
+        for button in ["1", "2", "3", "4", "5"] {
+            run_xdotool(display, ["mouseup", button]).await?;
+        }
     }
     release_pressed_keys(display, pressed_keys).await?;
     for key in [
@@ -650,7 +836,11 @@ async fn reset_input_state(display: &str, pressed_keys: &mut HashSet<String>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::key_chord_rank;
+    use super::{
+        PointerMotionCommand, key_chord_rank, push_pointer_motion_command,
+        should_wake_display_for_message,
+    };
+    use crate::messages::ClientMessage;
 
     #[test]
     fn chord_modifiers_sort_before_regular_keys() {
@@ -665,6 +855,60 @@ mod tests {
                 .then_with(|| left.cmp(right))
         });
         assert_eq!(keys, vec!["Control_L", "Shift_L", "v"]);
+    }
+
+    #[test]
+    fn pointer_motion_does_not_trigger_display_wake() {
+        assert!(!should_wake_display_for_message(&ClientMessage::PointerMove {
+            dx: 5.0,
+            dy: -3.0,
+        }));
+        assert!(!should_wake_display_for_message(&ClientMessage::PointerAbsolute {
+            x: 320,
+            y: 240,
+        }));
+        assert!(should_wake_display_for_message(&ClientMessage::PointerButton {
+            button: 1,
+            down: true,
+        }));
+    }
+
+    #[test]
+    fn pointer_motion_batch_keeps_only_latest_absolute_position() {
+        let mut motions = Vec::new();
+        push_pointer_motion_command(
+            &mut motions,
+            &ClientMessage::PointerMove { dx: 12.0, dy: 4.0 },
+        );
+        push_pointer_motion_command(
+            &mut motions,
+            &ClientMessage::PointerAbsolute { x: 320, y: 240 },
+        );
+        push_pointer_motion_command(
+            &mut motions,
+            &ClientMessage::PointerAbsolute { x: 640, y: 480 },
+        );
+        assert_eq!(
+            motions,
+            vec![PointerMotionCommand::Absolute { x: 640, y: 480 }]
+        );
+    }
+
+    #[test]
+    fn pointer_motion_batch_sums_consecutive_relative_moves() {
+        let mut motions = Vec::new();
+        push_pointer_motion_command(
+            &mut motions,
+            &ClientMessage::PointerMove { dx: 4.4, dy: 1.2 },
+        );
+        push_pointer_motion_command(
+            &mut motions,
+            &ClientMessage::PointerMove { dx: 2.0, dy: -3.0 },
+        );
+        assert_eq!(
+            motions,
+            vec![PointerMotionCommand::Relative { dx: 6, dy: -2 }]
+        );
     }
 }
 

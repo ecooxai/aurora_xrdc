@@ -156,7 +156,7 @@ pub async fn choose_encoder(
 
 pub async fn available_encoder_options(codec: CodecKind) -> Result<Vec<AvailableEncoderOption>> {
     let encoders = ffmpeg_list_encoders().await?;
-    let mut options = default_encoder_options(codec);
+    let mut options = Vec::new();
     for profile in available_profiles(codec, &encoders).await {
         options.push(AvailableEncoderOption {
             value: specific_preference(profile.ffmpeg_encoder)
@@ -171,31 +171,6 @@ pub async fn available_encoder_options(codec: CodecKind) -> Result<Vec<Available
         });
     }
     Ok(options)
-}
-
-fn default_encoder_options(codec: CodecKind) -> Vec<AvailableEncoderOption> {
-    let mut options = Vec::new();
-    if codec != CodecKind::Vp8 {
-        options.push(AvailableEncoderOption {
-            value: EncodePreference::Nvidia,
-            label: "NVIDIA auto".into(),
-            mode: "gpu",
-            ffmpeg_encoder: None,
-        });
-        options.push(AvailableEncoderOption {
-            value: EncodePreference::Gpu,
-            label: "GPU auto".into(),
-            mode: "gpu",
-            ffmpeg_encoder: None,
-        });
-    }
-    options.push(AvailableEncoderOption {
-        value: EncodePreference::Cpu,
-        label: "CPU auto".into(),
-        mode: "cpu",
-        ffmpeg_encoder: None,
-    });
-    options
 }
 
 async fn available_profiles(codec: CodecKind, encoders: &str) -> Vec<EncoderProfile> {
