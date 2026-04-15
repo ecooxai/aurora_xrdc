@@ -166,11 +166,6 @@ const state = {
   pressedKeys: new Set(),
   modifierChordKeys: new Set(),
   keyStateSyncTimer: 0,
-  pendingPointer: null,
-  pendingPointerDirty: false,
-  pointerRaf: 0,
-  pendingRelativePointer: null,
-  relativePointerRaf: 0,
   wheelAccumulator: 0,
   pendingWheelSteps: 0,
   wheelRaf: 0,
@@ -3141,41 +3136,13 @@ function queueWheel(deltaY) {
   scheduleWheelFlush();
 }
 
-function flushPointerFrame() {
-  state.pointerRaf = 0;
-  const point = state.pendingPointer;
-  const dirty = state.pendingPointerDirty;
-  state.pendingPointerDirty = false;
-  if (dirty && point) {
-    send({ type: "pointer_absolute", x: point.x, y: point.y });
-  }
-}
-
-function ensurePointerFrameLoop() {
-  if (state.pointerRaf) return;
-  state.pointerRaf = requestAnimationFrame(flushPointerFrame);
-}
-
 function queuePointerMove(x, y) {
-  state.pendingPointer = { x, y };
-  state.pendingPointerDirty = true;
-  ensurePointerFrameLoop();
+  send({ type: "pointer_absolute", x, y });
 }
 
 function queueRelativePointerMove(dx, dy) {
   if (!dx && !dy) return;
-  const pending = state.pendingRelativePointer || { dx: 0, dy: 0 };
-  pending.dx += dx;
-  pending.dy += dy;
-  state.pendingRelativePointer = pending;
-  if (state.relativePointerRaf) return;
-  state.relativePointerRaf = requestAnimationFrame(() => {
-    state.relativePointerRaf = 0;
-    const delta = state.pendingRelativePointer;
-    state.pendingRelativePointer = null;
-    if (!delta || (!delta.dx && !delta.dy)) return;
-    send({ type: "pointer_move", dx: delta.dx, dy: delta.dy });
-  });
+  send({ type: "pointer_move", dx, dy });
 }
 
 function clientPointToCanvas(clientX, clientY) {
@@ -3233,19 +3200,8 @@ function resetTouchInteraction() {
   state.touchPointers.clear();
   state.touchDragPointerId = null;
   state.touchScrollLastY = null;
-  state.pendingPointer = null;
-  state.pendingPointerDirty = false;
-  state.pendingRelativePointer = null;
   state.pendingWheelSteps = 0;
   state.wheelAccumulator = 0;
-  if (state.pointerRaf) {
-    cancelAnimationFrame(state.pointerRaf);
-    state.pointerRaf = 0;
-  }
-  if (state.relativePointerRaf) {
-    cancelAnimationFrame(state.relativePointerRaf);
-    state.relativePointerRaf = 0;
-  }
   if (state.wheelRaf) {
     cancelAnimationFrame(state.wheelRaf);
     state.wheelRaf = 0;
@@ -3861,11 +3817,6 @@ function initControls() {
     });
     queuePointerMove(point.x, point.y);
     if (event.button === 0 || event.button === 2 || event.button === 1) {
-      if (state.pointerRaf) {
-        cancelAnimationFrame(state.pointerRaf);
-        state.pointerRaf = 0;
-      }
-      flushPointerFrame();
       send({ type: "pointer_button", button: event.button + 1, down: true });
       event.preventDefault();
     }

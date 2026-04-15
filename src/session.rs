@@ -478,7 +478,6 @@ fn is_pointer_motion_message(message: &ClientMessage) -> bool {
 fn push_pointer_motion_command(commands: &mut Vec<PointerMotionCommand>, message: &ClientMessage) {
     match message {
         ClientMessage::PointerAbsolute { x, y } => {
-            commands.clear();
             commands.push(PointerMotionCommand::Absolute { x: *x, y: *y });
         }
         ClientMessage::PointerMove { dx, dy } => {
@@ -870,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_motion_batch_keeps_only_latest_absolute_position() {
+    fn pointer_motion_batch_preserves_absolute_positions() {
         let mut motions = Vec::new();
         push_pointer_motion_command(
             &mut motions,
@@ -886,7 +885,11 @@ mod tests {
         );
         assert_eq!(
             motions,
-            vec![PointerMotionCommand::Absolute { x: 640, y: 480 }]
+            vec![
+                PointerMotionCommand::Relative { dx: 12, dy: 4 },
+                PointerMotionCommand::Absolute { x: 320, y: 240 },
+                PointerMotionCommand::Absolute { x: 640, y: 480 },
+            ]
         );
     }
 
