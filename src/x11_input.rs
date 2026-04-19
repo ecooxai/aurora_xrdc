@@ -59,6 +59,11 @@ impl X11InputInjector {
         self.flush()
     }
 
+    pub fn queue_pointer_click(&self, button: u8) -> Result<()> {
+        self.queue_pointer_button(button, true)?;
+        self.queue_pointer_button(button, false)
+    }
+
     pub fn release_all_buttons(&self) -> Result<()> {
         for button in 1..=5 {
             self.queue_pointer_button(button, false)?;

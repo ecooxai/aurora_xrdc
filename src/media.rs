@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::{
     process::Child,
     sync::{Mutex, broadcast, watch},
@@ -19,6 +19,7 @@ use crate::{
 pub struct ActiveVideoState {
     pub config: StreamConfig,
     pub encoder: crate::ffmpeg::EncoderChoice,
+    pub config_fallback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -235,12 +236,9 @@ impl VideoHub {
             return Ok(());
         }
 
-        match streamer::start(self.server.clone(), desired.clone(), self.frames.clone()).await {
-            Ok((encoder, child)) => {
-                let state = ActiveVideoState {
-                    config: desired,
-                    encoder,
-                };
+        match self.start_capture_with_encoder_fallback(desired).await {
+            Ok((state, child)) => {
+                runtime.desired_config = state.config.clone();
                 self.state.send_replace(Some(state.clone()));
                 runtime.active = Some(VideoProcess {
                     state,
@@ -252,6 +250,52 @@ impl VideoHub {
                 self.state.send_replace(None);
                 self.frames.send_replace(None);
                 Err(err)
+            }
+        }
+    }
+
+    async fn start_capture_with_encoder_fallback(
+        &self,
+        desired: StreamConfig,
+    ) -> Result<(ActiveVideoState, Child)> {
+        match streamer::start(self.server.clone(), desired.clone(), self.frames.clone()).await {
+            Ok((encoder, child)) => Ok((
+                ActiveVideoState {
+                    config: desired,
+                    encoder,
+                    config_fallback: false,
+                },
+                child,
+            )),
+            Err(err) => {
+                let fallback = desired.h264_cpu_fallback();
+                if fallback == desired {
+                    return Err(err);
+                }
+
+                let original_error = err.to_string();
+                warn!(
+                    requested = ?desired,
+                    fallback = ?fallback,
+                    error = %original_error,
+                    "ffmpeg encoder unavailable; falling back to H.264 CPU"
+                );
+                let (encoder, child) =
+                    streamer::start(self.server.clone(), fallback.clone(), self.frames.clone())
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to start H.264 CPU fallback after requested encoder failed: {original_error}"
+                            )
+                        })?;
+                Ok((
+                    ActiveVideoState {
+                        config: fallback,
+                        encoder,
+                        config_fallback: true,
+                    },
+                    child,
+                ))
             }
         }
     }

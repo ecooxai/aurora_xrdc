@@ -494,8 +494,8 @@ async fn ws(
     }
     let config = StreamConfig {
         codec: query.codec.unwrap_or(CodecKind::H264),
-        bitrate_kbps: query.bitrate_kbps.unwrap_or(4_000),
-        fps: query.fps.unwrap_or(16),
+        bitrate_kbps: query.bitrate_kbps.unwrap_or(2_000),
+        fps: query.fps.unwrap_or(23),
         encode_preference: query.encode_preference.unwrap_or_default(),
     }
     .normalized();

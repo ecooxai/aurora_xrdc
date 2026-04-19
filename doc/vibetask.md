@@ -1,5 +1,5 @@
  # new task
-use rust to build a remote desktop app, it start a web server host a webclient, when user open in browser, encode current x server screen(prefer gpu encode and fallback to cpu encode) to h264/h265 then stream current x server video to user, user decode via webcodex, user also can control via pointer or touch screen (like touch pad),we need high performance and lowest lantency, user can set h264(default) or h265 or v8, also set bitrate(default to 4Mb) and fps(default 16fps) in client,also support ?debug=1 to show overlay info like latency,fps, codex, gpu/cpu, cpu usage, memory usage and realtime net speed
+use rust to build a remote desktop app, it start a web server host a webclient, when user open in browser, encode current x server screen(prefer gpu encode and fallback to cpu encode) to h264/h265 then stream current x server video to user, user decode via webcodex, user also can control via pointer or touch screen (like touch pad),we need high performance and lowest lantency, user can set h264(default) or h265 or v8, also set bitrate(default to 2Mb) and fps(default 23fps) in client,also support ?debug=1 to show overlay info like latency,fps, codex, gpu/cpu, cpu usage, memory usage and realtime net speed
 
 # vibetask.md
   doc/vibetask.md, put md doc file in doc/

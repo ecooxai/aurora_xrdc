@@ -13,6 +13,7 @@ pub enum ServerMessage {
         display: String,
         config: StreamConfig,
         audio_config: Option<AudioStreamConfig>,
+        config_fallback: bool,
         active_encoder: String,
         encoder_mode: &'static str,
         codec_string: String,
@@ -64,7 +65,13 @@ pub enum ClientMessage {
         down: bool,
     },
     PointerWheel {
-        delta_y: i32,
+        #[serde(default)]
+        delta_x: f64,
+        delta_y: f64,
+        #[serde(default)]
+        delta_mode: Option<u8>,
+        #[serde(default)]
+        scroll_speed: Option<f64>,
     },
     TouchTap,
     Key {

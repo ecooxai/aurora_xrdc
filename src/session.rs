@@ -31,11 +31,26 @@ const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
 const AUDIO_PACKET_QUEUE_CAPACITY: usize = 128;
 const DISPLAY_WAKE_INTERVAL: Duration = Duration::from_millis(350);
+const WHEEL_PIXEL_STEP: f64 = 100.0;
+const WHEEL_LINE_STEP: f64 = 3.0;
+const WHEEL_PAGE_STEPS: f64 = 8.0;
+const WHEEL_MAX_STEPS_PER_MESSAGE: f64 = 64.0;
+const WHEEL_GESTURE_IDLE_INTERVAL: Duration = Duration::from_millis(160);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PointerMotionCommand {
     Absolute { x: i32, y: i32 },
     Relative { dx: i32, dy: i32 },
+}
+
+#[derive(Debug, Default)]
+struct WheelAccumulator {
+    x_steps: f64,
+    y_steps: f64,
+    x_last_at: Option<Instant>,
+    y_last_at: Option<Instant>,
+    x_last_sign: i8,
+    y_last_sign: i8,
 }
 
 pub async fn handle_socket(
@@ -363,6 +378,7 @@ async fn handle_client(
     let mut mic_input = MicInputState::Idle;
     let mut last_key_state_at = None;
     let mut last_display_wake_at = None;
+    let mut wheel_accumulator = WheelAccumulator::default();
     let input_injector = match X11InputInjector::connect(&server.display) {
         Ok(injector) => Some(injector),
         Err(err) => {
@@ -416,6 +432,7 @@ async fn handle_client(
                                     client,
                                     &mut pressed_keys,
                                     &mut last_key_state_at,
+                                    &mut wheel_accumulator,
                                 )
                                 .await?;
                                 false
@@ -528,6 +545,119 @@ fn drain_pointer_motion_messages(
     }
 }
 
+fn wheel_clicks_for_delta(
+    accumulator: &mut WheelAccumulator,
+    delta_x: f64,
+    delta_y: f64,
+    delta_mode: Option<u8>,
+    scroll_speed: Option<f64>,
+) -> Vec<(u8, u32)> {
+    let speed = scroll_speed
+        .filter(|speed| speed.is_finite())
+        .unwrap_or(1.0)
+        .clamp(0.1, 5.0);
+    let x_steps = normalize_wheel_delta(delta_x, delta_mode) * speed;
+    let y_steps = normalize_wheel_delta(delta_y, delta_mode) * speed;
+    let horizontal_steps = accumulate_wheel_steps(
+        &mut accumulator.x_steps,
+        &mut accumulator.x_last_at,
+        &mut accumulator.x_last_sign,
+        x_steps,
+    );
+    let vertical_steps = accumulate_wheel_steps(
+        &mut accumulator.y_steps,
+        &mut accumulator.y_last_at,
+        &mut accumulator.y_last_sign,
+        y_steps,
+    );
+    let mut clicks = Vec::with_capacity(2);
+    if horizontal_steps < 0 {
+        clicks.push((6, horizontal_steps.unsigned_abs()));
+    } else if horizontal_steps > 0 {
+        clicks.push((7, horizontal_steps as u32));
+    }
+    if vertical_steps < 0 {
+        clicks.push((4, vertical_steps.unsigned_abs()));
+    } else if vertical_steps > 0 {
+        clicks.push((5, vertical_steps as u32));
+    }
+    clicks
+}
+
+fn normalize_wheel_delta(delta: f64, delta_mode: Option<u8>) -> f64 {
+    if !delta.is_finite() {
+        return 0.0;
+    }
+    let delta = delta.clamp(-10_000.0, 10_000.0);
+    match delta_mode {
+        // Old clients sent already-quantized wheel steps and had no deltaMode.
+        None => delta,
+        Some(0) => delta / WHEEL_PIXEL_STEP,
+        Some(1) => delta / WHEEL_LINE_STEP,
+        Some(2) => delta * WHEEL_PAGE_STEPS,
+        Some(_) => delta / WHEEL_PIXEL_STEP,
+    }
+    .clamp(-WHEEL_MAX_STEPS_PER_MESSAGE, WHEEL_MAX_STEPS_PER_MESSAGE)
+}
+
+fn accumulate_wheel_steps(
+    remainder: &mut f64,
+    last_at: &mut Option<Instant>,
+    last_sign: &mut i8,
+    delta_steps: f64,
+) -> i32 {
+    if !delta_steps.is_finite() || delta_steps == 0.0 {
+        return 0;
+    }
+    let now = Instant::now();
+    let idle =
+        last_at.is_none_or(|last_at| now.duration_since(last_at) > WHEEL_GESTURE_IDLE_INTERVAL);
+    let sign = if delta_steps > 0.0 { 1 } else { -1 };
+    if idle || (*last_sign != 0 && *last_sign != sign) {
+        *remainder = 0.0;
+        *last_sign = 0;
+    }
+    *last_at = Some(now);
+    *last_sign = sign;
+    *remainder += delta_steps;
+    let mut whole_steps = if *remainder >= 0.0 {
+        remainder.floor()
+    } else {
+        remainder.ceil()
+    };
+    if whole_steps == 0.0 && idle && delta_steps.abs() < 1.0 {
+        whole_steps = f64::from(sign);
+    }
+    *remainder -= whole_steps;
+    whole_steps as i32
+}
+
+async fn apply_wheel_clicks(
+    display: &str,
+    input_injector: Option<&X11InputInjector>,
+    clicks: &[(u8, u32)],
+) -> Result<()> {
+    if clicks.is_empty() {
+        return Ok(());
+    }
+    if let Some(input_injector) = input_injector {
+        for (button, count) in clicks {
+            for _ in 0..*count {
+                input_injector.queue_pointer_click(*button)?;
+            }
+        }
+        return input_injector.flush();
+    }
+    let mut args = Vec::new();
+    for (button, count) in clicks {
+        for _ in 0..*count {
+            args.push("click".to_string());
+            args.push(button.to_string());
+        }
+    }
+    run_xdotool(display, &args).await
+}
+
 async fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
     if let Some(last_wake_at) = last_wake_at {
         if last_wake_at.elapsed() < DISPLAY_WAKE_INTERVAL {
@@ -548,6 +678,7 @@ async fn apply_client_message(
     message: ClientMessage,
     pressed_keys: &mut HashSet<String>,
     last_key_state_at: &mut Option<Instant>,
+    wheel_accumulator: &mut WheelAccumulator,
 ) -> Result<()> {
     match message {
         ClientMessage::PointerMove { dx, dy } => {
@@ -580,13 +711,20 @@ async fn apply_client_message(
                 run_xdotool(display, [action, &button.to_string()]).await?;
             }
         }
-        ClientMessage::PointerWheel { delta_y } => {
-            let button = if delta_y < 0 { 4 } else { 5 };
-            if let Some(input_injector) = input_injector {
-                input_injector.pointer_click(button)?;
-            } else {
-                run_xdotool(display, ["click", &button.to_string()]).await?;
-            }
+        ClientMessage::PointerWheel {
+            delta_x,
+            delta_y,
+            delta_mode,
+            scroll_speed,
+        } => {
+            let clicks = wheel_clicks_for_delta(
+                wheel_accumulator,
+                delta_x,
+                delta_y,
+                delta_mode,
+                scroll_speed,
+            );
+            apply_wheel_clicks(display, input_injector, &clicks).await?;
         }
         ClientMessage::TouchTap => {
             if let Some(input_injector) = input_injector {
@@ -829,8 +967,8 @@ async fn reset_input_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        PointerMotionCommand, key_chord_rank, push_pointer_motion_command,
-        should_wake_display_for_message,
+        PointerMotionCommand, WheelAccumulator, key_chord_rank, push_pointer_motion_command,
+        should_wake_display_for_message, wheel_clicks_for_delta,
     };
     use crate::messages::ClientMessage;
 
@@ -874,9 +1012,11 @@ mod tests {
         assert!(!should_wake_display_for_message(&ClientMessage::KeyState {
             pressed_keys: vec!["Shift_L".to_string()],
         }));
-        assert!(!should_wake_display_for_message(&ClientMessage::TextInput {
-            text: "hello".to_string(),
-        }));
+        assert!(!should_wake_display_for_message(
+            &ClientMessage::TextInput {
+                text: "hello".to_string(),
+            }
+        ));
     }
 
     #[test]
@@ -918,6 +1058,59 @@ mod tests {
         assert_eq!(
             motions,
             vec![PointerMotionCommand::Relative { dx: 6, dy: -2 }]
+        );
+    }
+
+    #[test]
+    fn legacy_wheel_message_uses_step_units() {
+        let mut accumulator = WheelAccumulator::default();
+        assert_eq!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, 1.0, None, None),
+            vec![(5, 1)]
+        );
+        assert_eq!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, -1.0, None, None),
+            vec![(4, 1)]
+        );
+    }
+
+    #[test]
+    fn pixel_wheel_deltas_emit_immediately_then_repay_fractional_debt() {
+        let mut accumulator = WheelAccumulator::default();
+        assert_eq!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, 40.0, Some(0), Some(1.0)),
+            vec![(5, 1)]
+        );
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 40.0, Some(0), Some(1.0)).is_empty());
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 20.0, Some(0), Some(1.0)).is_empty());
+    }
+
+    #[test]
+    fn wheel_supports_horizontal_axis() {
+        let mut accumulator = WheelAccumulator::default();
+        assert_eq!(
+            wheel_clicks_for_delta(&mut accumulator, 100.0, 0.0, Some(0), Some(1.0)),
+            vec![(7, 1)]
+        );
+        assert_eq!(
+            wheel_clicks_for_delta(&mut accumulator, -100.0, 0.0, Some(0), Some(1.0)),
+            vec![(6, 1)]
+        );
+    }
+
+    #[test]
+    fn wheel_direction_change_drops_substep_remainder() {
+        let mut accumulator = WheelAccumulator::default();
+        assert_eq!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, 80.0, Some(0), Some(1.0)),
+            vec![(5, 1)]
+        );
+        assert!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, -30.0, Some(0), Some(1.0)).is_empty()
+        );
+        assert_eq!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, -70.0, Some(0), Some(1.0)),
+            vec![(4, 1)]
         );
     }
 }
@@ -1021,6 +1214,7 @@ async fn send_hello(
                 display: display.unwrap_or_default().into(),
                 config: video_state.config.clone(),
                 audio_config: audio_state.map(|state| state.config.clone()),
+                config_fallback: video_state.config_fallback,
                 active_encoder: video_state.encoder.ffmpeg_encoder.clone(),
                 encoder_mode: video_state.encoder.mode,
                 codec_string: video_state.config.codec.as_webcodec().into(),

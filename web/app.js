@@ -23,22 +23,19 @@ const AUDIO_MIN_BUFFER_SECONDS = 0.05;
 const AUDIO_UNDERRUN_RETRY_MS = 2000;
 const AUDIO_UNDERRUN_RESUME_SECONDS = 2;
 const AUDIO_UNDERRUN_POLL_MS = 100;
-const AUDIO_REBUFFER_BUFFER_SECONDS = 3;
-const AUDIO_REBUFFER_HOLD_MS = 4000;
-const AUDIO_TRIM_LATENCY_LOW_BUFFER_SECONDS = 1.9;
-const AUDIO_TRIM_LATENCY_BUFFER_SECONDS = 2.1;
+const AUDIO_REBUFFER_EXTRA_SECONDS = 0.3;
+const AUDIO_REBUFFER_HOLD_MS = 10000;
+const AUDIO_TRIM_LATENCY_EXTRA_SECONDS = 0.3;
 const AUDIO_TRIM_LATENCY_HOLD_MS = 20000;
 const AUDIO_TRIM_TARGET_EXTRA_SECONDS = 0.2;
+const AUDIO_GOOD_LATENCY_BUFFER_SECONDS = 0.75;
 const AUDIO_UNDERRUN_WARNING = "Audio buffer too small, pausing playback";
 const AAC_SAMPLES_PER_FRAME = 1024;
 const AUDIO_BASE_PLAYBACK_RATE = 0.9650;
 const AUDIO_AUTO_CLOCK_STEP = 0.005;
-const AUDIO_AUTO_CLOCK_INCREASE_BUFFER_SECONDS = 2.4;
-const AUDIO_AUTO_CLOCK_INCREASE_INTERVAL_MS = 7000;
-const AUDIO_AUTO_CLOCK_INCREASE_MIN_GROWTH_SECONDS = 0.1;
-const AUDIO_AUTO_CLOCK_SLOW_TUNE_STEP = 0.001;
+const AUDIO_AUTO_CLOCK_SLOW_TUNE_STEP = 0.0005;
 const AUDIO_AUTO_CLOCK_SLOW_TUNE_TARGET_EXTRA_SECONDS = 0.2;
-const AUDIO_AUTO_CLOCK_SLOW_TUNE_INTERVAL_MS = 30000;
+const AUDIO_AUTO_CLOCK_SLOW_TUNE_INTERVAL_MS = 8000;
 const AUDIO_DRIFT_SLOWDOWN_MAX = 0.05;
 const AUDIO_DRIFT_SPEEDUP_MAX = 0.02;
 const AUDIO_DRIFT_CORRECTION_DEADZONE_SECONDS = 0.015;
@@ -167,9 +164,6 @@ const state = {
   pressedKeys: new Set(),
   modifierChordKeys: new Set(),
   keyStateSyncTimer: 0,
-  wheelAccumulator: 0,
-  pendingWheelSteps: 0,
-  wheelRaf: 0,
   localClipboard: { text: null, image_png_b64: null },
   remoteClipboard: { text: null, image_png_b64: null },
   localClipboardSig: "",
@@ -388,11 +382,22 @@ function renderLatencyMetric() {
     : "--";
 }
 
-function currentBufferedAudioSeconds() {
+function pendingEncodedAudioSeconds() {
+  return state.pendingEncodedAudioFrames.reduce(
+    (total, frame) => total + (Number(frame.durationSeconds) || 0),
+    0,
+  );
+}
+
+function currentDecodedAudioSeconds() {
   const audioContext = state.audioContext;
   const now = Number.isFinite(audioContext?.currentTime) ? audioContext.currentTime : 0;
   const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
   return Math.max(0, queuedFor + state.pendingAudioDuration + state.audioDecodingDuration);
+}
+
+function currentBufferedAudioSeconds() {
+  return currentDecodedAudioSeconds() + pendingEncodedAudioSeconds();
 }
 
 function renderAudioBufferMetric() {
@@ -565,7 +570,7 @@ function syncPendingStreamSettings(settings = readSettingsFromControls()) {
   state.lastLocalStreamSettingsAt = performance.now();
 }
 
-function syncServerStreamSettings(streamConfig, audioConfig) {
+function syncServerStreamSettings(streamConfig, audioConfig, { force = false } = {}) {
   const incoming = normalizeSettings({
     codec: streamConfig?.codec,
     encodePreference: streamConfig?.encode_preference,
@@ -578,19 +583,30 @@ function syncServerStreamSettings(streamConfig, audioConfig) {
   const incomingKey = streamReconnectSettingsKey(incoming);
   if (incomingKey === currentKey) {
     markAppliedStreamSettings(incoming);
+    if (force) {
+      clearSettingsReconnectTimer();
+      state.pendingStreamSettingsKey = "";
+      state.lastLocalStreamSettingsAt = 0;
+    }
     return;
   }
-  const recentlyChangedLocally = state.lastLocalStreamSettingsAt > 0
-    && performance.now() - state.lastLocalStreamSettingsAt < SETTINGS_RECONNECT_DELAY_MS;
-  if (recentlyChangedLocally) {
-    return;
-  }
-  if (!state.appliedStreamSettingsKey) {
-    markAppliedStreamSettings(incoming);
-    return;
-  }
-  if (state.pendingStreamSettingsKey && incomingKey !== state.pendingStreamSettingsKey) {
-    return;
+  if (!force) {
+    const recentlyChangedLocally = state.lastLocalStreamSettingsAt > 0
+      && performance.now() - state.lastLocalStreamSettingsAt < SETTINGS_RECONNECT_DELAY_MS;
+    if (recentlyChangedLocally) {
+      return;
+    }
+    if (!state.appliedStreamSettingsKey) {
+      markAppliedStreamSettings(incoming);
+      return;
+    }
+    if (state.pendingStreamSettingsKey && incomingKey !== state.pendingStreamSettingsKey) {
+      return;
+    }
+  } else {
+    clearSettingsReconnectTimer();
+    state.pendingStreamSettingsKey = "";
+    state.lastLocalStreamSettingsAt = 0;
   }
   const next = {
     ...current,
@@ -1632,7 +1648,9 @@ function handleServerMessage(message) {
       state.sessionId = message.session_id;
     }
     if (message.config) {
-      syncServerStreamSettings(message.config, message.audio_config);
+      syncServerStreamSettings(message.config, message.audio_config, {
+        force: message.config_fallback === true,
+      });
     }
     const codecStringChanged = typeof message.codec_string === "string"
       && message.codec_string !== state.codecString;
@@ -1959,8 +1977,12 @@ function handleAudioFrame(buffer, view) {
   const stalledForMs = state.lastAudioPacketAt ? receivedAt - state.lastAudioPacketAt : 0;
   state.lastAudioPacketAt = receivedAt;
   const mediaAgeMs = estimateMediaAgeMs(sentAt);
-  if (stalledForMs >= MEDIA_STALL_RESET_MS || mediaAgeMs > LIVE_MEDIA_MAX_AGE_MS) {
-    markStaleDrop("Buffered delayed audio");
+  if (mediaAgeMs > LIVE_MEDIA_MAX_AGE_MS) {
+    markStaleDrop(`Dropping delayed audio packet ${Math.round(mediaAgeMs)} ms old`);
+    return;
+  }
+  if (stalledForMs >= MEDIA_STALL_RESET_MS) {
+    markStaleDrop("Audio stream resumed after stall");
   }
   const length = view.getUint32(9, true);
   const bytes = new Uint8Array(buffer, 13, length);
@@ -2147,27 +2169,77 @@ function currentConfiguredAudioLatencySeconds() {
   return Math.max(AUDIO_MIN_BUFFER_SECONDS, currentConfiguredAudioLatencyMs() / 1000);
 }
 
-function rebufferOversizedAudioBuffer() {
-  state.audioLargeBufferSinceAt = 0;
-  state.audioHighLatencySinceAt = 0;
-  markStaleDrop("Rebuffering oversized audio buffer");
-  resetAudioDecoderForLiveCatchup();
+function oversizedAudioBufferSeconds(profile) {
+  return (profile.targetBufferSeconds * 2) + AUDIO_REBUFFER_EXTRA_SECONDS;
 }
 
-function trimAudioBufferToTarget(profile) {
-  const keepSeconds = Math.max(
+function trimAudioLatencyLowSeconds(profile) {
+  return profile.targetBufferSeconds + AUDIO_TRIM_LATENCY_EXTRA_SECONDS;
+}
+
+function audioBufferNeedsCatchup(bufferedSeconds) {
+  return bufferedSeconds >= AUDIO_GOOD_LATENCY_BUFFER_SECONDS;
+}
+
+function msFromSeconds(seconds) {
+  return Math.round(Math.max(0, seconds) * 1000);
+}
+
+function audioTrimTargetSeconds(profile) {
+  return Math.max(
     profile.minBufferSeconds,
     profile.targetBufferSeconds + AUDIO_TRIM_TARGET_EXTRA_SECONDS,
   );
+}
+
+function rebufferOversizedAudioBuffer(profile, bufferedSeconds) {
+  state.audioLargeBufferSinceAt = 0;
+  state.audioHighLatencySinceAt = 0;
+  setConfiguredAudioClockRate(currentConfiguredAudioClockRate() + AUDIO_AUTO_CLOCK_STEP);
+  const limitMs = msFromSeconds(oversizedAudioBufferSeconds(profile));
+  const goodLatencyMs = msFromSeconds(AUDIO_GOOD_LATENCY_BUFFER_SECONDS);
+  const targetMs = msFromSeconds(audioTrimTargetSeconds(profile));
+  trimAudioBufferToTarget(
+    profile,
+    `Audio buffer ${msFromSeconds(bufferedSeconds)} ms > latency*2+300 ms (${limitMs} ms) and >= ${goodLatencyMs} ms, dropping to latency+200 ms (${targetMs} ms)`,
+  );
+}
+
+function trimPendingEncodedAudioFrames(keepSeconds) {
+  const keptFrames = [];
+  let keptDuration = 0;
+  for (let index = state.pendingEncodedAudioFrames.length - 1; index >= 0; index -= 1) {
+    const frame = state.pendingEncodedAudioFrames[index];
+    const duration = Number(frame.durationSeconds) || 0;
+    if (keptFrames.length > 0 && keptDuration + duration > keepSeconds) {
+      continue;
+    }
+    keptFrames.unshift(frame);
+    keptDuration += duration;
+  }
+  state.pendingEncodedAudioFrames = keptFrames;
+  return keptDuration;
+}
+
+function trimAudioBufferToTarget(profile, message = "") {
+  const keepSeconds = audioTrimTargetSeconds(profile);
   stopActiveAudioPlayback();
+  const encodedBudgetSeconds = Math.max(0, keepSeconds - state.audioDecodingDuration);
+  const keptEncodedDuration = trimPendingEncodedAudioFrames(encodedBudgetSeconds);
+  const decodedBudgetSeconds = Math.max(0, keepSeconds - state.audioDecodingDuration - keptEncodedDuration);
   const keptBuffers = [];
   let keptDuration = 0;
-  for (let index = state.pendingAudioBuffers.length - 1; index >= 0; index -= 1) {
-    const buffer = state.pendingAudioBuffers[index];
-    keptBuffers.unshift(buffer);
-    keptDuration += buffer.duration;
-    if (keptDuration >= keepSeconds) {
-      break;
+  if (decodedBudgetSeconds > 0) {
+    for (let index = state.pendingAudioBuffers.length - 1; index >= 0; index -= 1) {
+      const buffer = state.pendingAudioBuffers[index];
+      if (keptBuffers.length > 0 && keptDuration + buffer.duration > decodedBudgetSeconds) {
+        continue;
+      }
+      keptBuffers.unshift(buffer);
+      keptDuration += buffer.duration;
+      if (keptDuration >= decodedBudgetSeconds) {
+        break;
+      }
     }
   }
   state.pendingAudioBuffers = keptBuffers;
@@ -2177,7 +2249,7 @@ function trimAudioBufferToTarget(profile) {
   state.audioClockAutoLastIncreaseAt = 0;
   state.audioClockAutoLastIncreaseLead = 0;
   state.audioClockAutoLastSlowTuneAt = 0;
-  markStaleDrop(`Trimming delayed audio to ${Math.round(keepSeconds * 1000)} ms`);
+  markStaleDrop(message || `Dropping delayed audio buffer to ${msFromSeconds(keepSeconds)} ms`);
 }
 
 function setConfiguredAudioClockRate(nextRate) {
@@ -2201,36 +2273,6 @@ function maybeAutoDecreaseAudioClockRate() {
   state.audioClockAutoLastIncreaseLead = 0;
   state.audioClockAutoLastSlowTuneAt = 0;
   setConfiguredAudioClockRate(currentConfiguredAudioClockRate() - AUDIO_AUTO_CLOCK_STEP);
-}
-
-function maybeAutoIncreaseAudioClockRate(totalAvailableLead, wallNow) {
-  if (!currentConfiguredAudioClockAutoEnabled() || state.audioUnderrunActive) {
-    state.audioClockAutoLastIncreaseAt = 0;
-    state.audioClockAutoLastIncreaseLead = 0;
-    state.audioClockAutoLastSlowTuneAt = 0;
-    return;
-  }
-  if (totalAvailableLead < AUDIO_AUTO_CLOCK_INCREASE_BUFFER_SECONDS) {
-    state.audioClockAutoLastIncreaseAt = 0;
-    state.audioClockAutoLastIncreaseLead = 0;
-    return;
-  }
-  if (!state.audioClockAutoLastIncreaseAt) {
-    state.audioClockAutoLastIncreaseAt = wallNow;
-    state.audioClockAutoLastIncreaseLead = totalAvailableLead;
-    return;
-  }
-  if (wallNow - state.audioClockAutoLastIncreaseAt < AUDIO_AUTO_CLOCK_INCREASE_INTERVAL_MS) {
-    return;
-  }
-  const leadGrowth = totalAvailableLead - state.audioClockAutoLastIncreaseLead;
-  if (leadGrowth >= AUDIO_AUTO_CLOCK_INCREASE_MIN_GROWTH_SECONDS) {
-    setConfiguredAudioClockRate(currentConfiguredAudioClockRate() + AUDIO_AUTO_CLOCK_STEP);
-  } else {
-    trimAudioBufferToTarget(currentAudioBufferProfile());
-  }
-  state.audioClockAutoLastIncreaseAt = wallNow;
-  state.audioClockAutoLastIncreaseLead = totalAvailableLead;
 }
 
 function maybeAutoSlowTuneAudioClockRate(totalAvailableLead, wallNow, profile) {
@@ -2311,9 +2353,9 @@ function pumpPendingAudioDecode() {
   const profile = currentAudioBufferProfile();
   const decodeTargetSeconds = state.audioUnderrunActive
     ? currentAudioResumeBufferSeconds(profile)
-    : AUDIO_REBUFFER_BUFFER_SECONDS;
+    : oversizedAudioBufferSeconds(profile);
   while (state.pendingEncodedAudioFrames.length > 0) {
-    const bufferedSeconds = currentBufferedAudioSeconds();
+    const bufferedSeconds = currentDecodedAudioSeconds();
     if (bufferedSeconds >= decodeTargetSeconds) {
       break;
     }
@@ -2354,38 +2396,48 @@ function flushPendingAudioPlayback(audioContext) {
     const now = audioContext.currentTime;
     const wallNow = performance.now();
     const queuedFor = state.audioNextTime > now ? state.audioNextTime - now : 0;
-    const totalAvailableLead = queuedFor + state.pendingAudioDuration + state.audioDecodingDuration;
+    const decodedAvailableLead = queuedFor + state.pendingAudioDuration + state.audioDecodingDuration;
+    const totalAvailableLead = decodedAvailableLead + pendingEncodedAudioSeconds();
     const playbackStale = !state.audioNextTime || state.audioNextTime < now - profile.resetGraceSeconds;
-    if (totalAvailableLead > AUDIO_REBUFFER_BUFFER_SECONDS) {
+    const needsCatchup = audioBufferNeedsCatchup(totalAvailableLead);
+    const oversizedBufferSeconds = oversizedAudioBufferSeconds(profile);
+    if (needsCatchup && totalAvailableLead > oversizedBufferSeconds) {
       if (!state.audioLargeBufferSinceAt) {
         state.audioLargeBufferSinceAt = wallNow;
       } else if (wallNow - state.audioLargeBufferSinceAt >= AUDIO_REBUFFER_HOLD_MS) {
-        rebufferOversizedAudioBuffer();
+        rebufferOversizedAudioBuffer(profile, totalAvailableLead);
         break;
       }
     } else {
       state.audioLargeBufferSinceAt = 0;
     }
-    const trimInBand = totalAvailableLead > AUDIO_TRIM_LATENCY_LOW_BUFFER_SECONDS
-      && totalAvailableLead < AUDIO_TRIM_LATENCY_BUFFER_SECONDS;
+    const trimInBand = needsCatchup
+      && totalAvailableLead > trimAudioLatencyLowSeconds(profile)
+      && totalAvailableLead <= oversizedBufferSeconds;
     if (trimInBand) {
       if (!state.audioHighLatencySinceAt) {
         state.audioHighLatencySinceAt = wallNow;
       } else if (wallNow - state.audioHighLatencySinceAt >= AUDIO_TRIM_LATENCY_HOLD_MS) {
-        trimAudioBufferToTarget(profile);
+        const limitMs = msFromSeconds(trimAudioLatencyLowSeconds(profile));
+        const goodLatencyMs = msFromSeconds(AUDIO_GOOD_LATENCY_BUFFER_SECONDS);
+        const targetMs = msFromSeconds(audioTrimTargetSeconds(profile));
+        trimAudioBufferToTarget(
+          profile,
+          `Audio buffer ${msFromSeconds(totalAvailableLead)} ms > latency+300 ms (${limitMs} ms) and >= ${goodLatencyMs} ms, dropping to latency+200 ms (${targetMs} ms)`,
+        );
         break;
       }
     } else {
       state.audioHighLatencySinceAt = 0;
     }
-    if (totalAvailableLead < profile.minBufferSeconds) {
-      enterAudioUnderrun(audioContext, totalAvailableLead);
+    if (decodedAvailableLead < profile.minBufferSeconds) {
+      enterAudioUnderrun(audioContext, decodedAvailableLead);
       break;
     }
     if (state.audioUnderrunActive) {
       const resumeBufferSeconds = currentAudioResumeBufferSeconds(profile);
-      if (wallNow < state.audioResumeBlockedUntil || totalAvailableLead < resumeBufferSeconds) {
-        const bufferedMs = Math.max(0, Math.round(totalAvailableLead * 1000));
+      if (wallNow < state.audioResumeBlockedUntil || decodedAvailableLead < resumeBufferSeconds) {
+        const bufferedMs = Math.max(0, Math.round(decodedAvailableLead * 1000));
         const resumeMs = Math.max(0, Math.round(resumeBufferSeconds * 1000));
         setStreamWarning(`Audio rebuffering (${bufferedMs} / ${resumeMs} ms)`);
         const nextDelayMs = wallNow < state.audioResumeBlockedUntil
@@ -2396,9 +2448,14 @@ function flushPendingAudioPlayback(audioContext) {
       }
       clearAudioUnderrun();
     }
-    maybeAutoIncreaseAudioClockRate(totalAvailableLead, wallNow);
-    maybeAutoSlowTuneAudioClockRate(totalAvailableLead, wallNow, profile);
-    if (playbackStale && totalAvailableLead < profile.targetBufferSeconds) {
+    if (
+      needsCatchup
+      && !trimInBand
+      && totalAvailableLead <= trimAudioLatencyLowSeconds(profile)
+    ) {
+      maybeAutoSlowTuneAudioClockRate(totalAvailableLead, wallNow, profile);
+    }
+    if (playbackStale && decodedAvailableLead < profile.targetBufferSeconds) {
       break;
     }
     if (!playbackStale && queuedFor >= profile.targetBufferSeconds) {
@@ -3148,38 +3205,22 @@ function handleMobileKeyboardKeydown(event) {
   tapRemoteKey(key);
 }
 
-function flushQueuedWheel() {
-  state.wheelRaf = 0;
-  const steps = state.pendingWheelSteps;
-  state.pendingWheelSteps = 0;
-  if (!steps) return;
-  const direction = steps > 0 ? 1 : -1;
-  for (let i = 0; i < Math.abs(steps); i += 1) {
-    send({ type: "pointer_wheel", delta_y: direction });
-  }
+function scrollSpeedScale() {
+  const value = Number(scrollSpeedInput.value);
+  if (!Number.isFinite(value)) return 1;
+  return Math.min(Math.max(value * 0.25, 0.1), 5);
 }
 
-function scheduleWheelFlush() {
-  if (state.wheelRaf) return;
-  state.wheelRaf = requestAnimationFrame(flushQueuedWheel);
-}
-
-function queueWheel(deltaY) {
-  const speed = Number($("scroll-speed").value) * 0.25;
-  state.wheelAccumulator += deltaY * speed;
-  const threshold = 100;
-  let steps = 0;
-  while (state.wheelAccumulator >= threshold) {
-    state.wheelAccumulator -= threshold;
-    steps += 1;
-  }
-  while (state.wheelAccumulator <= -threshold) {
-    state.wheelAccumulator += threshold;
-    steps -= 1;
-  }
-  if (!steps) return;
-  state.pendingWheelSteps += Math.max(-4, Math.min(4, steps));
-  scheduleWheelFlush();
+function sendWheelDelta(deltaX, deltaY, deltaMode = 0) {
+  if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) return;
+  if (!deltaX && !deltaY) return;
+  send({
+    type: "pointer_wheel",
+    delta_x: deltaX,
+    delta_y: deltaY,
+    delta_mode: deltaMode,
+    scroll_speed: scrollSpeedScale(),
+  });
 }
 
 function queuePointerMove(x, y) {
@@ -3246,12 +3287,6 @@ function resetTouchInteraction() {
   state.touchPointers.clear();
   state.touchDragPointerId = null;
   state.touchScrollLastY = null;
-  state.pendingWheelSteps = 0;
-  state.wheelAccumulator = 0;
-  if (state.wheelRaf) {
-    cancelAnimationFrame(state.wheelRaf);
-    state.wheelRaf = 0;
-  }
 }
 
 function getAverageTouchClientY() {
@@ -3361,7 +3396,7 @@ function handleTouchPointerMove(event) {
     } else {
       const averageY = getAverageTouchClientY();
       if (averageY !== null) {
-        queueWheel(averageY - state.touchScrollLastY);
+        sendWheelDelta(0, averageY - state.touchScrollLastY, 0);
         state.touchScrollLastY = averageY;
       }
     }
@@ -3386,7 +3421,7 @@ function handleTouchPointerMove(event) {
         return;
       }
       clearTouchLongPress();
-      queueWheel((previous.clientY - event.clientY) * DIRECT_TOUCH_SCROLL_MULTIPLIER);
+      sendWheelDelta(0, (previous.clientY - event.clientY) * DIRECT_TOUCH_SCROLL_MULTIPLIER, 0);
     } else {
       const point = pointerToCanvas(event);
       if (point) queuePointerMove(point.x, point.y);
@@ -3895,7 +3930,7 @@ function initControls() {
   canvas.addEventListener("wheel", (event) => {
     event.preventDefault();
     synchronizeModifierState(event);
-    queueWheel(event.deltaY);
+    sendWheelDelta(event.deltaX, event.deltaY, event.deltaMode);
   }, { passive: false });
   window.addEventListener("keydown", (event) => {
     void primeAudioPlayback();

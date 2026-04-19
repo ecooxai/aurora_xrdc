@@ -170,8 +170,8 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             codec: CodecKind::H264,
-            bitrate_kbps: 4_000,
-            fps: 16,
+            bitrate_kbps: 2_000,
+            fps: 23,
             encode_preference: EncodePreference::Cpu,
         }
     }
@@ -183,6 +183,16 @@ impl StreamConfig {
         self.fps = self.fps.clamp(1, 60);
         self.encode_preference = self.encode_preference.normalized_for_codec(self.codec);
         self
+    }
+
+    pub fn h264_cpu_fallback(&self) -> Self {
+        Self {
+            codec: CodecKind::H264,
+            bitrate_kbps: self.bitrate_kbps,
+            fps: self.fps,
+            encode_preference: EncodePreference::Cpu,
+        }
+        .normalized()
     }
 }
 
@@ -415,6 +425,21 @@ mod tests {
         }
         .normalized();
         assert_eq!(cfg.encode_preference, EncodePreference::Av1Qsv);
+    }
+
+    #[test]
+    fn h264_cpu_fallback_preserves_rate_settings() {
+        let cfg = StreamConfig {
+            codec: CodecKind::H265,
+            bitrate_kbps: 6_000,
+            fps: 24,
+            encode_preference: EncodePreference::HevcQsv,
+        }
+        .h264_cpu_fallback();
+        assert_eq!(cfg.codec, CodecKind::H264);
+        assert_eq!(cfg.bitrate_kbps, 6_000);
+        assert_eq!(cfg.fps, 24);
+        assert_eq!(cfg.encode_preference, EncodePreference::Cpu);
     }
 
     #[test]
