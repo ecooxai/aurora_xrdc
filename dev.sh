@@ -1,10 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prefer a rustup-managed toolchain when available in the current workspace.
-if [[ -f "${HOME}/.cargo/env" ]]; then
+# Prefer a rustup-managed toolchain when available. Under sudo, use the
+# invoking user's rustup path because root often does not have cargo installed.
+CARGO_ENV_HOME="${HOME}"
+if [[ "$(id -u)" -eq 0 && -n "${SUDO_UID:-}" && "${SUDO_UID}" != "0" ]]; then
+    SUDO_PASSWD_ENTRY="$(getent passwd "${SUDO_UID}" 2>/dev/null || true)"
+    if [[ -n "${SUDO_PASSWD_ENTRY}" ]]; then
+        IFS=: read -r _ _ _ _ _ SUDO_HOME_FOR_CARGO _ <<<"${SUDO_PASSWD_ENTRY}"
+        if [[ -n "${SUDO_HOME_FOR_CARGO}" ]]; then
+            CARGO_ENV_HOME="${SUDO_HOME_FOR_CARGO}"
+        fi
+    fi
+fi
+if [[ -f "${CARGO_ENV_HOME}/.cargo/env" ]]; then
+    if [[ -d "${CARGO_ENV_HOME}/.cargo" ]]; then
+        export CARGO_HOME="${CARGO_HOME:-${CARGO_ENV_HOME}/.cargo}"
+    fi
+    if [[ -d "${CARGO_ENV_HOME}/.rustup" ]]; then
+        export RUSTUP_HOME="${RUSTUP_HOME:-${CARGO_ENV_HOME}/.rustup}"
+    fi
     # shellcheck disable=SC1090
-    . "${HOME}/.cargo/env"
+    SAVED_HOME_FOR_CARGO="${HOME}"
+    export HOME="${CARGO_ENV_HOME}"
+    . "${CARGO_ENV_HOME}/.cargo/env"
+    export HOME="${SAVED_HOME_FOR_CARGO}"
 fi
 
 WATCH_DIRS=(src web Cargo.toml)
@@ -18,7 +38,13 @@ XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
 export VIBE_RDESK_BIND="${VIBE_RDESK_BIND:-0.0.0.0:8001,[::]:8001}"
+DEV_LOG_UID="${SUDO_UID:-$(id -u)}"
+DEV_LOG_DIR="${VIBE_RDESK_LOG_DIR:-/tmp/vibe_rdesk-${DEV_LOG_UID}}"
 AUDIO_BACKEND=""
+SUDO_AUDIO_USER=""
+SUDO_AUDIO_UID=""
+SUDO_AUDIO_HOME=""
+SUDO_AUDIO_RUNTIME_DIR=""
 APP_PID=""
 XVFB_PID=""
 JWM_PID=""
@@ -83,6 +109,98 @@ wait_for_process() {
     return 1
 }
 
+configure_sudo_audio_env() {
+    if [[ "$(id -u)" -ne 0 || -z "${SUDO_UID:-}" || "${SUDO_UID}" == "0" ]]; then
+        return 0
+    fi
+
+    local passwd_entry=""
+    local passwd_user=""
+    local passwd_home=""
+
+    passwd_entry="$(getent passwd "${SUDO_UID}" 2>/dev/null || true)"
+    if [[ -n "${passwd_entry}" ]]; then
+        IFS=: read -r passwd_user _ _ _ _ passwd_home _ <<<"${passwd_entry}"
+    fi
+
+    SUDO_AUDIO_UID="${SUDO_UID}"
+    SUDO_AUDIO_USER="${SUDO_USER:-${passwd_user}}"
+    SUDO_AUDIO_HOME="${passwd_home}"
+    SUDO_AUDIO_RUNTIME_DIR="/run/user/${SUDO_AUDIO_UID}"
+
+    if [[ -z "${SUDO_AUDIO_USER}" ]]; then
+        echo "[dev] sudo audio: unable to resolve user for uid ${SUDO_AUDIO_UID}" >&2
+        return 0
+    fi
+
+    if [[ ! -d "${SUDO_AUDIO_RUNTIME_DIR}" ]]; then
+        echo "[dev] sudo audio: ${SUDO_AUDIO_RUNTIME_DIR} does not exist; the normal user's audio session may not be running" >&2
+        return 0
+    fi
+
+    export XDG_RUNTIME_DIR="${SUDO_AUDIO_RUNTIME_DIR}"
+    export PULSE_SERVER="unix:${SUDO_AUDIO_RUNTIME_DIR}/pulse/native"
+
+    if [[ -z "${PULSE_COOKIE:-}" && -n "${SUDO_AUDIO_HOME}" ]]; then
+        if [[ -r "${SUDO_AUDIO_HOME}/.config/pulse/cookie" ]]; then
+            export PULSE_COOKIE="${SUDO_AUDIO_HOME}/.config/pulse/cookie"
+        elif [[ -r "${SUDO_AUDIO_HOME}/.pulse-cookie" ]]; then
+            export PULSE_COOKIE="${SUDO_AUDIO_HOME}/.pulse-cookie"
+        fi
+    fi
+
+    if [[ -S "${SUDO_AUDIO_RUNTIME_DIR}/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=${SUDO_AUDIO_RUNTIME_DIR}/bus"
+    fi
+
+    echo "[dev] sudo audio: using ${SUDO_AUDIO_USER}'s audio session at ${SUDO_AUDIO_RUNTIME_DIR}"
+}
+
+using_sudo_audio_user() {
+    [[ "$(id -u)" -eq 0 && -n "${SUDO_AUDIO_USER}" && -n "${SUDO_AUDIO_UID}" && "${SUDO_AUDIO_UID}" != "0" ]]
+}
+
+run_as_audio_user() {
+    local -a env_args=()
+
+    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        env_args+=("XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}")
+    fi
+    if [[ -n "${PULSE_SERVER:-}" ]]; then
+        env_args+=("PULSE_SERVER=${PULSE_SERVER}")
+    fi
+    if [[ -n "${PULSE_COOKIE:-}" ]]; then
+        env_args+=("PULSE_COOKIE=${PULSE_COOKIE}")
+    fi
+    if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
+    fi
+
+    if using_sudo_audio_user && command -v runuser >/dev/null 2>&1; then
+        runuser -u "${SUDO_AUDIO_USER}" -- env "${env_args[@]}" "$@"
+        return $?
+    fi
+
+    env "${env_args[@]}" "$@"
+}
+
+ensure_dev_log_dir() {
+    mkdir -p "${DEV_LOG_DIR}"
+    if using_sudo_audio_user; then
+        chown "${SUDO_AUDIO_USER}:" "${DEV_LOG_DIR}" 2>/dev/null || true
+    fi
+}
+
+prepare_dev_log_file() {
+    local log_file="$1"
+
+    ensure_dev_log_dir
+    : >"${log_file}"
+    if using_sudo_audio_user; then
+        chown "${SUDO_AUDIO_USER}:" "${log_file}" 2>/dev/null || true
+    fi
+}
+
 source_exists() {
     local source_name="${1:-}"
     if [[ -z "${source_name}" ]]; then
@@ -105,7 +223,7 @@ wait_for_pipewire_server() {
     local attempts=20
 
     while (( attempts > 0 )); do
-        if pw-cli info 0 >/dev/null 2>&1; then
+        if run_as_audio_user pw-cli info 0 >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.25
@@ -123,7 +241,7 @@ pipewire_node_id() {
         return 1
     fi
 
-    node_id="$(pw-cli ls Node 2>/dev/null | awk -v node_name="${node_name}" -v media_class="${media_class}" '
+    node_id="$(run_as_audio_user pw-cli ls Node 2>/dev/null | awk -v node_name="${node_name}" -v media_class="${media_class}" '
         function flush_block() {
             if (current_id != "" && current_name == node_name && current_class == media_class) {
                 print current_id
@@ -245,12 +363,14 @@ start_pulse_server() {
     fi
 
     if command -v dbus-launch >/dev/null 2>&1; then
+        local log_file="${DEV_LOG_DIR}/pulseaudio.log"
+        prepare_dev_log_file "${log_file}"
         echo "[dev] starting PulseAudio with dbus-launch"
-        dbus-launch pulseaudio >/tmp/vibe_rdesk-pulseaudio.log 2>&1 &
+        run_as_audio_user dbus-launch pulseaudio >"${log_file}" 2>&1 &
         PULSE_PID=$!
     else
         echo "[dev] starting PulseAudio"
-        pulseaudio --start >/dev/null 2>&1 || true
+        run_as_audio_user pulseaudio --start >/dev/null 2>&1 || true
     fi
 
     if ! wait_for_pulse_server; then
@@ -267,7 +387,7 @@ start_pipewire_server() {
 
     if command -v systemctl >/dev/null 2>&1; then
         echo "[dev] starting PipeWire user services"
-        systemctl --user start pipewire pipewire-pulse wireplumber >/dev/null 2>&1 || true
+        run_as_audio_user systemctl --user start pipewire pipewire-pulse wireplumber >/dev/null 2>&1 || true
     fi
 
     if ! wait_for_pipewire_server; then
@@ -310,7 +430,7 @@ ensure_pipewire_virtual_mic() {
 
     if ! pipewire_sink_exists "${VIRTUAL_MIC_SINK_NAME}"; then
         echo "[dev] creating PipeWire virtual sink ${VIRTUAL_MIC_SINK_NAME}"
-        pw-cli create-node adapter \
+        run_as_audio_user pw-cli create-node adapter \
             "{ factory.name = support.null-audio-sink node.name = \"${VIRTUAL_MIC_SINK_NAME}\" node.description = \"VibeRDeskVirtualMicSink\" media.class = \"Audio/Sink\" object.linger = true audio.position = [ FL FR ] }" \
             >/dev/null
         if ! wait_for_pipewire_sink "${VIRTUAL_MIC_SINK_NAME}"; then
@@ -320,11 +440,13 @@ ensure_pipewire_virtual_mic() {
     fi
 
     echo "[dev] creating PipeWire virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
-    pw-loopback \
+    local log_file="${DEV_LOG_DIR}/pipewire-loopback.log"
+    prepare_dev_log_file "${log_file}"
+    run_as_audio_user pw-loopback \
         --name "${VIRTUAL_MIC_SOURCE_NAME}_loopback" \
         --capture-props "{ stream.capture.sink = true target.object = \"${VIRTUAL_MIC_SINK_NAME}\" node.passive = true node.dont-reconnect = true }" \
         --playback-props "{ node.name = \"${VIRTUAL_MIC_SOURCE_NAME}\" node.description = \"${VIRTUAL_MIC_SOURCE_NAME}\" media.class = \"Audio/Source\" audio.position = [ FL FR ] }" \
-        >/tmp/vibe_rdesk-pipewire-loopback.log 2>&1 &
+        >"${log_file}" 2>&1 &
     PIPEWIRE_LOOPBACK_PID=$!
 
     if ! wait_for_pipewire_source "${VIRTUAL_MIC_SOURCE_NAME}"; then
@@ -405,38 +527,45 @@ start_headless_display() {
         exit 1
     fi
 
+    local xvfb_log="${DEV_LOG_DIR}/xvfb.log"
+    local jwm_log="${DEV_LOG_DIR}/jwm.log"
+    local xterm_log="${DEV_LOG_DIR}/xterm.log"
+
     echo "[dev] starting Xvfb on ${DISPLAY}"
-    Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp >/tmp/vibe_rdesk-xvfb.log 2>&1 &
+    prepare_dev_log_file "${xvfb_log}"
+    Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp >"${xvfb_log}" 2>&1 &
     XVFB_PID=$!
 
     if ! wait_for_display "${DISPLAY}"; then
-        echo "[dev] Xvfb on ${DISPLAY} did not become ready; see /tmp/vibe_rdesk-xvfb.log" >&2
+        echo "[dev] Xvfb on ${DISPLAY} did not become ready; see ${xvfb_log}" >&2
         exit 1
     fi
 
     sleep "${WINDOW_MANAGER_DELAY_SECONDS}"
 
     echo "[dev] starting jwm on ${DISPLAY}"
-    DISPLAY="${DISPLAY}" jwm >/tmp/vibe_rdesk-jwm.log 2>&1 &
+    prepare_dev_log_file "${jwm_log}"
+    DISPLAY="${DISPLAY}" jwm >"${jwm_log}" 2>&1 &
     JWM_PID=$!
 
     if ! wait_for_process "${JWM_PID}" 4; then
-        echo "[dev] jwm exited during startup; see /tmp/vibe_rdesk-jwm.log" >&2
+        echo "[dev] jwm exited during startup; see ${jwm_log}" >&2
         exit 1
     fi
 
     echo "[dev] starting xterm on ${DISPLAY}"
+    prepare_dev_log_file "${xterm_log}"
     DISPLAY="${DISPLAY}" xterm \
         -display "${DISPLAY}" \
         -title "vibe_rdesk" \
         -fa "${XTERM_FONT_FAMILY}" \
         -fs "${XTERM_FONT_SIZE}" \
         -geometry 120x30+40+40 \
-        >/tmp/vibe_rdesk-xterm.log 2>&1 &
+        >"${xterm_log}" 2>&1 &
     XTERM_PID=$!
 
     if ! wait_for_process "${XTERM_PID}" 4; then
-        echo "[dev] xterm exited during startup; see /tmp/vibe_rdesk-xterm.log" >&2
+        echo "[dev] xterm exited during startup; see ${xterm_log}" >&2
         exit 1
     fi
 }
@@ -530,6 +659,8 @@ wait_for_change_polling() {
 
 trap cleanup EXIT INT TERM
 
+configure_sudo_audio_env
+ensure_dev_log_dir
 ensure_display
 start_audio_server
 ensure_virtual_mic
