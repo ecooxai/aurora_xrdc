@@ -23,6 +23,7 @@ use crate::{
     settings::{AudioStreamConfig, ServerConfig, StreamConfig},
     streamer::StreamFrame,
     system_stats::StatsSampler,
+    uinput::UInputWheelInjector,
     x11_input::X11InputInjector,
 };
 
@@ -31,11 +32,20 @@ const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
 const AUDIO_PACKET_QUEUE_CAPACITY: usize = 128;
 const DISPLAY_WAKE_INTERVAL: Duration = Duration::from_millis(350);
-const WHEEL_PIXEL_STEP: f64 = 100.0;
+// The X11 backend injects wheel input as button clicks. Keep pixel-mode input
+// responsive for slow trackpad deltas, but never turn one browser wheel event
+// into a burst of server clicks.
+const WHEEL_PIXEL_STEP: f64 = 12.0;
 const WHEEL_LINE_STEP: f64 = 3.0;
 const WHEEL_PAGE_STEPS: f64 = 8.0;
-const WHEEL_MAX_STEPS_PER_MESSAGE: f64 = 64.0;
-const WHEEL_GESTURE_IDLE_INTERVAL: Duration = Duration::from_millis(160);
+const WHEEL_MAX_STEPS_PER_MESSAGE: f64 = 1.0;
+const WHEEL_GESTURE_IDLE_INTERVAL: Duration = Duration::from_millis(800);
+const WEBCLIENT_CLICK_SCROLL_DISTANCE_SCALE: f64 = 0.5;
+const WEBCLIENT_SMOOTH_SCROLL_DISTANCE_SCALE: f64 = 2.0;
+const SMOOTH_WHEEL_UNITS_PER_PIXEL: f64 = 1.0;
+const SMOOTH_WHEEL_LINE_PIXELS: f64 = 40.0;
+const SMOOTH_WHEEL_PAGE_PIXELS: f64 = 800.0;
+const SMOOTH_WHEEL_MAX_UNITS_PER_MESSAGE: f64 = 120.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PointerMotionCommand {
@@ -386,6 +396,13 @@ async fn handle_client(
             None
         }
     };
+    let mut smooth_wheel_injector = match UInputWheelInjector::connect() {
+        Ok(injector) => Some(injector),
+        Err(err) => {
+            warn!("smooth uinput wheel unavailable, falling back to X11 wheel clicks: {err}");
+            None
+        }
+    };
     let mut pending_message = None;
     let mut key_watchdog = tokio::time::interval(KEY_STATE_WATCHDOG_INTERVAL);
     key_watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -427,6 +444,7 @@ async fn handle_client(
                                 apply_client_message(
                                     &server.display,
                                     input_injector.as_ref(),
+                                    smooth_wheel_injector.as_mut(),
                                     &sender,
                                     &media,
                                     client,
@@ -552,10 +570,11 @@ fn wheel_clicks_for_delta(
     delta_mode: Option<u8>,
     scroll_speed: Option<f64>,
 ) -> Vec<(u8, u32)> {
-    let speed = scroll_speed
-        .filter(|speed| speed.is_finite())
-        .unwrap_or(1.0)
-        .clamp(0.1, 5.0);
+    let speed = wheel_speed_scale(
+        scroll_speed,
+        delta_mode,
+        WEBCLIENT_CLICK_SCROLL_DISTANCE_SCALE,
+    );
     let x_steps = normalize_wheel_delta(delta_x, delta_mode) * speed;
     let y_steps = normalize_wheel_delta(delta_y, delta_mode) * speed;
     let horizontal_steps = accumulate_wheel_steps(
@@ -584,6 +603,35 @@ fn wheel_clicks_for_delta(
     clicks
 }
 
+fn smooth_wheel_units_for_delta(
+    accumulator: &mut WheelAccumulator,
+    delta_x: f64,
+    delta_y: f64,
+    delta_mode: Option<u8>,
+    scroll_speed: Option<f64>,
+) -> (i32, i32) {
+    let speed = wheel_speed_scale(
+        scroll_speed,
+        delta_mode,
+        WEBCLIENT_SMOOTH_SCROLL_DISTANCE_SCALE,
+    );
+    let x_units = normalize_smooth_wheel_delta(delta_x, delta_mode) * speed;
+    let y_units = normalize_smooth_wheel_delta(delta_y, delta_mode) * speed;
+    let horizontal_units = accumulate_wheel_steps(
+        &mut accumulator.x_steps,
+        &mut accumulator.x_last_at,
+        &mut accumulator.x_last_sign,
+        x_units,
+    );
+    let vertical_units = accumulate_wheel_steps(
+        &mut accumulator.y_steps,
+        &mut accumulator.y_last_at,
+        &mut accumulator.y_last_sign,
+        y_units,
+    );
+    (horizontal_units, -vertical_units)
+}
+
 fn normalize_wheel_delta(delta: f64, delta_mode: Option<u8>) -> f64 {
     if !delta.is_finite() {
         return 0.0;
@@ -598,6 +646,40 @@ fn normalize_wheel_delta(delta: f64, delta_mode: Option<u8>) -> f64 {
         Some(_) => delta / WHEEL_PIXEL_STEP,
     }
     .clamp(-WHEEL_MAX_STEPS_PER_MESSAGE, WHEEL_MAX_STEPS_PER_MESSAGE)
+}
+
+fn wheel_speed_scale(
+    scroll_speed: Option<f64>,
+    delta_mode: Option<u8>,
+    webclient_scale: f64,
+) -> f64 {
+    let speed = scroll_speed
+        .filter(|speed| speed.is_finite())
+        .unwrap_or(1.0)
+        .clamp(0.1, 5.0);
+    if delta_mode.is_some() {
+        speed * webclient_scale
+    } else {
+        speed
+    }
+}
+
+fn normalize_smooth_wheel_delta(delta: f64, delta_mode: Option<u8>) -> f64 {
+    if !delta.is_finite() {
+        return 0.0;
+    }
+    let delta = delta.clamp(-10_000.0, 10_000.0);
+    match delta_mode {
+        None => delta * 120.0,
+        Some(0) => delta * SMOOTH_WHEEL_UNITS_PER_PIXEL,
+        Some(1) => delta * SMOOTH_WHEEL_LINE_PIXELS,
+        Some(2) => delta * SMOOTH_WHEEL_PAGE_PIXELS,
+        Some(_) => delta * SMOOTH_WHEEL_UNITS_PER_PIXEL,
+    }
+    .clamp(
+        -SMOOTH_WHEEL_MAX_UNITS_PER_MESSAGE,
+        SMOOTH_WHEEL_MAX_UNITS_PER_MESSAGE,
+    )
 }
 
 fn accumulate_wheel_steps(
@@ -620,14 +702,11 @@ fn accumulate_wheel_steps(
     *last_at = Some(now);
     *last_sign = sign;
     *remainder += delta_steps;
-    let mut whole_steps = if *remainder >= 0.0 {
+    let whole_steps = if *remainder >= 0.0 {
         remainder.floor()
     } else {
         remainder.ceil()
     };
-    if whole_steps == 0.0 && idle && delta_steps.abs() < 1.0 {
-        whole_steps = f64::from(sign);
-    }
     *remainder -= whole_steps;
     whole_steps as i32
 }
@@ -673,6 +752,7 @@ async fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
 async fn apply_client_message(
     display: &str,
     input_injector: Option<&X11InputInjector>,
+    smooth_wheel_injector: Option<&mut UInputWheelInjector>,
     sender: &mpsc::Sender<Message>,
     media: &MediaHub,
     message: ClientMessage,
@@ -717,14 +797,25 @@ async fn apply_client_message(
             delta_mode,
             scroll_speed,
         } => {
-            let clicks = wheel_clicks_for_delta(
-                wheel_accumulator,
-                delta_x,
-                delta_y,
-                delta_mode,
-                scroll_speed,
-            );
-            apply_wheel_clicks(display, input_injector, &clicks).await?;
+            if let Some(smooth_wheel_injector) = smooth_wheel_injector {
+                let (horizontal, vertical) = smooth_wheel_units_for_delta(
+                    wheel_accumulator,
+                    delta_x,
+                    delta_y,
+                    delta_mode,
+                    scroll_speed,
+                );
+                smooth_wheel_injector.emit_scroll(horizontal, vertical)?;
+            } else {
+                let clicks = wheel_clicks_for_delta(
+                    wheel_accumulator,
+                    delta_x,
+                    delta_y,
+                    delta_mode,
+                    scroll_speed,
+                );
+                apply_wheel_clicks(display, None, &clicks).await?;
+            }
         }
         ClientMessage::TouchTap => {
             if let Some(input_injector) = input_injector {
@@ -968,7 +1059,7 @@ async fn reset_input_state(
 mod tests {
     use super::{
         PointerMotionCommand, WheelAccumulator, key_chord_rank, push_pointer_motion_command,
-        should_wake_display_for_message, wheel_clicks_for_delta,
+        should_wake_display_for_message, smooth_wheel_units_for_delta, wheel_clicks_for_delta,
     };
     use crate::messages::ClientMessage;
 
@@ -1075,25 +1166,59 @@ mod tests {
     }
 
     #[test]
-    fn pixel_wheel_deltas_emit_immediately_then_repay_fractional_debt() {
+    fn pixel_wheel_deltas_accumulate_until_a_full_step() {
         let mut accumulator = WheelAccumulator::default();
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 12.0, Some(0), Some(1.0)).is_empty());
         assert_eq!(
-            wheel_clicks_for_delta(&mut accumulator, 0.0, 40.0, Some(0), Some(1.0)),
+            wheel_clicks_for_delta(&mut accumulator, 0.0, 12.0, Some(0), Some(1.0)),
             vec![(5, 1)]
         );
-        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 40.0, Some(0), Some(1.0)).is_empty());
-        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 20.0, Some(0), Some(1.0)).is_empty());
+    }
+
+    #[test]
+    fn large_pixel_wheel_delta_emits_half_step_for_webclient() {
+        let mut accumulator = WheelAccumulator::default();
+        assert!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, 100.0, Some(0), Some(1.0)).is_empty()
+        );
+        assert_eq!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, 100.0, Some(0), Some(1.0)),
+            vec![(5, 1)]
+        );
+    }
+
+    #[test]
+    fn smooth_wheel_deltas_use_high_resolution_units() {
+        let mut accumulator = WheelAccumulator::default();
+        assert_eq!(
+            smooth_wheel_units_for_delta(&mut accumulator, 0.0, 0.2, Some(0), Some(1.0)),
+            (0, 0)
+        );
+        assert_eq!(
+            smooth_wheel_units_for_delta(&mut accumulator, 0.0, 0.3, Some(0), Some(1.0)),
+            (0, -1)
+        );
+
+        let mut accumulator = WheelAccumulator::default();
+        assert_eq!(
+            smooth_wheel_units_for_delta(&mut accumulator, 0.0, 500.0, Some(0), Some(1.0)),
+            (0, -240)
+        );
     }
 
     #[test]
     fn wheel_supports_horizontal_axis() {
         let mut accumulator = WheelAccumulator::default();
+        assert!(wheel_clicks_for_delta(&mut accumulator, 12.0, 0.0, Some(0), Some(1.0)).is_empty());
         assert_eq!(
-            wheel_clicks_for_delta(&mut accumulator, 100.0, 0.0, Some(0), Some(1.0)),
+            wheel_clicks_for_delta(&mut accumulator, 12.0, 0.0, Some(0), Some(1.0)),
             vec![(7, 1)]
         );
+        assert!(
+            wheel_clicks_for_delta(&mut accumulator, -12.0, 0.0, Some(0), Some(1.0)).is_empty()
+        );
         assert_eq!(
-            wheel_clicks_for_delta(&mut accumulator, -100.0, 0.0, Some(0), Some(1.0)),
+            wheel_clicks_for_delta(&mut accumulator, -12.0, 0.0, Some(0), Some(1.0)),
             vec![(6, 1)]
         );
     }
@@ -1101,15 +1226,16 @@ mod tests {
     #[test]
     fn wheel_direction_change_drops_substep_remainder() {
         let mut accumulator = WheelAccumulator::default();
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 24.0, Some(0), Some(1.0)).is_empty());
         assert_eq!(
-            wheel_clicks_for_delta(&mut accumulator, 0.0, 80.0, Some(0), Some(1.0)),
+            wheel_clicks_for_delta(&mut accumulator, 0.0, 24.0, Some(0), Some(1.0)),
             vec![(5, 1)]
         );
-        assert!(
-            wheel_clicks_for_delta(&mut accumulator, 0.0, -30.0, Some(0), Some(1.0)).is_empty()
-        );
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, -6.0, Some(0), Some(1.0)).is_empty());
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, -6.0, Some(0), Some(1.0)).is_empty());
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, -6.0, Some(0), Some(1.0)).is_empty());
         assert_eq!(
-            wheel_clicks_for_delta(&mut accumulator, 0.0, -70.0, Some(0), Some(1.0)),
+            wheel_clicks_for_delta(&mut accumulator, 0.0, -6.0, Some(0), Some(1.0)),
             vec![(4, 1)]
         );
     }

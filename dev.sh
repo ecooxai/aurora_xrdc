@@ -109,6 +109,78 @@ wait_for_process() {
     return 1
 }
 
+ensure_uinput_access() {
+    if [[ "${VIBE_RDESK_SKIP_UINPUT_SETUP:-0}" == "1" ]]; then
+        echo "[dev] uinput: setup skipped by VIBE_RDESK_SKIP_UINPUT_SETUP=1"
+        return 0
+    fi
+
+    local target_user=""
+
+    if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+        target_user="${SUDO_USER}"
+    else
+        target_user="$(id -un)"
+    fi
+
+    if [[ -e /dev/uinput && -r /dev/uinput && -w /dev/uinput ]]; then
+        echo "[dev] uinput: current process can access /dev/uinput"
+        return 0
+    fi
+
+    # Manual equivalent:
+    #   sudo modprobe uinput
+    #   sudo setfacl -m "u:$(id -un):rw" /dev/uinput
+    if [[ "$(id -u)" -ne 0 ]]; then
+        if ! command -v sudo >/dev/null 2>&1; then
+            echo "[dev] uinput: sudo is unavailable; smooth wheel will fall back to xdotool"
+            return 0
+        fi
+
+        if ! sudo -v; then
+            echo "[dev] uinput: sudo auth failed; smooth wheel will fall back to xdotool"
+            return 0
+        fi
+    fi
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        modprobe uinput 2>/dev/null || true
+    else
+        sudo modprobe uinput 2>/dev/null || true
+    fi
+
+    if [[ ! -e /dev/uinput ]]; then
+        echo "[dev] uinput: /dev/uinput is unavailable; smooth wheel will fall back to xdotool"
+        return 0
+    fi
+
+    if command -v setfacl >/dev/null 2>&1; then
+        if [[ "$(id -u)" -eq 0 ]]; then
+            if setfacl -m "u:${target_user}:rw" /dev/uinput 2>/dev/null; then
+                echo "[dev] uinput: granted ${target_user} rw access with setfacl"
+                return 0
+            fi
+        elif sudo setfacl -m "u:${target_user}:rw" /dev/uinput 2>/dev/null; then
+            echo "[dev] uinput: granted ${target_user} rw access with setfacl"
+            return 0
+        fi
+
+        echo "[dev] uinput: setfacl failed; trying chown fallback"
+    fi
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        if chown "${target_user}" /dev/uinput 2>/dev/null && chmod u+rw /dev/uinput 2>/dev/null; then
+            echo "[dev] uinput: granted ${target_user} rw access with chown"
+            return 0
+        fi
+    elif sudo chown "${target_user}" /dev/uinput 2>/dev/null && sudo chmod u+rw /dev/uinput 2>/dev/null; then
+        echo "[dev] uinput: granted ${target_user} rw access with chown"
+        return 0
+    fi
+
+    echo "[dev] uinput: unable to grant access; smooth wheel will fall back to xdotool"
+}
+
 configure_sudo_audio_env() {
     if [[ "$(id -u)" -ne 0 || -z "${SUDO_UID:-}" || "${SUDO_UID}" == "0" ]]; then
         return 0
@@ -661,6 +733,7 @@ trap cleanup EXIT INT TERM
 
 configure_sudo_audio_env
 ensure_dev_log_dir
+ensure_uinput_access
 ensure_display
 start_audio_server
 ensure_virtual_mic

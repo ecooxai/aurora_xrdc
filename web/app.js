@@ -116,6 +116,7 @@ const state = {
   cameraStarting: false,
   cameraUploadTail: Promise.resolve(),
   cameraSeq: 0,
+  cameraMimeType: "",
   sessionId: "",
   activeCodec: "h264",
   codecString: "avc1.64001f",
@@ -280,9 +281,12 @@ const MIC_MIME_CANDIDATES = [
 ];
 const CAMERA_CHUNK_MS = 1000;
 const CAMERA_MIME_CANDIDATES = [
-  "video/mp4;codecs=avc1.42E01E,mp4a.40.2",
-  "video/mp4;codecs=avc1,mp4a.40.2",
+  "video/mp4;codecs=avc1.42E01E",
+  "video/mp4;codecs=avc1",
   "video/mp4",
+  "video/webm;codecs=vp8",
+  "video/webm;codecs=vp9",
+  "video/webm",
 ];
 const VIDEO_CODEC_STRINGS = {
   h264: "avc1.64001f",
@@ -2611,11 +2615,24 @@ function pickCameraMimeType() {
   return CAMERA_MIME_CANDIDATES.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || "";
 }
 
+function cameraUploadExtension(mimeType) {
+  const normalized = (mimeType || "").toLowerCase();
+  if (normalized.includes("webm")) return "webm";
+  if (normalized.includes("mp4")) return "mp4";
+  return "bin";
+}
+
+function isLocalBrowserOrigin() {
+  return ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+}
+
 async function uploadCameraChunk(blob, seq) {
+  const mimeType = blob.type || state.cameraMimeType;
   const formData = new FormData();
   formData.append("session_id", state.sessionId);
   formData.append("seq", String(seq));
-  formData.append("file", blob, `camera_${seq}.mp4`);
+  formData.append("mime_type", mimeType);
+  formData.append("file", blob, `camera_${seq}.${cameraUploadExtension(mimeType)}`);
   const response = await fetch(apiUrl("/api/camera/chunk"), {
     method: "POST",
     credentials: "include",
@@ -2676,6 +2693,12 @@ async function notifyCameraStop() {
 }
 
 async function startCameraCapture() {
+  if (!window.isSecureContext && !isLocalBrowserOrigin()) {
+    showToast("camera_insecure_context", "Open the client over HTTPS or localhost to allow camera access");
+    state.cameraEnabled = false;
+    renderCameraToggle();
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
     showToast("camera_unavailable", "Camera recording is unavailable in this browser");
     state.cameraEnabled = false;
@@ -2694,12 +2717,13 @@ async function startCameraCapture() {
 
   const mimeType = pickCameraMimeType();
   if (!mimeType) {
-    showToast("camera_mp4_unsupported", "This browser cannot record camera uplink as MP4");
+    showToast("camera_recording_unsupported", "This browser cannot record camera uplink as MP4 or WebM");
     state.cameraEnabled = false;
     renderCameraToggle();
     return;
   }
 
+  state.cameraMimeType = mimeType;
   state.cameraStarting = true;
   renderCameraToggle();
   try {
@@ -2708,12 +2732,6 @@ async function startCameraCapture() {
         width: { ideal: 1280 },
         height: { ideal: 720 },
         frameRate: { ideal: 30, max: 30 },
-      },
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
       },
     });
 
@@ -2727,7 +2745,6 @@ async function startCameraCapture() {
     const recorder = new MediaRecorder(stream, {
       mimeType,
       videoBitsPerSecond: 2_500_000,
-      audioBitsPerSecond: 128_000,
     });
 
     recorder.ondataavailable = (event) => {
@@ -2750,6 +2767,7 @@ async function startCameraCapture() {
   } catch (error) {
     showToast("camera_access_failed", error.message || String(error));
     state.cameraEnabled = false;
+    state.cameraMimeType = "";
   } finally {
     state.cameraStarting = false;
     renderCameraToggle();
@@ -2779,6 +2797,7 @@ async function stopCameraCapture({ notifyServer = true, keepEnabled = false } = 
   const uploadTail = state.cameraUploadTail.catch(() => {});
   state.cameraUploadTail = Promise.resolve();
   await uploadTail;
+  state.cameraMimeType = "";
   if (notifyServer) {
     try {
       await notifyCameraStop();

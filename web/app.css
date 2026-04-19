@@ -749,12 +749,14 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
   stroke-linejoin: round;
 }
 
-.tool-toggle .mic-off-slash {
+.tool-toggle .mic-off-slash,
+.tool-toggle .camera-off-slash {
   opacity: 0;
   transition: opacity 120ms ease;
 }
 
-#mic-toggle:not(.is-active) .mic-off-slash {
+#mic-toggle:not(.is-active) .mic-off-slash,
+#camera-toggle:not(.is-active) .camera-off-slash {
   opacity: 1;
 }
 

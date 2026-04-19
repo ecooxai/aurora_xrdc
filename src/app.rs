@@ -253,7 +253,7 @@ struct CameraStopRequest {
 
 pub async fn run(server: ServerConfig) -> Result<()> {
     let bind = server.bind.clone();
-    let camera = CameraRelay::new(PathBuf::from(&server.upload_dir));
+    let camera = CameraRelay::new();
     let media = MediaHub::new(server.clone());
     if let Err(err) = ffmpeg::warm_audio_stack().await {
         warn!("audio bootstrap failed during startup: {err}");
@@ -638,7 +638,7 @@ async fn upload_camera_chunk(
 
     let status = state
         .camera
-        .enqueue_mp4_chunk(&session_id, seq, bytes)
+        .enqueue_media_chunk(&session_id, seq, bytes)
         .await
         .map_err(internal_error)?;
 

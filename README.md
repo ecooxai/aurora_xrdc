@@ -9,7 +9,7 @@
 - One shared FFmpeg video capture pipeline for all connected browsers, with shared codec/FPS/bitrate changes.
 - Browser-side pointer, click, wheel, and keyboard input.
 - Remote and local clipboard sync.
-- Browser camera uplink as MP4 chunks, replayed into a server-side virtual camera named `viberdeskcamera`.
+- Browser camera uplink as MP4 or WebM chunks, streamed into a server-side virtual camera named `VibeRDesk Camera`.
 - Browser debug overlay with latency, FPS, codec, encoder mode, CPU, memory, and network stats.
 - Service worker caching for the web client.
 
@@ -45,9 +45,13 @@ The server listens on `0.0.0.0:8001` and `[::]:8001` by default.
 
 ## Camera Uplink
 
-The camera toggle records browser camera plus microphone into 1-second MP4 chunks and uploads them to the server. The server checks for an existing virtual camera named `viberdeskcamera`, creates it with `modprobe v4l2loopback ...` when needed, then replays the uploaded MP4 video into that device with FFmpeg.
+The camera toggle records browser camera video into 1-second MP4 or WebM chunks and uploads them to the server. The server checks for an existing virtual camera named `VibeRDesk Camera`, creates it with `modprobe v4l2loopback ...` when needed, then keeps one FFmpeg relay open for the browser session and streams the uploaded media into that device.
+
+The server keeps a black placeholder feed open while no browser camera is active so Chromium and other apps can detect the virtual camera before the browser starts sending camera frames. After the placeholder starts, the server also refreshes the udev camera capability tag and restarts WirePlumber best-effort so PipeWire/portal camera lists see the virtual camera as a source.
 
 If the host cannot create `/dev/video*` automatically, install `v4l2loopback` and ensure the server process has permission to run `modprobe`.
+
+Browsers only expose local camera devices to secure origins. Use `https://...` or `http://localhost:...` when enabling camera uplink.
 
 ## Browser UI
 

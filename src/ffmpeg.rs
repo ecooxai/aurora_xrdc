@@ -1,15 +1,10 @@
-use std::{
-    ffi::OsStr,
-    fs,
-    path::{Path, PathBuf},
-    process::Stdio,
-};
+use std::{ffi::OsStr, fs, path::PathBuf, process::Stdio};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use tokio::{
     io::AsyncReadExt,
-    process::{ChildStdin, Command},
+    process::{Child, ChildStdin, Command},
     time::{Duration, sleep},
 };
 use tracing::warn;
@@ -54,13 +49,23 @@ struct EncoderProfile {
 }
 
 pub struct MicInputHandle {
-    pub child: tokio::process::Child,
+    pub child: Child,
     pub stdin: ChildStdin,
+}
+
+pub struct VirtualCameraRelayHandle {
+    pub child: Child,
+    pub stdin: ChildStdin,
+}
+
+pub struct VirtualCameraPlaceholderHandle {
+    pub child: Child,
 }
 
 const VIRTUAL_MIC_SOURCE_NAME: &str = "Viberdeskmic";
 const VIRTUAL_MIC_SINK_NAME: &str = "vibe_rdesk_virtual_mic_sink";
-const VIRTUAL_CAMERA_LABEL: &str = "viberdeskcamera";
+const VIRTUAL_CAMERA_LABEL: &str = "VibeRDesk Camera";
+const LEGACY_VIRTUAL_CAMERA_LABELS: &[&str] = &["viberdeskcamera", "vibedeskcamera"];
 const VIRTUAL_CAMERA_NR: &str = "42";
 const VIDEO_GOP_SECONDS: u32 = 2;
 const DISPLAY_WAKE_RETRY_DELAY: Duration = Duration::from_millis(150);
@@ -730,29 +735,152 @@ pub async fn ensure_virtual_camera_device() -> Result<String> {
     wait_for_virtual_camera_device().await
 }
 
-pub async fn replay_mp4_to_virtual_camera(path: &Path, device: &str) -> Result<()> {
-    let output = Command::new("ffmpeg")
-        .args(["-loglevel", "error", "-re", "-i"])
-        .arg(path)
-        .args([
-            "-map", "0:v:0", "-an", "-sn", "-pix_fmt", "yuv420p", "-f", "v4l2", device,
-        ])
+pub fn spawn_virtual_camera_relay(device: &str) -> Result<VirtualCameraRelayHandle> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-loglevel",
+        "error",
+        "-re",
+        "-fflags",
+        "nobuffer",
+        "-avioflags",
+        "direct",
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "v4l2",
+        device,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn ffmpeg virtual camera relay for {device}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg virtual camera relay stdin missing"))?;
+    Ok(VirtualCameraRelayHandle { child, stdin })
+}
+
+pub fn spawn_virtual_camera_placeholder(device: &str) -> Result<VirtualCameraPlaceholderHandle> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-loglevel",
+        "error",
+        "-re",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:size=1280x720:rate=15",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "v4l2",
+        device,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+
+    let child = cmd.spawn().with_context(|| {
+        format!("failed to spawn ffmpeg virtual camera placeholder for {device}")
+    })?;
+    Ok(VirtualCameraPlaceholderHandle { child })
+}
+
+pub async fn refresh_virtual_camera_desktop_services(device: &str) {
+    let Some(device_name) = std::path::Path::new(device).file_name() else {
+        warn!("virtual camera desktop refresh skipped for invalid device path {device}");
+        return;
+    };
+    let sys_path = format!("/sys/class/video4linux/{}", device_name.to_string_lossy());
+
+    match trigger_virtual_camera_udev_change(&sys_path).await {
+        Ok(()) => {}
+        Err(err) => {
+            warn!(
+                "virtual camera udev refresh failed for {device}: {err}; PipeWire apps may need a manual `sudo udevadm trigger --action=change {sys_path}`"
+            );
+            return;
+        }
+    }
+
+    match Command::new("systemctl")
+        .args(["--user", "restart", "wireplumber"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .await
-        .with_context(|| format!("failed to relay {} into {device}", path.display()))?;
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!(
+                "WirePlumber refresh failed with {}: {}; restart WirePlumber or reopen camera apps if the virtual camera is missing",
+                output.status,
+                stderr.trim()
+            );
+        }
+        Err(err) => {
+            warn!("failed to refresh WirePlumber after virtual camera activation: {err}");
+        }
+    }
+}
 
+async fn trigger_virtual_camera_udev_change(sys_path: &str) -> Result<()> {
+    let direct = Command::new("udevadm")
+        .args(["trigger", "--action=change", sys_path])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await;
+    match direct {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) if !permission_denied_stderr(&output.stderr) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "udevadm trigger exited with {}: {}",
+                output.status,
+                stderr.trim()
+            ));
+        }
+        Ok(_) | Err(_) => {}
+    }
+
+    let output = Command::new("sudo")
+        .args(["-n", "udevadm", "trigger", "--action=change", sys_path])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("failed to run sudo udevadm trigger")?;
     if output.status.success() {
         return Ok(());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(anyhow!(
-        "ffmpeg virtual camera relay exited with {}: {}",
+        "sudo udevadm trigger exited with {}: {}",
         output.status,
         stderr.trim()
     ))
+}
+
+fn permission_denied_stderr(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .to_ascii_lowercase()
+        .contains("permission denied")
 }
 
 pub async fn spawn_mic_input_injector(server: &ServerConfig) -> Result<MicInputHandle> {
@@ -1000,7 +1128,7 @@ fn find_virtual_camera_device() -> Result<Option<String>> {
     for entry in dir {
         let entry = entry.context("failed to read video4linux entry")?;
         let name = std::fs::read_to_string(entry.path().join("name")).unwrap_or_default();
-        if name.trim() != VIRTUAL_CAMERA_LABEL {
+        if !is_virtual_camera_label(name.trim()) {
             continue;
         }
         let device_name = entry.file_name();
@@ -1008,6 +1136,10 @@ fn find_virtual_camera_device() -> Result<Option<String>> {
     }
 
     Ok(None)
+}
+
+fn is_virtual_camera_label(label: &str) -> bool {
+    label == VIRTUAL_CAMERA_LABEL || LEGACY_VIRTUAL_CAMERA_LABELS.contains(&label)
 }
 
 async fn wait_for_virtual_camera_device() -> Result<String> {
