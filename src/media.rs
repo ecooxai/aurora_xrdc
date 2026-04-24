@@ -141,6 +141,14 @@ impl MediaHub {
         Ok(())
     }
 
+    pub fn video_state_rx(&self) -> watch::Receiver<Option<ActiveVideoState>> {
+        self.video.state.subscribe()
+    }
+
+    pub fn audio_state_rx(&self) -> watch::Receiver<Option<ActiveAudioState>> {
+        self.audio.state.subscribe()
+    }
+
     pub async fn shutdown(&self) {
         self.video.shutdown().await;
         self.audio.shutdown().await;

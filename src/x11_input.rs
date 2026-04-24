@@ -16,6 +16,17 @@ pub struct X11InputInjector {
     root: Window,
 }
 
+pub fn screen_size(display: &str) -> Result<(u16, u16)> {
+    let (connection, screen_num) = x11rb::connect(Some(display))
+        .with_context(|| format!("failed to connect to X11 display {display}"))?;
+    let screen = connection
+        .setup()
+        .roots
+        .get(screen_num)
+        .context("X11 setup missing default screen")?;
+    Ok((screen.width_in_pixels, screen.height_in_pixels))
+}
+
 impl X11InputInjector {
     pub fn connect(display: &str) -> Result<Self> {
         let (connection, screen_num) = x11rb::connect(Some(display))

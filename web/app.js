@@ -10,8 +10,8 @@ const VIEW_ZOOM_STEP_PERCENT = 10;
 const VIEW_ZOOM_MIN_PERCENT = 10;
 const VIEW_ZOOM_MAX_PERCENT = 300;
 const LATENCY_PROBE_INTERVAL_MS = 3000;
-const LIVE_MEDIA_MAX_AGE_MS = 1000;
-const MEDIA_STALL_RESET_MS = 1000;
+const DEFAULT_LIVE_MEDIA_MAX_AGE_MS = 250;
+const DEFAULT_MEDIA_STALL_RESET_MS = 350;
 const HIGH_LATENCY_RECONNECT_MS = 1500;
 const HIGH_LATENCY_RECONNECT_GRACE_MS = 5000;
 const HEALTH_WATCHDOG_INTERVAL_MS = 1000;
@@ -22,7 +22,7 @@ const TWO_FINGER_TAP_MOVE_PX = 24;
 const RECOVERY_TAP_WINDOW_MS = 1600;
 const RECOVERY_TAP_SAME_AREA_PX = 70;
 const KEY_STATE_SYNC_INTERVAL_MS = 500;
-const MAX_VIDEO_DECODE_QUEUE = 4;
+const DEFAULT_MAX_VIDEO_DECODE_QUEUE = 4;
 const MAX_AUDIO_DECODE_QUEUE = 24;
 const AUDIO_MIN_BUFFER_SECONDS = 0.05;
 const AUDIO_UNDERRUN_RETRY_MS = 2000;
@@ -99,6 +99,9 @@ const AUTO_DISCONNECT_ACTIVITY_MESSAGE_TYPES = new Set([
 ]);
 const state = {
   socket: null,
+  videoSocket: null,
+  audioSocket: null,
+  micSocket: null,
   decoder: null,
   audioDecoder: null,
   audioContext: null,
@@ -190,6 +193,8 @@ const state = {
   connecting: false,
   remoteScreenWidth: null,
   remoteScreenHeight: null,
+  videoFrameWidth: null,
+  videoFrameHeight: null,
   viewZoomPercent: 100,
   wsLatencyMs: null,
   latencyProbeSeq: 0,
@@ -200,6 +205,9 @@ const state = {
   lastAudioPacketAt: 0,
   streamWarning: "",
   lastStaleDropAt: 0,
+  liveMediaMaxAgeMs: DEFAULT_LIVE_MEDIA_MAX_AGE_MS,
+  mediaStallResetMs: DEFAULT_MEDIA_STALL_RESET_MS,
+  maxVideoDecodeQueue: DEFAULT_MAX_VIDEO_DECODE_QUEUE,
   highLatencySinceAt: 0,
   reconnectingForLatency: false,
   appliedStreamSettingsKey: "",
@@ -247,6 +255,20 @@ const audioClockRateInput = $("audio-clock-rate");
 const audioClockRateValue = $("audio-clock-rate-value");
 const audioClockAutoInput = $("audio-clock-auto");
 const autoDisconnectMinutesInput = $("auto-disconnect-minutes");
+const encoderLatencySelect = $("encoder-latency");
+const videoScaleSelect = $("video-scale");
+const gopMsInput = $("gop-ms");
+const gopMsValue = $("gop-ms-value");
+const bufferMsInput = $("buffer-ms");
+const bufferMsValue = $("buffer-ms-value");
+const staleDropMsInput = $("stale-drop-ms");
+const staleDropMsValue = $("stale-drop-ms-value");
+const stallResetMsInput = $("stall-reset-ms");
+const stallResetMsValue = $("stall-reset-ms-value");
+const decodeQueueInput = $("decode-queue");
+const decodeQueueValue = $("decode-queue-value");
+const performanceSpeedButton = $("performance-speed");
+const performanceQualityButton = $("performance-quality");
 const touchModeSelect = $("touch-mode");
 const directTouchScrollInput = $("direct-touch-scroll");
 const directTouchScrollLabel = $("direct-touch-scroll-label");
@@ -300,6 +322,32 @@ const CAMERA_MIME_CANDIDATES = [
   "video/webm;codecs=vp9",
   "video/webm",
 ];
+const PERFORMANCE_PRESETS = {
+  speed: {
+    codec: "h264",
+    bitrate: 1024,
+    fps: 30,
+    encoderLatency: "low",
+    videoScale: "720p",
+    gopMs: 4000,
+    bufferMs: 2000,
+    staleDropMs: 250,
+    stallResetMs: 350,
+    maxDecodeQueue: 4,
+  },
+  quality: {
+    codec: "h264",
+    bitrate: 6000,
+    fps: 30,
+    encoderLatency: "balanced",
+    videoScale: "1080p",
+    gopMs: 1000,
+    bufferMs: 500,
+    staleDropMs: 700,
+    stallResetMs: 900,
+    maxDecodeQueue: 3,
+  },
+};
 const VIDEO_CODEC_STRINGS = {
   h264: "avc1.64001f",
   h265: "hvc1.1.6.L93.B0",
@@ -337,7 +385,7 @@ function setStatus(text, { hideAfterMs = 0 } = {}) {
     state.statusTimer = setTimeout(() => {
       state.statusTimer = null;
       if (status.textContent !== text) return;
-      setStatus(state.socket?.readyState === WebSocket.OPEN ? "Connected" : "Disconnected");
+      setStatus(isConnected() ? "Connected" : "Disconnected");
     }, hideAfterMs);
   }
 }
@@ -483,19 +531,19 @@ function renderViewMetrics() {
 }
 
 function applyCanvasZoom() {
-  const remoteWidth = state.remoteScreenWidth ?? canvas.width;
-  const remoteHeight = state.remoteScreenHeight ?? canvas.height;
-  if (!Number.isFinite(remoteWidth) || !Number.isFinite(remoteHeight) || remoteWidth <= 0 || remoteHeight <= 0) {
+  const surfaceWidth = state.videoFrameWidth ?? state.remoteScreenWidth ?? canvas.width;
+  const surfaceHeight = state.videoFrameHeight ?? state.remoteScreenHeight ?? canvas.height;
+  if (!Number.isFinite(surfaceWidth) || !Number.isFinite(surfaceHeight) || surfaceWidth <= 0 || surfaceHeight <= 0) {
     renderViewMetrics();
     return;
   }
 
   const viewportWidth = Math.max(viewportCard.clientWidth, 1);
   const viewportHeight = Math.max(viewportCard.clientHeight, 1);
-  const fitScale = Math.min(viewportWidth / remoteWidth, viewportHeight / remoteHeight);
+  const fitScale = Math.min(viewportWidth / surfaceWidth, viewportHeight / surfaceHeight);
   const zoomScale = state.viewZoomPercent / 100;
-  const displayWidth = Math.max(1, Math.round(remoteWidth * fitScale * zoomScale));
-  const displayHeight = Math.max(1, Math.round(remoteHeight * fitScale * zoomScale));
+  const displayWidth = Math.max(1, Math.round(surfaceWidth * fitScale * zoomScale));
+  const displayHeight = Math.max(1, Math.round(surfaceHeight * fitScale * zoomScale));
 
   canvas.style.width = `${displayWidth}px`;
   canvas.style.height = `${displayHeight}px`;
@@ -503,11 +551,11 @@ function applyCanvasZoom() {
 }
 
 function videoSurfaceWidth() {
-  return state.remoteScreenWidth ?? canvas.width;
+  return state.remoteScreenWidth ?? state.videoFrameWidth ?? canvas.width;
 }
 
 function videoSurfaceHeight() {
-  return state.remoteScreenHeight ?? canvas.height;
+  return state.remoteScreenHeight ?? state.videoFrameHeight ?? canvas.height;
 }
 
 function adjustZoom(deltaPercent) {
@@ -581,6 +629,10 @@ function streamReconnectSettingsKey(settings = readSettingsFromControls()) {
     bitrate: settings.bitrate,
     audioBitrateKbps: settings.audioBitrateKbps,
     fps: settings.fps,
+    encoderLatency: settings.encoderLatency,
+    videoScale: settings.videoScale,
+    gopMs: settings.gopMs,
+    bufferMs: settings.bufferMs,
   });
 }
 
@@ -608,6 +660,10 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
     bitrate: streamConfig?.bitrate_kbps,
     audioBitrateKbps: audioConfig?.bitrate_kbps,
     fps: streamConfig?.fps,
+    encoderLatency: streamConfig?.performance?.encoder_latency,
+    videoScale: streamConfig?.performance?.scale,
+    gopMs: streamConfig?.performance?.gop_ms,
+    bufferMs: streamConfig?.performance?.buffer_ms,
   });
   const current = readSettingsFromControls();
   const currentKey = streamReconnectSettingsKey(current);
@@ -646,6 +702,10 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
     bitrate: incoming.bitrate,
     audioBitrateKbps: incoming.audioBitrateKbps,
     fps: incoming.fps,
+    encoderLatency: incoming.encoderLatency,
+    videoScale: incoming.videoScale,
+    gopMs: incoming.gopMs,
+    bufferMs: incoming.bufferMs,
   };
   applySettings(next);
   const applied = readSettingsFromControls();
@@ -655,7 +715,7 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
 
 function pushSharedStreamSettings(reason) {
   if (state.connecting) return;
-  if (state.socket?.readyState !== WebSocket.OPEN) return;
+  if (!isConnected()) return;
   clearSettingsReconnectTimer();
   const settings = readSettingsFromControls();
   send({
@@ -665,6 +725,12 @@ function pushSharedStreamSettings(reason) {
       encode_preference: settings.encodePreference,
       bitrate_kbps: settings.bitrate,
       fps: settings.fps,
+      performance: {
+        encoder_latency: settings.encoderLatency,
+        gop_ms: settings.gopMs,
+        buffer_ms: settings.bufferMs,
+        scale: settings.videoScale,
+      },
     },
     audio_config: {
       bitrate_kbps: settings.audioBitrateKbps,
@@ -674,7 +740,7 @@ function pushSharedStreamSettings(reason) {
 }
 
 function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
-  const socketOpen = state.socket?.readyState === WebSocket.OPEN;
+  const socketOpen = isConnected();
   if (!socketOpen || state.connecting || state.reconnectingForLatency) {
     clearSettingsReconnectTimer();
     return;
@@ -690,7 +756,7 @@ function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
   clearSettingsReconnectTimer();
   state.settingsReconnectTimer = setTimeout(() => {
     state.settingsReconnectTimer = null;
-    if (state.socket?.readyState !== WebSocket.OPEN || state.connecting) return;
+    if (!isConnected() || state.connecting) return;
     const latestSettings = readSettingsFromControls();
     if (streamReconnectSettingsKey(latestSettings) === state.appliedStreamSettingsKey) return;
     pushSharedStreamSettings("Applying shared stream settings...");
@@ -699,14 +765,14 @@ function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
 
 function monitorConnectionHealth() {
   const now = performance.now();
-  const socketOpen = state.socket?.readyState === WebSocket.OPEN;
+  const socketOpen = isConnected();
 
   let warning = "";
   if (socketOpen && state.audioUnderrunActive) {
     warning = state.streamWarning || AUDIO_UNDERRUN_WARNING;
-  } else if (socketOpen && state.lastVideoPacketAt && now - state.lastVideoPacketAt > MEDIA_STALL_RESET_MS) {
+  } else if (socketOpen && state.lastVideoPacketAt && now - state.lastVideoPacketAt > state.mediaStallResetMs) {
     warning = "Video stalled";
-  } else if (socketOpen && state.lastVideoFrameRenderedAt && now - state.lastVideoFrameRenderedAt > MEDIA_STALL_RESET_MS) {
+  } else if (socketOpen && state.lastVideoFrameRenderedAt && now - state.lastVideoFrameRenderedAt > state.mediaStallResetMs) {
     warning = "Video render stalled";
   } else if (socketOpen && state.lastStaleDropAt && now - state.lastStaleDropAt < 3000) {
     warning = state.streamWarning || "Dropping delayed frames";
@@ -820,6 +886,8 @@ function normalizeSettings(settings = {}) {
   const allowedAudioBitrates = new Set(Array.from(audioBitrateSelect.options, (option) => Number(option.value)));
   const allowedMicBitrates = new Set(Array.from(micBitrateSelect.options, (option) => Number(option.value)));
   const allowedTouchModes = new Set(Array.from(touchModeSelect.options, (option) => option.value));
+  const allowedEncoderLatency = new Set(Array.from(encoderLatencySelect.options, (option) => option.value));
+  const allowedVideoScales = new Set(Array.from(videoScaleSelect.options, (option) => option.value));
   const defaultCodec = codecSelect.options[0]?.value || "h264";
   const defaultBitrate = Number(bitrateInput.value);
   const defaultAudioBitrate = Number(audioBitrateSelect.value);
@@ -847,6 +915,29 @@ function normalizeSettings(settings = {}) {
     audioLatencyMs: clampControlValue(audioLatencyInput, settings.audioLatencyMs, Number(audioLatencyInput.value)),
     audioClockRate: clampControlValue(audioClockRateInput, settings.audioClockRate, defaultAudioClockRate),
     audioClockAuto: settings.audioClockAuto !== false,
+    encoderLatency: allowedEncoderLatency.has(settings.encoderLatency)
+      ? settings.encoderLatency
+      : encoderLatencySelect.value,
+    videoScale: allowedVideoScales.has(settings.videoScale)
+      ? settings.videoScale
+      : videoScaleSelect.value,
+    gopMs: clampControlValue(gopMsInput, settings.gopMs, Number(gopMsInput.value)),
+    bufferMs: clampControlValue(bufferMsInput, settings.bufferMs, Number(bufferMsInput.value)),
+    staleDropMs: clampControlValue(
+      staleDropMsInput,
+      settings.staleDropMs,
+      DEFAULT_LIVE_MEDIA_MAX_AGE_MS,
+    ),
+    stallResetMs: clampControlValue(
+      stallResetMsInput,
+      settings.stallResetMs,
+      DEFAULT_MEDIA_STALL_RESET_MS,
+    ),
+    maxDecodeQueue: clampControlValue(
+      decodeQueueInput,
+      settings.maxDecodeQueue,
+      DEFAULT_MAX_VIDEO_DECODE_QUEUE,
+    ),
     autoDisconnectMinutes: clampControlValue(
       autoDisconnectMinutesInput,
       settings.autoDisconnectMinutes,
@@ -940,6 +1031,13 @@ function readSettingsFromControls() {
     audioLatencyMs: audioLatencyInput.value,
     audioClockRate: audioClockRateInput.value,
     audioClockAuto: audioClockAutoInput.checked,
+    encoderLatency: encoderLatencySelect.value,
+    videoScale: videoScaleSelect.value,
+    gopMs: gopMsInput.value,
+    bufferMs: bufferMsInput.value,
+    staleDropMs: staleDropMsInput.value,
+    stallResetMs: stallResetMsInput.value,
+    maxDecodeQueue: decodeQueueInput.value,
     autoDisconnectMinutes: autoDisconnectMinutesInput.value,
     touchMode: touchModeSelect.value,
     directTouchScroll: directTouchScrollInput.checked,
@@ -972,6 +1070,20 @@ function renderSettingsValues(settings = readSettingsFromControls()) {
   scrollSpeedValue.textContent = `${settings.scrollSpeed} / 10`;
   audioLatencyValue.textContent = `${settings.audioLatencyMs} ms`;
   audioClockRateValue.textContent = `${Number(settings.audioClockRate).toFixed(4)}x`;
+  gopMsValue.textContent = `${settings.gopMs} ms`;
+  bufferMsValue.textContent = `${settings.bufferMs} ms`;
+  staleDropMsValue.textContent = `${settings.staleDropMs} ms`;
+  stallResetMsValue.textContent = `${settings.stallResetMs} ms`;
+  decodeQueueValue.textContent = `${settings.maxDecodeQueue} frame${settings.maxDecodeQueue === 1 ? "" : "s"}`;
+  syncPerformancePresetButtons(settings);
+}
+
+function syncPerformancePresetButtons(settings = readSettingsFromControls()) {
+  const activePreset = Object.entries(PERFORMANCE_PRESETS)
+    .find(([, preset]) => Object.entries(preset)
+      .every(([key, value]) => settings[key] === value))?.[0];
+  performanceSpeedButton.classList.toggle("is-active", activePreset === "speed");
+  performanceQualityButton.classList.toggle("is-active", activePreset === "quality");
 }
 
 function syncTouchModeControls(settings = readSettingsFromControls()) {
@@ -1007,11 +1119,21 @@ function applySettings(settings) {
   audioLatencyInput.value = String(normalized.audioLatencyMs);
   audioClockRateInput.value = String(normalized.audioClockRate);
   audioClockAutoInput.checked = normalized.audioClockAuto;
+  encoderLatencySelect.value = normalized.encoderLatency;
+  videoScaleSelect.value = normalized.videoScale;
+  gopMsInput.value = String(normalized.gopMs);
+  bufferMsInput.value = String(normalized.bufferMs);
+  staleDropMsInput.value = String(normalized.staleDropMs);
+  stallResetMsInput.value = String(normalized.stallResetMs);
+  decodeQueueInput.value = String(normalized.maxDecodeQueue);
   autoDisconnectMinutesInput.value = String(normalized.autoDisconnectMinutes);
   touchModeSelect.value = normalized.touchMode;
   directTouchScrollInput.checked = normalized.directTouchScroll;
   state.micEnabled = normalized.micEnabled;
   state.viewZoomPercent = normalized.viewZoomPercent;
+  state.liveMediaMaxAgeMs = normalized.staleDropMs;
+  state.mediaStallResetMs = normalized.stallResetMs;
+  state.maxVideoDecodeQueue = normalized.maxDecodeQueue;
   renderSettingsValues(normalized);
   syncTouchModeControls(normalized);
   renderMicToggle();
@@ -1021,6 +1143,9 @@ function applySettings(settings) {
 function persistResolvedSettings(settings, { scheduleReconnect = true } = {}) {
   renderSettingsValues(settings);
   syncTouchModeControls(settings);
+  state.liveMediaMaxAgeMs = settings.staleDropMs;
+  state.mediaStallResetMs = settings.stallResetMs;
+  state.maxVideoDecodeQueue = settings.maxDecodeQueue;
   syncPendingStreamSettings(settings);
   saveSettings(settings);
   syncAutoDisconnectTimer(settings);
@@ -1033,6 +1158,15 @@ function persistCurrentSettings() {
   persistResolvedSettings(readSettingsFromControls());
 }
 
+function applyPerformancePreset(name) {
+  const preset = PERFORMANCE_PRESETS[name];
+  if (!preset) return;
+  const current = readSettingsFromControls();
+  const next = normalizeSettings({ ...current, ...preset });
+  applySettings(next);
+  persistResolvedSettings(readSettingsFromControls());
+}
+
 function clearAutoDisconnectTimer() {
   if (!state.autoDisconnectTimer) return;
   clearTimeout(state.autoDisconnectTimer);
@@ -1041,7 +1175,7 @@ function clearAutoDisconnectTimer() {
 
 function syncAutoDisconnectTimer(settings = readSettingsFromControls()) {
   clearAutoDisconnectTimer();
-  if (state.socket?.readyState !== WebSocket.OPEN) return;
+  if (!isConnected()) return;
   if (settings.autoDisconnectMinutes <= AUTO_DISCONNECT_DISABLED_MINUTES) return;
   state.autoDisconnectTimer = setTimeout(() => {
     state.autoDisconnectTimer = null;
@@ -1258,7 +1392,7 @@ async function refreshEncodePreferenceOptions(
 }
 
 async function disconnectIfSelectedCodecIsUnsupported(settings = readSettingsFromControls()) {
-  if (state.socket?.readyState !== WebSocket.OPEN) return true;
+  if (!isConnected()) return true;
   const videoCodecSupport = await getVideoCodecSupport(settings.codec);
   if (videoCodecSupport.supported) {
     return true;
@@ -1429,6 +1563,108 @@ function isAuthFailureMessage(message) {
     || lower.includes("authentication failed");
 }
 
+function appendStreamQuery(url, settings) {
+  url.searchParams.set("codec", settings.codec);
+  url.searchParams.set("encode_preference", settings.encodePreference);
+  url.searchParams.set("bitrate_kbps", settings.bitrate);
+  url.searchParams.set("audio_bitrate_kbps", settings.audioBitrateKbps);
+  url.searchParams.set("fps", settings.fps);
+  url.searchParams.set("encoder_latency", settings.encoderLatency);
+  url.searchParams.set("scale", settings.videoScale);
+  url.searchParams.set("gop_ms", settings.gopMs);
+  url.searchParams.set("buffer_ms", settings.bufferMs);
+  if (state.sessionPasswd) {
+    url.searchParams.set("passwd", state.sessionPasswd);
+  }
+}
+
+function roleWebSocketUrl(role, settings) {
+  const url = webSocketUrl("/ws");
+  appendStreamQuery(url, settings);
+  url.searchParams.set("role", role);
+  return url;
+}
+
+function createClientSessionId() {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function isSocketOpen(socket) {
+  return socket?.readyState === WebSocket.OPEN;
+}
+
+function isConnected() {
+  return isSocketOpen(state.socket);
+}
+
+function isFullyConnected() {
+  return isSocketOpen(state.socket)
+    && isSocketOpen(state.videoSocket)
+    && isSocketOpen(state.audioSocket)
+    && isSocketOpen(state.micSocket);
+}
+
+function openRoleSocket(role, settings, onMessage) {
+  const socket = new WebSocket(roleWebSocketUrl(role, settings));
+  socket.binaryType = "arraybuffer";
+  let opened = false;
+  const openPromise = new Promise((resolve, reject) => {
+    socket.onopen = () => {
+      opened = true;
+      resolve(socket);
+    };
+    socket.onerror = () => {
+      if (!opened) {
+        reject(new Error(`${role} WebSocket error`));
+      } else {
+        showToast("ws_error", `${role} WebSocket error`);
+      }
+    };
+    socket.onclose = (event) => {
+      if (!opened) {
+        reject(new Error(`${role} WebSocket closed (${event.code || "no code"})`));
+        return;
+      }
+      handleRoleSocketClose(role, event);
+    };
+  });
+  socket.onmessage = onMessage;
+  return { socket, openPromise };
+}
+
+function handleRoleSocketClose(role, event) {
+  if (state.manualDisconnect) return;
+  setStatus("Disconnected");
+  if (event.code && event.code !== 1000 && !state.reconnectTimer) {
+    showToast("ws_closed", `${role} WebSocket closed (${event.code})`);
+  }
+  closeConnection({ manual: false, preserveStatus: true });
+  scheduleReconnect();
+}
+
+function handleControlSocketMessage(event) {
+  if (typeof event.data === "string") {
+    handleServerMessage(JSON.parse(event.data));
+  }
+}
+
+function handleMediaSocketMessage(event) {
+  if (typeof event.data === "string") {
+    handleServerMessage(JSON.parse(event.data));
+  } else {
+    handleFrame(event.data);
+  }
+}
+
+function handleMicSocketMessage(event) {
+  if (typeof event.data === "string") {
+    handleServerMessage(JSON.parse(event.data));
+  }
+}
+
 async function connect() {
   if (state.connecting) return;
   state.apiOrigin = normalizeApiOrigin(authOriginInput.value || state.apiOrigin);
@@ -1461,21 +1697,15 @@ async function connect() {
     state.manualDisconnect = false;
     clearReconnectTimer();
     void primeAudioPlayback();
-    const {
-      codec,
-      encodePreference,
-      bitrate,
-      audioBitrateKbps,
-      fps,
-    } = readSettingsFromControls();
-    const videoCodecSupport = await getVideoCodecSupport(codec);
+    const settings = readSettingsFromControls();
+    const videoCodecSupport = await getVideoCodecSupport(settings.codec);
     if (!videoCodecSupport.supported) {
       setStatus("Disconnected");
       setEncoderStatus("Not connected");
       showToast("codec_unsupported", videoCodecSupport.message);
       return;
     }
-    state.activeCodec = codec;
+    state.activeCodec = settings.codec;
     if (videoCodecSupport.codecString) {
       state.codecString = videoCodecSupport.codecString;
     }
@@ -1484,65 +1714,50 @@ async function connect() {
     state.netWindowBytes = 0;
     state.netKbps = 0;
     state.lastNetAt = performance.now();
-    const url = webSocketUrl("/ws");
-    url.searchParams.set("codec", codec);
-    url.searchParams.set("encode_preference", encodePreference);
-    url.searchParams.set("bitrate_kbps", bitrate);
-    url.searchParams.set("audio_bitrate_kbps", audioBitrateKbps);
-    url.searchParams.set("fps", fps);
-    if (state.sessionPasswd) {
-      url.searchParams.set("passwd", state.sessionPasswd);
-    }
     setStatus("Connecting...");
     setEncoderStatus("Connecting...");
-    state.socket = new WebSocket(url);
-    state.socket.binaryType = "arraybuffer";
-    state.socket.onopen = () => {
-      state.appliedStreamSettingsKey = "";
-      state.reconnectAttempt = 0;
-      state.reconnectingForLatency = false;
-      state.highLatencySinceAt = 0;
-      setStreamWarning("");
-      setStatus("Connected");
-      void refreshCodecOptions(codecSelect.value, { silent: true });
-      void refreshEncodePreferenceOptions(
-        codecSelect.value,
-        loadStoredSettings().encodePreference,
-        { silent: true },
-      );
-      void loadClipboardHistory().catch((error) => {
-        showToast("history_load_failed", error.message || String(error));
-      });
-      startKeyStateSync();
-      startPing();
-      startRemoteClipboardPolling();
-      syncAutoDisconnectTimer();
-      void refreshLocalClipboard();
-      if (state.micEnabled) {
-        void startMicrophoneCapture();
-      }
-      maybeScheduleSettingsReconnect();
-    };
-    state.socket.onclose = (event) => {
-      setStatus("Disconnected");
-      stopKeyStateSync();
-      clearInterval(startPing.timer);
-      stopRemoteClipboardPolling();
-      if (!state.manualDisconnect && event.code && event.code !== 1000) {
-        showToast("ws_closed", `WebSocket closed (${event.code})`);
-      }
-      if (!state.manualDisconnect) scheduleReconnect();
-    };
-    state.socket.onerror = () => showToast("ws_error", "WebSocket error");
-    state.socket.onmessage = (event) => {
-      if (typeof event.data === "string") {
-        handleServerMessage(JSON.parse(event.data));
-      } else {
-        handleFrame(event.data);
-      }
-    };
+    state.sessionId = createClientSessionId();
+    const control = openRoleSocket("control", settings, handleControlSocketMessage);
+    const video = openRoleSocket("video", settings, handleMediaSocketMessage);
+    const audio = openRoleSocket("audio", settings, handleMediaSocketMessage);
+    const mic = openRoleSocket("mic", settings, handleMicSocketMessage);
+    state.socket = control.socket;
+    state.videoSocket = video.socket;
+    state.audioSocket = audio.socket;
+    state.micSocket = mic.socket;
+    await Promise.all([
+      control.openPromise,
+      video.openPromise,
+      audio.openPromise,
+      mic.openPromise,
+    ]);
+    state.appliedStreamSettingsKey = "";
+    state.reconnectAttempt = 0;
+    state.reconnectingForLatency = false;
+    state.highLatencySinceAt = 0;
+    setStreamWarning("");
+    setStatus("Connected");
+    void refreshCodecOptions(codecSelect.value, { silent: true });
+    void refreshEncodePreferenceOptions(
+      codecSelect.value,
+      loadStoredSettings().encodePreference,
+      { silent: true },
+    );
+    void loadClipboardHistory().catch((error) => {
+      showToast("history_load_failed", error.message || String(error));
+    });
+    startKeyStateSync();
+    startPing();
+    startRemoteClipboardPolling();
+    syncAutoDisconnectTimer();
+    void refreshLocalClipboard();
+    if (state.micEnabled) {
+      void startMicrophoneCapture();
+    }
+    maybeScheduleSettingsReconnect();
   } catch (error) {
     const message = error.message || String(error);
+    closeConnection({ manual: false, preserveStatus: true });
     if (needsLogin || isAuthFailureMessage(message)) {
       state.authenticated = false;
       showToast("auth_failed", message);
@@ -1551,7 +1766,7 @@ async function connect() {
       showToast("connect_failed", message);
       if (!state.manualDisconnect) scheduleReconnect();
     }
-    setStatus(state.socket?.readyState === WebSocket.OPEN ? "Connected" : "Disconnected");
+    setStatus(isConnected() ? "Connected" : "Disconnected");
   } finally {
     state.connecting = false;
   }
@@ -1598,11 +1813,21 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.netWindowBytes = 0;
   state.netKbps = 0;
   resetKeys();
-  if (state.socket) {
-    const socket = state.socket;
-    state.socket = null;
+  const sockets = [state.socket, state.videoSocket, state.audioSocket, state.micSocket];
+  state.socket = null;
+  state.videoSocket = null;
+  state.audioSocket = null;
+  state.micSocket = null;
+  for (const socket of sockets) {
+    if (!socket) continue;
     socket.onclose = null;
-    socket.close();
+    socket.onerror = null;
+    socket.onmessage = null;
+    try {
+      socket.close();
+    } catch {
+      // Ignore close errors while replacing a connection.
+    }
   }
   if (!preserveStatus) setEncoderStatus("Not connected");
   if (!preserveStatus) setStatus("Disconnected");
@@ -1614,11 +1839,12 @@ function disconnect() {
 }
 
 function isConnectionOpen() {
-  return state.socket?.readyState === WebSocket.OPEN;
+  return isFullyConnected();
 }
 
 function isConnectionDisconnected() {
-  return !state.socket || state.socket.readyState === WebSocket.CLOSED;
+  return [state.socket, state.videoSocket, state.audioSocket, state.micSocket]
+    .every((socket) => !socket || socket.readyState === WebSocket.CLOSED);
 }
 
 function reconnectFromViewport() {
@@ -1679,9 +1905,10 @@ function scheduleReconnect() {
 function handleServerMessage(message) {
   if (message.type === "hello") {
     updateServerClockOffset(message.server_time_ms);
-    if (message.session_id) {
+    if (message.session_id && !state.sessionId) {
       state.sessionId = message.session_id;
     }
+    updateRemoteScreenSize(message.screen_width, message.screen_height);
     if (message.config) {
       syncServerStreamSettings(message.config, message.audio_config, {
         force: message.config_fallback === true,
@@ -1878,12 +2105,9 @@ function initVideoRenderer() {
 }
 
 function updateVideoSurfaceSize(width, height) {
-  const remoteSizeChanged = (
-    state.remoteScreenWidth !== width
-    || state.remoteScreenHeight !== height
-  );
+  const frameSizeChanged = state.videoFrameWidth !== width || state.videoFrameHeight !== height;
   if (state.videoRenderWorker) {
-    if (remoteSizeChanged) {
+    if (frameSizeChanged) {
       try {
         state.videoRenderWorker.postMessage({ type: "resize", width, height });
       } catch {
@@ -1894,11 +2118,29 @@ function updateVideoSurfaceSize(width, height) {
     canvas.width = width;
     canvas.height = height;
   }
-  if (remoteSizeChanged) {
-    state.remoteScreenWidth = width;
-    state.remoteScreenHeight = height;
+  if (frameSizeChanged) {
+    state.videoFrameWidth = width;
+    state.videoFrameHeight = height;
+    if (!state.remoteScreenWidth || !state.remoteScreenHeight) {
+      state.remoteScreenWidth = width;
+      state.remoteScreenHeight = height;
+    }
     applyCanvasZoom();
   }
+}
+
+function updateRemoteScreenSize(width, height) {
+  const screenWidth = Number(width);
+  const screenHeight = Number(height);
+  if (!Number.isFinite(screenWidth) || !Number.isFinite(screenHeight) || screenWidth <= 0 || screenHeight <= 0) {
+    return;
+  }
+  if (state.remoteScreenWidth === screenWidth && state.remoteScreenHeight === screenHeight) {
+    return;
+  }
+  state.remoteScreenWidth = screenWidth;
+  state.remoteScreenHeight = screenHeight;
+  applyCanvasZoom();
 }
 
 function resetVideoDecoderForLiveCatchup() {
@@ -1942,7 +2184,7 @@ async function renderLatestVideoFrame() {
   state.renderingVideoFrame = true;
   try {
     const sentAtMs = Number(frame.timestamp ?? 0) / 1000;
-    if (estimateMediaAgeMs(sentAtMs) > LIVE_MEDIA_MAX_AGE_MS) {
+    if (estimateMediaAgeMs(sentAtMs) > state.liveMediaMaxAgeMs) {
       markStaleDrop("Dropping delayed video");
       return;
     }
@@ -1998,12 +2240,12 @@ function handleVideoFrame(buffer, view) {
   const stalledForMs = state.lastVideoPacketAt ? receivedAt - state.lastVideoPacketAt : 0;
   state.lastVideoPacketAt = receivedAt;
   const mediaAgeMs = estimateMediaAgeMs(sentAt);
-  if (stalledForMs >= MEDIA_STALL_RESET_MS || mediaAgeMs > LIVE_MEDIA_MAX_AGE_MS) {
+  if (stalledForMs >= state.mediaStallResetMs || mediaAgeMs > state.liveMediaMaxAgeMs) {
     markStaleDrop("Dropping delayed video");
     resetVideoDecoderForLiveCatchup();
     return;
   }
-  if ((state.decoder.decodeQueueSize ?? 0) > MAX_VIDEO_DECODE_QUEUE) {
+  if ((state.decoder.decodeQueueSize ?? 0) > state.maxVideoDecodeQueue) {
     markStaleDrop("Video decoder catching up");
     resetVideoDecoderForLiveCatchup();
     return;
@@ -2031,11 +2273,11 @@ function handleAudioFrame(buffer, view) {
   const stalledForMs = state.lastAudioPacketAt ? receivedAt - state.lastAudioPacketAt : 0;
   state.lastAudioPacketAt = receivedAt;
   const mediaAgeMs = estimateMediaAgeMs(sentAt);
-  if (mediaAgeMs > LIVE_MEDIA_MAX_AGE_MS) {
+  if (mediaAgeMs > state.liveMediaMaxAgeMs) {
     markStaleDrop(`Dropping delayed audio packet ${Math.round(mediaAgeMs)} ms old`);
     return;
   }
-  if (stalledForMs >= MEDIA_STALL_RESET_MS) {
+  if (stalledForMs >= state.mediaStallResetMs) {
     markStaleDrop("Audio stream resumed after stall");
   }
   const length = view.getUint32(9, true);
@@ -2577,7 +2819,7 @@ async function startMicrophoneCapture() {
         autoGainControl: true,
       },
     });
-    if (state.socket?.readyState !== WebSocket.OPEN) {
+    if (!isConnected()) {
       for (const track of stream.getTracks()) {
         track.stop();
       }
@@ -2591,7 +2833,7 @@ async function startMicrophoneCapture() {
       audioBitsPerSecond: currentConfiguredMicBitrateBps(),
     });
     recorder.ondataavailable = async (event) => {
-      if (state.socket?.readyState !== WebSocket.OPEN || !event.data || event.data.size === 0) return;
+      if (!isSocketOpen(state.micSocket) || !event.data || event.data.size === 0) return;
       const payload = new Uint8Array(await event.data.arrayBuffer());
       const message = new Uint8Array(MIC_HEADER_BYTES + payload.byteLength);
       const header = new DataView(message.buffer);
@@ -2887,7 +3129,7 @@ async function playAudioData(audioData) {
 }
 
 function sendNow(message) {
-  if (state.socket?.readyState === WebSocket.OPEN) {
+  if (isConnected()) {
     noteAutoDisconnectActivity(message);
     state.socket.send(JSON.stringify(message));
   }
@@ -2927,8 +3169,8 @@ function send(message) {
 }
 
 function sendBinary(bytes) {
-  if (state.socket?.readyState === WebSocket.OPEN) {
-    state.socket.send(bytes);
+  if (isSocketOpen(state.micSocket)) {
+    state.micSocket.send(bytes);
   }
 }
 
@@ -2939,7 +3181,7 @@ function toggleMicrophone() {
     stopMicrophoneCapture();
     return;
   }
-  if (state.socket?.readyState === WebSocket.OPEN) {
+  if (isConnected()) {
     void startMicrophoneCapture();
   } else {
     renderMicToggle();
@@ -3006,7 +3248,7 @@ function startPing() {
 }
 
 function sendLatencyProbe() {
-  if (state.socket?.readyState !== WebSocket.OPEN) return;
+  if (!isConnected()) return;
   state.latencyProbeSeq += 1;
   const seq = state.latencyProbeSeq;
   state.latencyProbeSentAt.set(seq, performance.now());
@@ -3481,8 +3723,8 @@ function isVideoRecoveryNeeded() {
   if (!isConnectionOpen()) return true;
   const now = performance.now();
   if (state.decoderRecovering || state.streamWarning) return true;
-  if (state.lastVideoPacketAt && now - state.lastVideoPacketAt > MEDIA_STALL_RESET_MS) return true;
-  if (state.lastVideoFrameRenderedAt && now - state.lastVideoFrameRenderedAt > MEDIA_STALL_RESET_MS) return true;
+  if (state.lastVideoPacketAt && now - state.lastVideoPacketAt > state.mediaStallResetMs) return true;
+  if (state.lastVideoFrameRenderedAt && now - state.lastVideoFrameRenderedAt > state.mediaStallResetMs) return true;
   return false;
 }
 
@@ -3942,7 +4184,7 @@ async function writeLocalClipboard(payload) {
 }
 
 async function pasteLocalClipboardToRemote() {
-  if (state.socket?.readyState !== WebSocket.OPEN) {
+  if (!isConnected()) {
     showToast("paste_unavailable", "Connect to the server first");
     return;
   }
@@ -3984,7 +4226,7 @@ async function uploadSelectedFile() {
       throw new Error(await response.text());
     }
     const body = await response.json();
-    setStatus(state.socket?.readyState === WebSocket.OPEN ? "Connected" : "Disconnected");
+    setStatus(isConnected() ? "Connected" : "Disconnected");
     showToast("upload_ok", `Saved to ${body.saved_as}`);
   } catch (error) {
     showToast("upload_failed", error.message || String(error));
@@ -4047,12 +4289,26 @@ function initControls() {
   audioBitrateSelect.addEventListener("change", persistCurrentSettings);
   micBitrateSelect.addEventListener("change", () => {
     persistCurrentSettings();
-    if (!state.micEnabled || state.socket?.readyState !== WebSocket.OPEN) return;
+    if (!state.micEnabled || !isSocketOpen(state.micSocket)) return;
     stopMicrophoneCapture();
     void startMicrophoneCapture();
   });
   fpsInput.addEventListener("input", persistCurrentSettings);
   fpsInput.addEventListener("change", persistCurrentSettings);
+  encoderLatencySelect.addEventListener("change", persistCurrentSettings);
+  videoScaleSelect.addEventListener("change", persistCurrentSettings);
+  gopMsInput.addEventListener("input", persistCurrentSettings);
+  gopMsInput.addEventListener("change", persistCurrentSettings);
+  bufferMsInput.addEventListener("input", persistCurrentSettings);
+  bufferMsInput.addEventListener("change", persistCurrentSettings);
+  staleDropMsInput.addEventListener("input", persistCurrentSettings);
+  staleDropMsInput.addEventListener("change", persistCurrentSettings);
+  stallResetMsInput.addEventListener("input", persistCurrentSettings);
+  stallResetMsInput.addEventListener("change", persistCurrentSettings);
+  decodeQueueInput.addEventListener("input", persistCurrentSettings);
+  decodeQueueInput.addEventListener("change", persistCurrentSettings);
+  performanceSpeedButton.addEventListener("click", () => applyPerformancePreset("speed"));
+  performanceQualityButton.addEventListener("click", () => applyPerformancePreset("quality"));
   scrollSpeedInput.addEventListener("input", persistCurrentSettings);
   scrollSpeedInput.addEventListener("change", persistCurrentSettings);
   audioLatencyInput.addEventListener("input", persistCurrentSettings);

@@ -5,7 +5,9 @@ use std::{
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
+use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
+use serde::Deserialize;
 use tokio::{
     io::AsyncWriteExt,
     process::Child,
@@ -24,8 +26,19 @@ use crate::{
     streamer::StreamFrame,
     system_stats::StatsSampler,
     uinput::{UInputPointerInjector, UInputWheelInjector},
-    x11_input::X11InputInjector,
+    x11_input::{X11InputInjector, screen_size},
 };
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    #[default]
+    All,
+    Control,
+    Video,
+    Audio,
+    Mic,
+}
 
 const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
@@ -69,6 +82,25 @@ pub async fn handle_socket(
     media: MediaHub,
     config: StreamConfig,
     audio_config: AudioStreamConfig,
+    role: SessionRole,
+) -> Result<()> {
+    match role {
+        SessionRole::All => {
+            handle_combined_socket(socket, server, media, config, audio_config).await
+        }
+        SessionRole::Control => handle_control_socket(socket, server, media).await,
+        SessionRole::Video => handle_video_socket(socket, server, media, config).await,
+        SessionRole::Audio => handle_audio_socket(socket, media, audio_config).await,
+        SessionRole::Mic => handle_mic_socket(socket, server).await,
+    }
+}
+
+async fn handle_combined_socket(
+    socket: WebSocket,
+    server: ServerConfig,
+    media: MediaHub,
+    config: StreamConfig,
+    audio_config: AudioStreamConfig,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
     maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
@@ -83,7 +115,7 @@ pub async fn handle_socket(
         .and_then(|stream| stream.state_rx.borrow().clone());
     let (ws_sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
-    let (video_tx, video_rx) = watch::channel(None::<Vec<u8>>);
+    let (video_tx, video_rx) = watch::channel(None::<Bytes>);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let session_id = format!("{:x}", rand_id());
@@ -185,9 +217,388 @@ pub async fn handle_socket(
     Ok(())
 }
 
+async fn handle_control_socket(
+    socket: WebSocket,
+    server: ServerConfig,
+    media: MediaHub,
+) -> Result<()> {
+    let mut initial_display_wake_at = None;
+    maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
+    let (ws_sender, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(32);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
+    let stats_task = spawn_stats(out_tx.clone(), media.video_state_rx());
+    let state_task = tokio::spawn(forward_state_hellos(
+        out_tx.clone(),
+        server.display.clone(),
+        media.video_state_rx(),
+        media.audio_state_rx(),
+    ));
+    let mut recv_task = tokio::spawn(handle_client(receiver, out_tx, server, media, shutdown_rx));
+    let mut writer_task = writer_task;
+    let mut state_task = state_task;
+
+    tokio::select! {
+        result = &mut recv_task => {
+            if let Err(err) = result {
+                warn!("control websocket receiver task failed: {err}");
+            }
+        }
+        result = &mut writer_task => {
+            if let Err(err) = result {
+                warn!("control websocket writer task failed: {err}");
+            }
+        }
+        result = &mut state_task => {
+            if let Err(err) = result {
+                warn!("control websocket state task failed: {err}");
+            }
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    stats_task.abort();
+    if !recv_task.is_finished() {
+        recv_task.abort();
+    }
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
+    if !state_task.is_finished() {
+        state_task.abort();
+    }
+    Ok(())
+}
+
+async fn handle_video_socket(
+    socket: WebSocket,
+    server: ServerConfig,
+    media: MediaHub,
+    config: StreamConfig,
+) -> Result<()> {
+    let video_stream = media.acquire_video(config).await?;
+    let initial_video = current_video_state(&video_stream.state_rx)?;
+    let audio_state_rx = media.audio_state_rx();
+    let initial_audio = current_audio_state(Some(&audio_state_rx));
+    let (ws_sender, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(32);
+    let (video_tx, video_rx) = watch::channel(None::<Bytes>);
+    let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(1);
+    drop(audio_tx);
+    let session_id = format!("{:x}", rand_id());
+    send_hello(
+        &out_tx,
+        Some(session_id.as_str()),
+        Some(server.display.as_str()),
+        &initial_video,
+        initial_audio.as_ref(),
+        None,
+    )
+    .await?;
+    let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
+    let send_task = tokio::spawn(forward_frames(
+        out_tx,
+        video_tx,
+        video_stream.rx.clone(),
+        video_stream.state_rx.clone(),
+        Some(audio_state_rx),
+    ));
+    let close_task = tokio::spawn(wait_for_socket_close(receiver));
+    wait_for_role_tasks("video", writer_task, send_task, close_task).await;
+    Ok(())
+}
+
+async fn handle_audio_socket(
+    socket: WebSocket,
+    media: MediaHub,
+    audio_config: AudioStreamConfig,
+) -> Result<()> {
+    let (ws_sender, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(32);
+    let (video_tx, video_rx) = watch::channel(None::<Bytes>);
+    drop(video_tx);
+    let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
+    let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
+    let close_task = tokio::spawn(wait_for_socket_close(receiver));
+    let mut audio_stream = match media.acquire_audio(audio_config).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            let _ = out_tx
+                .send(Message::Text(
+                    serde_json::to_string(&ServerMessage::Error {
+                        code: "audio_unavailable",
+                        message: "Audio capture is unavailable. Install and run PulseAudio/PipeWire with pactl support, or set VIBE_RDESK_AUDIO_SOURCE.".into(),
+                    })?
+                    .into(),
+                ))
+                .await;
+            wait_for_audio_error_socket(writer_task, close_task).await;
+            return Ok(());
+        }
+    };
+    let video_state = { media.video_state_rx().borrow().clone() };
+    let audio_state = { audio_stream.state_rx.borrow().clone() };
+    if let (Some(video_state), Some(audio_state)) = (video_state, audio_state) {
+        send_hello(&out_tx, None, None, &video_state, Some(&audio_state), None).await?;
+    }
+    let audio_task = audio_stream
+        .take_audio_rx()
+        .map(|rx| tokio::spawn(forward_audio(audio_tx, rx)));
+    wait_for_audio_tasks(writer_task, audio_task, close_task).await;
+    Ok(())
+}
+
+async fn handle_mic_socket(socket: WebSocket, server: ServerConfig) -> Result<()> {
+    let (ws_sender, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(8);
+    let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
+    let recv_task = tokio::spawn(handle_mic_client(receiver, out_tx, server));
+    wait_for_mic_tasks(writer_task, recv_task).await;
+    Ok(())
+}
+
+async fn write_control_socket(
+    mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut control_rx: mpsc::Receiver<Message>,
+) {
+    while let Some(message) = control_rx.recv().await {
+        if futures_util::SinkExt::send(&mut ws_sender, message)
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+async fn wait_for_socket_close(
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+) -> Result<()> {
+    while let Some(message) = receiver.next().await {
+        match message? {
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn forward_state_hellos(
+    sender: mpsc::Sender<Message>,
+    display: String,
+    mut video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
+    mut audio_state_rx: watch::Receiver<Option<ActiveAudioState>>,
+) -> Result<()> {
+    let session_id = format!("{:x}", rand_id());
+    loop {
+        let video_state = { video_state_rx.borrow().clone() };
+        if let Some(video_state) = video_state {
+            let audio_state = { audio_state_rx.borrow().clone() };
+            send_hello(
+                &sender,
+                Some(session_id.as_str()),
+                Some(display.as_str()),
+                &video_state,
+                audio_state.as_ref(),
+                None,
+            )
+            .await?;
+            break;
+        }
+        video_state_rx.changed().await?;
+    }
+
+    loop {
+        tokio::select! {
+            changed = video_state_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            changed = audio_state_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+        }
+        let video_state = { video_state_rx.borrow().clone() };
+        let Some(video_state) = video_state else {
+            continue;
+        };
+        let audio_state = { audio_state_rx.borrow().clone() };
+        send_hello(
+            &sender,
+            Some(session_id.as_str()),
+            Some(display.as_str()),
+            &video_state,
+            audio_state.as_ref(),
+            None,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_mic_client(
+    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    sender: mpsc::Sender<Message>,
+    server: ServerConfig,
+) -> Result<()> {
+    let mut mic_input = MicInputState::Idle;
+    while let Some(message) = receiver.next().await {
+        match message? {
+            Message::Binary(bytes) => {
+                forward_client_binary(&server, &sender, bytes.as_ref(), &mut mic_input).await;
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    shutdown_mic_input(&mut mic_input).await;
+    Ok(())
+}
+
+async fn wait_for_role_tasks(
+    kind: &'static str,
+    mut writer_task: tokio::task::JoinHandle<()>,
+    mut send_task: tokio::task::JoinHandle<Result<()>>,
+    mut close_task: tokio::task::JoinHandle<Result<()>>,
+) {
+    tokio::select! {
+        result = &mut writer_task => {
+            if let Err(err) = result {
+                warn!("{kind} websocket writer task failed: {err}");
+            }
+        }
+        result = &mut send_task => {
+            match result {
+                Ok(Err(err)) => warn!("{kind} websocket sender task failed: {err}"),
+                Err(err) => warn!("{kind} websocket sender task failed: {err}"),
+                Ok(Ok(())) => {}
+            }
+        }
+        result = &mut close_task => {
+            match result {
+                Ok(Err(err)) => warn!("{kind} websocket close task failed: {err}"),
+                Err(err) => warn!("{kind} websocket close task failed: {err}"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
+    if !send_task.is_finished() {
+        send_task.abort();
+    }
+    if !close_task.is_finished() {
+        close_task.abort();
+    }
+}
+
+async fn wait_for_audio_error_socket(
+    mut writer_task: tokio::task::JoinHandle<()>,
+    mut close_task: tokio::task::JoinHandle<Result<()>>,
+) {
+    tokio::select! {
+        result = &mut writer_task => {
+            if let Err(err) = result {
+                warn!("audio websocket writer task failed: {err}");
+            }
+        }
+        result = &mut close_task => {
+            match result {
+                Ok(Err(err)) => warn!("audio websocket close task failed: {err}"),
+                Err(err) => warn!("audio websocket close task failed: {err}"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
+    if !close_task.is_finished() {
+        close_task.abort();
+    }
+}
+
+async fn wait_for_audio_tasks(
+    mut writer_task: tokio::task::JoinHandle<()>,
+    mut audio_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    mut close_task: tokio::task::JoinHandle<Result<()>>,
+) {
+    match audio_task.as_mut() {
+        Some(audio_task) => {
+            tokio::select! {
+                result = &mut writer_task => {
+                    if let Err(err) = result {
+                        warn!("audio websocket writer task failed: {err}");
+                    }
+                }
+                result = audio_task => {
+                    match result {
+                        Ok(Err(err)) => warn!("audio websocket sender task failed: {err}"),
+                        Err(err) => warn!("audio websocket sender task failed: {err}"),
+                        Ok(Ok(())) => {}
+                    }
+                }
+                result = &mut close_task => {
+                    match result {
+                        Ok(Err(err)) => warn!("audio websocket close task failed: {err}"),
+                        Err(err) => warn!("audio websocket close task failed: {err}"),
+                        Ok(Ok(())) => {}
+                    }
+                }
+            }
+        }
+        None => {
+            wait_for_audio_error_socket(writer_task, close_task).await;
+            return;
+        }
+    }
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
+    if let Some(audio_task) = audio_task {
+        if !audio_task.is_finished() {
+            audio_task.abort();
+        }
+    }
+    if !close_task.is_finished() {
+        close_task.abort();
+    }
+}
+
+async fn wait_for_mic_tasks(
+    mut writer_task: tokio::task::JoinHandle<()>,
+    mut recv_task: tokio::task::JoinHandle<Result<()>>,
+) {
+    tokio::select! {
+        result = &mut writer_task => {
+            if let Err(err) = result {
+                warn!("mic websocket writer task failed: {err}");
+            }
+        }
+        result = &mut recv_task => {
+            match result {
+                Ok(Err(err)) => warn!("mic websocket receiver task failed: {err}"),
+                Err(err) => warn!("mic websocket receiver task failed: {err}"),
+                Ok(Ok(())) => {}
+            }
+        }
+    }
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
+    if !recv_task.is_finished() {
+        recv_task.abort();
+    }
+}
+
 async fn forward_frames(
     sender: mpsc::Sender<Message>,
-    media_sender: watch::Sender<Option<Vec<u8>>>,
+    media_sender: watch::Sender<Option<Bytes>>,
     mut rx: watch::Receiver<Option<StreamFrame>>,
     mut video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
     mut audio_state_rx: Option<watch::Receiver<Option<ActiveAudioState>>>,
@@ -201,7 +612,7 @@ async fn forward_frames(
                 let Some(frame) = rx.borrow_and_update().clone() else {
                     continue;
                 };
-                let _ = media_sender.send(Some(binary_frame(&frame)));
+                let _ = media_sender.send(Some(frame.packet.clone()));
                 if frame.description_b64.is_some() {
                     let video_state = current_video_state(&video_state_rx)?;
                     let audio_state = current_audio_state(audio_state_rx.as_ref());
@@ -254,13 +665,13 @@ async fn forward_audio(
 async fn write_socket(
     mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
     mut control_rx: mpsc::Receiver<Message>,
-    mut video_rx: watch::Receiver<Option<Vec<u8>>>,
+    mut video_rx: watch::Receiver<Option<Bytes>>,
     mut audio_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut control_closed = false;
     let mut video_closed = false;
     let mut audio_closed = false;
-    let mut pending_video: Option<Vec<u8>> = None;
+    let mut pending_video: Option<Bytes> = None;
     let mut pending_audio: Option<Vec<u8>> = None;
 
     loop {
@@ -291,7 +702,7 @@ async fn write_socket(
         }
 
         if let Some(bytes) = pending_video.take() {
-            if futures_util::SinkExt::send(&mut ws_sender, Message::Binary(bytes.into()))
+            if futures_util::SinkExt::send(&mut ws_sender, Message::Binary(bytes))
                 .await
                 .is_err()
             {
@@ -1346,16 +1757,6 @@ async fn send_clipboard_update(display: &str, sender: &mpsc::Sender<Message>) ->
     Ok(())
 }
 
-fn binary_frame(frame: &StreamFrame) -> Vec<u8> {
-    let mut out = Vec::with_capacity(18 + frame.bytes.len());
-    out.push(1);
-    out.push(u8::from(frame.keyframe));
-    out.extend_from_slice(&frame.sent_at_ms.to_le_bytes());
-    out.extend_from_slice(&(frame.bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(&frame.bytes);
-    out
-}
-
 fn binary_audio_frame(frame: &AudioFrame) -> Vec<u8> {
     let mut out = Vec::with_capacity(17 + frame.bytes.len());
     out.push(2);
@@ -1402,12 +1803,21 @@ async fn send_hello(
     audio_state: Option<&ActiveAudioState>,
     description_b64: Option<String>,
 ) -> Result<()> {
+    let screen_size = display.and_then(|display| match screen_size(display) {
+        Ok(size) => Some(size),
+        Err(err) => {
+            warn!("failed to query X11 screen size: {err}");
+            None
+        }
+    });
     sender
         .send(Message::Text(
             serde_json::to_string(&ServerMessage::Hello {
                 session_id: session_id.unwrap_or_default().into(),
                 server_time_ms: current_ms(),
                 display: display.unwrap_or_default().into(),
+                screen_width: screen_size.map(|(width, _)| width),
+                screen_height: screen_size.map(|(_, height)| height),
                 config: video_state.config.clone(),
                 audio_config: audio_state.map(|state| state.config.clone()),
                 config_fallback: video_state.config_fallback,

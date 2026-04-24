@@ -30,8 +30,11 @@ use crate::{
     },
     ffmpeg,
     media::MediaHub,
-    session,
-    settings::{AudioStreamConfig, CodecKind, EncodePreference, ServerConfig, StreamConfig},
+    session::{self, SessionRole},
+    settings::{
+        AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, ServerConfig,
+        StreamConfig, VideoPerformanceConfig, VideoScale,
+    },
 };
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -238,11 +241,16 @@ struct CodecsQuery {
 
 #[derive(Debug, Deserialize)]
 struct WsQuery {
+    role: Option<SessionRole>,
     codec: Option<CodecKind>,
     bitrate_kbps: Option<u32>,
     audio_bitrate_kbps: Option<u32>,
     fps: Option<u32>,
     encode_preference: Option<EncodePreference>,
+    encoder_latency: Option<EncoderLatencyMode>,
+    gop_ms: Option<u32>,
+    buffer_ms: Option<u32>,
+    scale: Option<VideoScale>,
     passwd: Option<String>,
 }
 
@@ -494,9 +502,23 @@ async fn ws(
     }
     let config = StreamConfig {
         codec: query.codec.unwrap_or(CodecKind::H264),
-        bitrate_kbps: query.bitrate_kbps.unwrap_or(2_000),
-        fps: query.fps.unwrap_or(23),
+        bitrate_kbps: query
+            .bitrate_kbps
+            .unwrap_or_else(|| StreamConfig::default().bitrate_kbps),
+        fps: query.fps.unwrap_or_else(|| StreamConfig::default().fps),
         encode_preference: query.encode_preference.unwrap_or_default(),
+        performance: VideoPerformanceConfig {
+            encoder_latency: query.encoder_latency.unwrap_or_default(),
+            gop_ms: query
+                .gop_ms
+                .unwrap_or_else(|| VideoPerformanceConfig::default().gop_ms),
+            buffer_ms: query
+                .buffer_ms
+                .unwrap_or_else(|| VideoPerformanceConfig::default().buffer_ms),
+            scale: query
+                .scale
+                .unwrap_or_else(|| VideoPerformanceConfig::default().scale),
+        },
     }
     .normalized();
     let audio_config = AudioStreamConfig {
@@ -510,6 +532,7 @@ async fn ws(
             state.media.clone(),
             config,
             audio_config,
+            query.role.unwrap_or_default(),
         )
         .await
         {

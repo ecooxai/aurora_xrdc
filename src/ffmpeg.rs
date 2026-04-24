@@ -9,7 +9,10 @@ use tokio::{
 };
 use tracing::warn;
 
-use crate::settings::{AudioStreamConfig, CodecKind, EncodePreference, ServerConfig, StreamConfig};
+use crate::settings::{
+    AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, ServerConfig, StreamConfig,
+    VideoScale,
+};
 
 #[derive(Debug, Clone)]
 pub struct EncoderChoice {
@@ -67,7 +70,6 @@ const VIRTUAL_MIC_SINK_NAME: &str = "vibe_rdesk_virtual_mic_sink";
 const VIRTUAL_CAMERA_LABEL: &str = "VibeRDesk Camera";
 const LEGACY_VIRTUAL_CAMERA_LABELS: &[&str] = &["viberdeskcamera", "vibedeskcamera"];
 const VIRTUAL_CAMERA_NR: &str = "42";
-const VIDEO_GOP_SECONDS: u32 = 2;
 const DISPLAY_WAKE_RETRY_DELAY: Duration = Duration::from_millis(150);
 
 const H264_GPU_ENCODERS: &[EncoderProfile] = &[
@@ -407,11 +409,11 @@ async fn ffmpeg_probe_encoder(profile: EncoderProfile) -> Result<bool> {
         "-an",
         "-sn",
     ]);
-    append_video_filter_args(&mut cmd, profile.backend);
+    append_video_filter_args(&mut cmd, profile.backend, VideoScale::Native);
     cmd.args(["-c:v", profile.ffmpeg_encoder]);
     append_bitrate_args(&mut cmd, "200k", "100k");
     append_gop_args(&mut cmd, "1", profile.backend);
-    append_encoder_specific_args(&mut cmd, profile.ffmpeg_encoder);
+    append_encoder_specific_args(&mut cmd, profile.ffmpeg_encoder, EncoderLatencyMode::Low);
     let output = cmd
         .args(["-f", "null", "-"])
         .stdout(Stdio::null())
@@ -429,8 +431,8 @@ pub fn spawn_capture(
 ) -> Result<tokio::process::Child> {
     let bitrate = format!("{}k", stream.bitrate_kbps);
     let fps = stream.fps.to_string();
-    let gop = video_gop_frames(stream.fps).to_string();
-    let buffer = format!("{}k", (stream.bitrate_kbps / 2).max(1));
+    let gop = video_gop_frames(stream.fps, stream.performance.gop_ms).to_string();
+    let buffer = video_buffer_size(stream.bitrate_kbps, stream.performance.buffer_ms);
     let backend = encoder_backend(&encoder.ffmpeg_encoder);
     let mut cmd = Command::new("ffmpeg");
     cmd.env("DISPLAY", &server.display).args([
@@ -462,11 +464,15 @@ pub fn spawn_capture(
         "-an",
         "-sn",
     ]);
-    append_video_filter_args(&mut cmd, backend);
+    append_video_filter_args(&mut cmd, backend, stream.performance.scale);
     cmd.args(["-c:v", &encoder.ffmpeg_encoder]);
     append_bitrate_args(&mut cmd, &bitrate, &buffer);
     append_gop_args(&mut cmd, &gop, backend);
-    append_encoder_specific_args(&mut cmd, &encoder.ffmpeg_encoder);
+    append_encoder_specific_args(
+        &mut cmd,
+        &encoder.ffmpeg_encoder,
+        stream.performance.encoder_latency,
+    );
     append_bitstream_filter_args(&mut cmd, encoder.output_format);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.args(["-f", encoder.output_format, "pipe:1"]);
@@ -499,13 +505,25 @@ fn append_hw_device_args(cmd: &mut Command, backend: EncoderBackend) -> Result<(
     Ok(())
 }
 
-fn append_video_filter_args(cmd: &mut Command, backend: EncoderBackend) {
+fn append_video_filter_args(cmd: &mut Command, backend: EncoderBackend, scale: VideoScale) {
+    let scale_filter = scale
+        .target_height()
+        .map(|height| format!("scale=-2:min(ih\\,{height})"));
     match backend {
         EncoderBackend::Cpu | EncoderBackend::NvidiaNvenc => {
+            if let Some(scale_filter) = scale_filter {
+                cmd.args(["-vf", &scale_filter]);
+            }
             cmd.args(["-pix_fmt", "yuv420p"]);
         }
         EncoderBackend::IntelQsv | EncoderBackend::Vaapi => {
-            cmd.args(["-vf", "format=nv12,hwupload=extra_hw_frames=64"]);
+            let filter = match scale_filter {
+                Some(scale_filter) => {
+                    format!("{scale_filter},format=nv12,hwupload=extra_hw_frames=64")
+                }
+                None => "format=nv12,hwupload=extra_hw_frames=64".into(),
+            };
+            cmd.args(["-vf", &filter]);
         }
     }
 }
@@ -520,61 +538,125 @@ fn append_gop_args(cmd: &mut Command, gop: &str, backend: EncoderBackend) {
         EncoderBackend::Cpu | EncoderBackend::NvidiaNvenc => {
             cmd.args(["-keyint_min", gop, "-threads", "2"]);
         }
-        EncoderBackend::IntelQsv | EncoderBackend::Vaapi => {
-            cmd.args(["-bf", "0"]);
-        }
+        EncoderBackend::IntelQsv | EncoderBackend::Vaapi => {}
     }
 }
 
-fn append_encoder_specific_args(cmd: &mut Command, encoder: &str) {
+fn append_encoder_specific_args(cmd: &mut Command, encoder: &str, latency: EncoderLatencyMode) {
     match encoder {
         "h264_nvenc" | "hevc_nvenc" | "av1_nvenc" => {
+            let tune = match latency {
+                EncoderLatencyMode::UltraLow => "ull",
+                EncoderLatencyMode::Low | EncoderLatencyMode::Balanced => "ll",
+            };
+            let preset = match latency {
+                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "p1",
+                EncoderLatencyMode::Balanced => "p3",
+            };
+            let rc = match latency {
+                EncoderLatencyMode::Balanced => "cbr_hq",
+                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "cbr_ld_hq",
+            };
             cmd.args([
                 "-preset",
-                "p1",
+                preset,
                 "-tune",
-                "ll",
+                tune,
                 "-rc",
-                "cbr_ld_hq",
+                rc,
                 "-zerolatency",
                 "1",
                 "-strict_gop",
                 "1",
+                "-bf",
+                "0",
+                "-delay",
+                "0",
+                "-rc-lookahead",
+                "0",
                 "-aud",
                 "1",
             ]);
+            if matches!(latency, EncoderLatencyMode::UltraLow) {
+                cmd.args(["-surfaces", "2"]);
+            } else if matches!(latency, EncoderLatencyMode::Balanced) {
+                cmd.args(["-spatial-aq", "1"]);
+            }
         }
         "libx264" => {
+            let preset = match latency {
+                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "ultrafast",
+                EncoderLatencyMode::Balanced => "veryfast",
+            };
+            let params = match latency {
+                EncoderLatencyMode::UltraLow => {
+                    "repeat-headers=1:aud=1:scenecut=0:sliced-threads=1"
+                }
+                EncoderLatencyMode::Low | EncoderLatencyMode::Balanced => "repeat-headers=1:aud=1",
+            };
             cmd.args([
                 "-preset",
-                "ultrafast",
+                preset,
                 "-tune",
                 "zerolatency",
+                "-bf",
+                "0",
                 "-x264-params",
-                "repeat-headers=1:aud=1",
+                params,
             ]);
         }
         "libx265" => {
+            let preset = match latency {
+                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "ultrafast",
+                EncoderLatencyMode::Balanced => "veryfast",
+            };
             cmd.args([
                 "-preset",
-                "ultrafast",
+                preset,
                 "-tune",
                 "zerolatency",
+                "-bf",
+                "0",
                 "-x265-params",
                 "repeat-headers=1:aud=1",
             ]);
         }
         "h264_qsv" | "hevc_qsv" | "vp9_qsv" | "av1_qsv" => {
+            let preset = match latency {
+                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "veryfast",
+                EncoderLatencyMode::Balanced => "faster",
+            };
             cmd.args([
                 "-preset",
-                "veryfast",
+                preset,
                 "-look_ahead",
                 "0",
                 "-async_depth",
                 "1",
+                "-bf",
+                "0",
             ]);
+            if matches!(latency, EncoderLatencyMode::UltraLow) {
+                cmd.args(["-low_power", "1", "-low_delay_brc", "1"]);
+            }
         }
-        "h264_vaapi" | "hevc_vaapi" | "vp9_vaapi" | "av1_vaapi" => {}
+        "h264_vaapi" | "hevc_vaapi" | "vp9_vaapi" | "av1_vaapi" => {
+            cmd.args(["-bf", "0"]);
+            match latency {
+                EncoderLatencyMode::UltraLow => {
+                    cmd.args(["-low_power", "1", "-quality", "7"]);
+                }
+                EncoderLatencyMode::Low => {
+                    cmd.args(["-quality", "6"]);
+                }
+                EncoderLatencyMode::Balanced => {
+                    cmd.args(["-quality", "4"]);
+                }
+            };
+            if matches!(encoder, "h264_vaapi" | "hevc_vaapi") {
+                cmd.args(["-aud", "1"]);
+            }
+        }
         "libvpx" => {
             cmd.args(["-deadline", "realtime", "-cpu-used", "8"]);
         }
@@ -637,8 +719,17 @@ fn render_device_path() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no GPU render device found under /dev/dri"))
 }
 
-fn video_gop_frames(fps: u32) -> u32 {
-    fps.saturating_mul(VIDEO_GOP_SECONDS).max(1)
+fn video_gop_frames(fps: u32, gop_ms: u32) -> u32 {
+    fps.saturating_mul(gop_ms).saturating_add(999) / 1_000
+}
+
+fn video_buffer_size(bitrate_kbps: u32, buffer_ms: u32) -> String {
+    let buffer_kbits = ((bitrate_kbps as u64)
+        .saturating_mul(buffer_ms as u64)
+        .saturating_add(999)
+        / 1_000)
+        .max(1);
+    format!("{buffer_kbits}k")
 }
 
 pub async fn spawn_audio_capture(
@@ -1443,9 +1534,15 @@ mod tests {
     }
 
     #[test]
-    fn video_gop_tracks_two_seconds_of_frames() {
-        assert_eq!(super::video_gop_frames(1), 2);
-        assert_eq!(super::video_gop_frames(16), 32);
-        assert_eq!(super::video_gop_frames(60), 120);
+    fn video_gop_tracks_configured_milliseconds() {
+        assert_eq!(super::video_gop_frames(1, 2_000), 2);
+        assert_eq!(super::video_gop_frames(16, 1_000), 16);
+        assert_eq!(super::video_gop_frames(60, 500), 30);
+    }
+
+    #[test]
+    fn video_buffer_size_tracks_configured_milliseconds() {
+        assert_eq!(super::video_buffer_size(2_000, 500), "1000k");
+        assert_eq!(super::video_buffer_size(4_000, 100), "400k");
     }
 }

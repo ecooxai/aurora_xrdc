@@ -13,6 +13,68 @@ pub enum CodecKind {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderLatencyMode {
+    UltraLow,
+    #[default]
+    Low,
+    Balanced,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoScale {
+    #[default]
+    Native,
+    #[serde(rename = "1080p")]
+    P1080,
+    #[serde(rename = "900p")]
+    P900,
+    #[serde(rename = "720p")]
+    P720,
+}
+
+impl VideoScale {
+    pub fn target_height(self) -> Option<u32> {
+        match self {
+            Self::Native => None,
+            Self::P1080 => Some(1080),
+            Self::P900 => Some(900),
+            Self::P720 => Some(720),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct VideoPerformanceConfig {
+    #[serde(default)]
+    pub encoder_latency: EncoderLatencyMode,
+    pub gop_ms: u32,
+    pub buffer_ms: u32,
+    #[serde(default)]
+    pub scale: VideoScale,
+}
+
+impl Default for VideoPerformanceConfig {
+    fn default() -> Self {
+        Self {
+            encoder_latency: EncoderLatencyMode::Low,
+            gop_ms: 4_000,
+            buffer_ms: 2_000,
+            scale: VideoScale::P720,
+        }
+    }
+}
+
+impl VideoPerformanceConfig {
+    pub fn normalized(mut self) -> Self {
+        self.gop_ms = self.gop_ms.clamp(250, 4_000);
+        self.buffer_ms = self.buffer_ms.clamp(50, 2_000);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EncodePreference {
     #[default]
@@ -164,15 +226,18 @@ pub struct StreamConfig {
     pub fps: u32,
     #[serde(default)]
     pub encode_preference: EncodePreference,
+    #[serde(default)]
+    pub performance: VideoPerformanceConfig,
 }
 
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             codec: CodecKind::H264,
-            bitrate_kbps: 2_000,
-            fps: 23,
+            bitrate_kbps: 1_024,
+            fps: 30,
             encode_preference: EncodePreference::Cpu,
+            performance: VideoPerformanceConfig::default(),
         }
     }
 }
@@ -182,6 +247,7 @@ impl StreamConfig {
         self.bitrate_kbps = self.bitrate_kbps.clamp(128, 25_000);
         self.fps = self.fps.clamp(1, 60);
         self.encode_preference = self.encode_preference.normalized_for_codec(self.codec);
+        self.performance = self.performance.normalized();
         self
     }
 
@@ -191,6 +257,7 @@ impl StreamConfig {
             bitrate_kbps: self.bitrate_kbps,
             fps: self.fps,
             encode_preference: EncodePreference::Cpu,
+            performance: self.performance.clone(),
         }
         .normalized()
     }
@@ -365,6 +432,7 @@ mod tests {
             bitrate_kbps: 99,
             fps: 99,
             encode_preference: EncodePreference::Gpu,
+            ..StreamConfig::default()
         }
         .normalized();
         assert_eq!(cfg.bitrate_kbps, 128);
@@ -386,6 +454,7 @@ mod tests {
             bitrate_kbps: 4_000,
             fps: 16,
             encode_preference: EncodePreference::H264Qsv,
+            ..StreamConfig::default()
         }
         .normalized();
         assert_eq!(cfg.encode_preference, EncodePreference::Cpu);
@@ -398,6 +467,7 @@ mod tests {
             bitrate_kbps: 4_000,
             fps: 16,
             encode_preference: EncodePreference::Nvidia,
+            ..StreamConfig::default()
         }
         .normalized();
         assert_eq!(cfg.encode_preference, EncodePreference::Nvidia);
@@ -410,6 +480,7 @@ mod tests {
             bitrate_kbps: 4_000,
             fps: 16,
             encode_preference: EncodePreference::Nvidia,
+            ..StreamConfig::default()
         }
         .normalized();
         assert_eq!(cfg.encode_preference, EncodePreference::Cpu);
@@ -422,6 +493,7 @@ mod tests {
             bitrate_kbps: 4_000,
             fps: 16,
             encode_preference: EncodePreference::Av1Qsv,
+            ..StreamConfig::default()
         }
         .normalized();
         assert_eq!(cfg.encode_preference, EncodePreference::Av1Qsv);
@@ -434,6 +506,7 @@ mod tests {
             bitrate_kbps: 6_000,
             fps: 24,
             encode_preference: EncodePreference::HevcQsv,
+            ..StreamConfig::default()
         }
         .h264_cpu_fallback();
         assert_eq!(cfg.codec, CodecKind::H264);

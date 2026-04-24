@@ -11,6 +11,8 @@ pub enum ServerMessage {
         session_id: String,
         server_time_ms: u64,
         display: String,
+        screen_width: Option<u16>,
+        screen_height: Option<u16>,
         config: StreamConfig,
         audio_config: Option<AudioStreamConfig>,
         config_fallback: bool,

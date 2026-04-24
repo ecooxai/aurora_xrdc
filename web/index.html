@@ -57,6 +57,7 @@
                 <button id="tab-button-status" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-status" data-tab-target="status">Status</button>
                 <button id="tab-button-view" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-view" data-tab-target="view">View</button>
                 <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Settings</button>
+                <button id="tab-button-performance" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-performance" data-tab-target="performance">Performance</button>
                 <button id="tab-button-transfer" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-transfer" data-tab-target="transfer">Transfer</button>
               </div>
               <section id="tab-panel-status" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-button-status">
@@ -160,10 +161,6 @@
                     </select>
                     <span id="encode-preference-help" class="field-help">Loading encoder availability...</span>
                   </div>
-                  <label>Bitrate
-                    <input id="bitrate" type="range" min="128" max="12000" step="16" value="2000" />
-                    <span id="bitrate-value">2000 kbps</span>
-                  </label>
                   <label>Audio playback bitrate
                     <select id="audio-bitrate">
                       <option value="16">16 kbps</option>
@@ -193,10 +190,6 @@
                       <option value="256">256 kbps</option>
                       <option value="320" selected>320 kbps</option>
                     </select>
-                  </label>
-                  <label>FPS
-                    <input id="fps" type="range" min="1" max="60" step="1" value="23" />
-                    <span id="fps-value">23 fps</span>
                   </label>
                   <label>Scroll speed
                     <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
@@ -231,6 +224,57 @@
                 <div class="button-row">
                   <button id="connect">Connect</button>
                   <button id="disconnect" class="secondary">Disconnect</button>
+                </div>
+              </section>
+              <section id="tab-panel-performance" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-performance" hidden>
+                <div class="performance-preset-row">
+                  <button id="performance-speed" class="is-active" type="button">Speed</button>
+                  <button id="performance-quality" class="secondary" type="button">Quality</button>
+                </div>
+                <div class="menu-grid">
+                  <label>Bitrate
+                    <input id="bitrate" type="range" min="128" max="12000" step="16" value="1024" />
+                    <span id="bitrate-value">1024 kbps</span>
+                  </label>
+                  <label>FPS
+                    <input id="fps" type="range" min="1" max="60" step="1" value="30" />
+                    <span id="fps-value">30 fps</span>
+                  </label>
+                  <label>Encoder latency
+                    <select id="encoder-latency">
+                      <option value="ultra_low">Ultra low</option>
+                      <option value="low" selected>Low</option>
+                      <option value="balanced">Balanced</option>
+                    </select>
+                  </label>
+                  <label>Stream size
+                    <select id="video-scale">
+                      <option value="native">Native</option>
+                      <option value="1080p">1080p</option>
+                      <option value="900p">900p</option>
+                      <option value="720p" selected>720p</option>
+                    </select>
+                  </label>
+                  <label>GOP
+                    <input id="gop-ms" type="range" min="250" max="4000" step="250" value="4000" />
+                    <span id="gop-ms-value">4000 ms</span>
+                  </label>
+                  <label>Encoder buffer
+                    <input id="buffer-ms" type="range" min="50" max="2000" step="50" value="2000" />
+                    <span id="buffer-ms-value">2000 ms</span>
+                  </label>
+                  <label>Stale drop
+                    <input id="stale-drop-ms" type="range" min="100" max="2000" step="50" value="250" />
+                    <span id="stale-drop-ms-value">250 ms</span>
+                  </label>
+                  <label>Stall reset
+                    <input id="stall-reset-ms" type="range" min="150" max="2500" step="50" value="350" />
+                    <span id="stall-reset-ms-value">350 ms</span>
+                  </label>
+                  <label>Decode queue
+                    <input id="decode-queue" type="range" min="1" max="8" step="1" value="4" />
+                    <span id="decode-queue-value">4 frames</span>
+                  </label>
                 </div>
               </section>
               <section id="tab-panel-transfer" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-transfer" hidden>

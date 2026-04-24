@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use bytes::Bytes;
 use tokio::{io::AsyncReadExt, process::Child, sync::watch};
 
 use crate::{
@@ -11,10 +12,8 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct StreamFrame {
-    pub bytes: Vec<u8>,
-    pub keyframe: bool,
+    pub packet: Bytes,
     pub description_b64: Option<String>,
-    pub sent_at_ms: u64,
 }
 
 pub async fn start(
@@ -48,11 +47,16 @@ pub async fn start(
 }
 
 fn pack_frame(frame: EncodedFrame) -> StreamFrame {
+    let sent_at_ms = now_ms();
+    let mut packet = Vec::with_capacity(14 + frame.data.len());
+    packet.push(1);
+    packet.push(u8::from(frame.keyframe));
+    packet.extend_from_slice(&sent_at_ms.to_le_bytes());
+    packet.extend_from_slice(&(frame.data.len() as u32).to_le_bytes());
+    packet.extend_from_slice(&frame.data);
     StreamFrame {
-        bytes: frame.data,
-        keyframe: frame.keyframe,
+        packet: Bytes::from(packet),
         description_b64: frame.description_b64,
-        sent_at_ms: now_ms(),
     }
 }
 
