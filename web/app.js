@@ -15,7 +15,12 @@ const MEDIA_STALL_RESET_MS = 1000;
 const HIGH_LATENCY_RECONNECT_MS = 1500;
 const HIGH_LATENCY_RECONNECT_GRACE_MS = 5000;
 const HEALTH_WATCHDOG_INTERVAL_MS = 1000;
-const ENABLE_VIDEO_RENDER_WORKER = false;
+const ENABLE_VIDEO_RENDER_WORKER = true;
+const POINTER_FLUSH_INTERVAL_MS = 8;
+const TWO_FINGER_TAP_MAX_MS = 450;
+const TWO_FINGER_TAP_MOVE_PX = 24;
+const RECOVERY_TAP_WINDOW_MS = 1600;
+const RECOVERY_TAP_SAME_AREA_PX = 70;
 const KEY_STATE_SYNC_INTERVAL_MS = 500;
 const MAX_VIDEO_DECODE_QUEUE = 4;
 const MAX_AUDIO_DECODE_QUEUE = 24;
@@ -156,11 +161,17 @@ const state = {
   reconnectTimer: null,
   settingsReconnectTimer: null,
   reconnectAttempt: 0,
+  pendingPointerMotion: null,
+  pointerFlushTimer: 0,
   touchPointers: new Map(),
   touchLongPressTimer: 0,
   touchLongPressPointerId: null,
   touchDragPointerId: null,
   touchScrollLastY: null,
+  touchTwoFingerTap: null,
+  recoveryTapCount: 0,
+  recoveryTapLastAt: 0,
+  recoveryTapCenter: null,
   inputCaptured: false,
   pressedKeys: new Set(),
   modifierChordKeys: new Set(),
@@ -185,6 +196,7 @@ const state = {
   latencyProbeSentAt: new Map(),
   serverClockOffsetMs: 0,
   lastVideoPacketAt: 0,
+  lastVideoFrameRenderedAt: 0,
   lastAudioPacketAt: 0,
   streamWarning: "",
   lastStaleDropAt: 0,
@@ -490,6 +502,14 @@ function applyCanvasZoom() {
   renderViewMetrics();
 }
 
+function videoSurfaceWidth() {
+  return state.remoteScreenWidth ?? canvas.width;
+}
+
+function videoSurfaceHeight() {
+  return state.remoteScreenHeight ?? canvas.height;
+}
+
 function adjustZoom(deltaPercent) {
   const nextZoom = clampZoomPercent(state.viewZoomPercent + deltaPercent);
   if (nextZoom === state.viewZoomPercent) {
@@ -527,10 +547,17 @@ function markStaleDrop(message) {
   setStreamWarning(message);
 }
 
+function clearReconnectTimer() {
+  if (!state.reconnectTimer) return;
+  clearTimeout(state.reconnectTimer);
+  state.reconnectTimer = null;
+}
+
 function forceReconnect(reason) {
   if (state.reconnectingForLatency || state.connecting) return;
   state.reconnectingForLatency = true;
   state.highLatencySinceAt = 0;
+  clearReconnectTimer();
   setStreamWarning(reason);
   showToast("stream_reconnect", reason);
   closeConnection({ manual: false, preserveStatus: true });
@@ -679,6 +706,8 @@ function monitorConnectionHealth() {
     warning = state.streamWarning || AUDIO_UNDERRUN_WARNING;
   } else if (socketOpen && state.lastVideoPacketAt && now - state.lastVideoPacketAt > MEDIA_STALL_RESET_MS) {
     warning = "Video stalled";
+  } else if (socketOpen && state.lastVideoFrameRenderedAt && now - state.lastVideoFrameRenderedAt > MEDIA_STALL_RESET_MS) {
+    warning = "Video render stalled";
   } else if (socketOpen && state.lastStaleDropAt && now - state.lastStaleDropAt < 3000) {
     warning = state.streamWarning || "Dropping delayed frames";
   }
@@ -1430,7 +1459,7 @@ async function connect() {
     );
     closeConnection({ manual: false, preserveStatus: true });
     state.manualDisconnect = false;
-    clearTimeout(state.reconnectTimer);
+    clearReconnectTimer();
     void primeAudioPlayback();
     const {
       codec,
@@ -1530,7 +1559,7 @@ async function connect() {
 
 function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.manualDisconnect = manual;
-  clearTimeout(state.reconnectTimer);
+  clearReconnectTimer();
   clearSettingsReconnectTimer();
   clearAutoDisconnectTimer();
   stopKeyStateSync();
@@ -1549,6 +1578,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   stopRemoteClipboardPolling();
   stopMicrophoneCapture();
   void stopCameraCapture({ notifyServer: true, keepEnabled: false });
+  clearPendingPointerMotion();
   cancelVideoFrameRender();
   clearPendingVideoFrame();
   clearWorkerVideoFrame();
@@ -1564,6 +1594,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   state.audioEnabled = false;
   state.sessionId = "";
   state.waitingForKeyframe = true;
+  state.lastVideoFrameRenderedAt = 0;
   state.netWindowBytes = 0;
   state.netKbps = 0;
   resetKeys();
@@ -1779,7 +1810,11 @@ function clearPendingVideoFrame() {
 }
 
 function clearWorkerVideoFrame() {
-  state.videoRenderWorker?.postMessage({ type: "clear" });
+  try {
+    state.videoRenderWorker?.postMessage({ type: "clear" });
+  } catch {
+    // The worker may already be gone during a reconnect or page shutdown.
+  }
 }
 
 function disableVideoRenderWorker() {
@@ -1809,8 +1844,10 @@ function handleVideoRenderWorkerMessage(event) {
   const message = event.data;
   if (!message || typeof message !== "object") return;
   if (message.type === "error") {
-    disableVideoRenderWorker();
     showToast(message.code || "video_worker_error", message.message || "Video worker failed");
+  } else if (message.type === "rendered") {
+    state.frameCount += 1;
+    state.lastVideoFrameRenderedAt = performance.now();
   }
 }
 
@@ -1828,8 +1865,8 @@ function initVideoRenderer() {
     const worker = new Worker(new URL("./video_renderer_worker.js", window.location.href));
     worker.addEventListener("message", handleVideoRenderWorkerMessage);
     worker.addEventListener("error", (event) => {
-      disableVideoRenderWorker();
       showToast("video_worker_error", event.message || "Video worker failed");
+      setStreamWarning("Video worker failed");
     });
     const offscreenCanvas = canvas.transferControlToOffscreen();
     worker.postMessage({ type: "init", canvas: offscreenCanvas }, [offscreenCanvas]);
@@ -1845,10 +1882,17 @@ function updateVideoSurfaceSize(width, height) {
     state.remoteScreenWidth !== width
     || state.remoteScreenHeight !== height
   );
-  if (canvas.width !== width || canvas.height !== height) {
+  if (state.videoRenderWorker) {
+    if (remoteSizeChanged) {
+      try {
+        state.videoRenderWorker.postMessage({ type: "resize", width, height });
+      } catch {
+        setStreamWarning("Video worker failed");
+      }
+    }
+  } else if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
-    state.videoRenderWorker?.postMessage({ type: "resize", width, height });
   }
   if (remoteSizeChanged) {
     state.remoteScreenWidth = width;
@@ -1864,8 +1908,13 @@ function resetVideoDecoderForLiveCatchup() {
 function queueVideoFrameForRender(frame) {
   updateVideoSurfaceSize(frame.displayWidth, frame.displayHeight);
   if (state.videoRenderWorker) {
-    state.frameCount += 1;
-    state.videoRenderWorker.postMessage({ type: "frame", frame }, [frame]);
+    try {
+      state.videoRenderWorker.postMessage({ type: "frame", frame }, [frame]);
+    } catch (error) {
+      frame.close();
+      showToast("video_worker_send_failed", error?.message || String(error));
+      setStreamWarning("Video worker failed");
+    }
     return;
   }
   if (state.pendingVideoFrame) {
@@ -1918,6 +1967,7 @@ async function drawFrame(frame) {
     bitmap.close();
   }
   state.frameCount += 1;
+  state.lastVideoFrameRenderedAt = performance.now();
 }
 
 function handleFrame(buffer) {
@@ -2836,11 +2886,44 @@ async function playAudioData(audioData) {
   audioData.close();
 }
 
-function send(message) {
+function sendNow(message) {
   if (state.socket?.readyState === WebSocket.OPEN) {
     noteAutoDisconnectActivity(message);
     state.socket.send(JSON.stringify(message));
   }
+}
+
+function clearPendingPointerMotion() {
+  if (state.pointerFlushTimer) {
+    clearTimeout(state.pointerFlushTimer);
+    state.pointerFlushTimer = 0;
+  }
+  state.pendingPointerMotion = null;
+}
+
+function flushPendingPointerMotion() {
+  if (state.pointerFlushTimer) {
+    clearTimeout(state.pointerFlushTimer);
+    state.pointerFlushTimer = 0;
+  }
+  const message = state.pendingPointerMotion;
+  state.pendingPointerMotion = null;
+  if (message) {
+    sendNow(message);
+  }
+}
+
+function schedulePointerMotionFlush() {
+  if (state.pointerFlushTimer) return;
+  state.pointerFlushTimer = setTimeout(() => {
+    state.pointerFlushTimer = 0;
+    flushPendingPointerMotion();
+  }, POINTER_FLUSH_INTERVAL_MS);
+}
+
+function send(message) {
+  flushPendingPointerMotion();
+  sendNow(message);
 }
 
 function sendBinary(bytes) {
@@ -3243,22 +3326,44 @@ function sendWheelDelta(deltaX, deltaY, deltaMode = 0) {
 }
 
 function queuePointerMove(x, y) {
-  send({ type: "pointer_absolute", x, y });
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  if (state.pendingPointerMotion?.type === "pointer_move") {
+    flushPendingPointerMotion();
+  }
+  state.pendingPointerMotion = {
+    type: "pointer_absolute",
+    x: Math.round(x),
+    y: Math.round(y),
+  };
+  schedulePointerMotionFlush();
 }
 
 function queueRelativePointerMove(dx, dy) {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
   if (!dx && !dy) return;
-  send({ type: "pointer_move", dx, dy });
+  if (state.pendingPointerMotion?.type === "pointer_absolute") {
+    flushPendingPointerMotion();
+  }
+  if (state.pendingPointerMotion?.type === "pointer_move") {
+    state.pendingPointerMotion.dx += dx;
+    state.pendingPointerMotion.dy += dy;
+  } else {
+    state.pendingPointerMotion = { type: "pointer_move", dx, dy };
+  }
+  schedulePointerMotionFlush();
 }
 
 function clientPointToCanvas(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
   if (!rect.width || !rect.height) return null;
+  const surfaceWidth = videoSurfaceWidth();
+  const surfaceHeight = videoSurfaceHeight();
+  if (!Number.isFinite(surfaceWidth) || !Number.isFinite(surfaceHeight)) return null;
   const x = Math.min(Math.max(clientX - rect.left, 0), rect.width);
   const y = Math.min(Math.max(clientY - rect.top, 0), rect.height);
   return {
-    x: Math.round((x / rect.width) * canvas.width),
-    y: Math.round((y / rect.height) * canvas.height),
+    x: Math.round((x / rect.width) * surfaceWidth),
+    y: Math.round((y / rect.height) * surfaceHeight),
   };
 }
 
@@ -3275,9 +3380,12 @@ function queuePointerEvent(event) {
 function clientDeltaToRemote(dx, dy) {
   const rect = canvas.getBoundingClientRect();
   if (!rect.width || !rect.height) return null;
+  const surfaceWidth = videoSurfaceWidth();
+  const surfaceHeight = videoSurfaceHeight();
+  if (!Number.isFinite(surfaceWidth) || !Number.isFinite(surfaceHeight)) return null;
   return {
-    dx: (dx / rect.width) * canvas.width,
-    dy: (dy / rect.height) * canvas.height,
+    dx: (dx / rect.width) * surfaceWidth,
+    dy: (dy / rect.height) * surfaceHeight,
   };
 }
 
@@ -3306,6 +3414,7 @@ function resetTouchInteraction() {
   state.touchPointers.clear();
   state.touchDragPointerId = null;
   state.touchScrollLastY = null;
+  state.touchTwoFingerTap = null;
 }
 
 function getAverageTouchClientY() {
@@ -3315,6 +3424,125 @@ function getAverageTouchClientY() {
     total += touch.clientY;
   }
   return total / state.touchPointers.size;
+}
+
+function getTouchCenter() {
+  if (!state.touchPointers.size) return null;
+  let totalX = 0;
+  let totalY = 0;
+  for (const touch of state.touchPointers.values()) {
+    totalX += touch.clientX;
+    totalY += touch.clientY;
+  }
+  return {
+    x: totalX / state.touchPointers.size,
+    y: totalY / state.touchPointers.size,
+  };
+}
+
+function startTwoFingerTapCandidate() {
+  const entries = [...state.touchPointers.entries()];
+  if (entries.length !== 2) return;
+  const center = getTouchCenter();
+  if (!center) return;
+  const now = performance.now();
+  const firstStartedAt = Math.min(...entries.map(([, touch]) => touch.startAt || now));
+  state.touchTwoFingerTap = {
+    startedAt: now,
+    pointerIds: new Set(entries.map(([pointerId]) => pointerId)),
+    endedPointerIds: new Set(),
+    center,
+    cancelled: now - firstStartedAt > TWO_FINGER_TAP_MAX_MS,
+  };
+}
+
+function updateTwoFingerTapCandidate(pointerId) {
+  const candidate = state.touchTwoFingerTap;
+  if (!candidate || !candidate.pointerIds.has(pointerId)) return;
+  if (state.touchPointers.size !== 2) {
+    candidate.cancelled = true;
+    return;
+  }
+  for (const id of candidate.pointerIds) {
+    const touch = state.touchPointers.get(id);
+    if (!touch) {
+      candidate.cancelled = true;
+      return;
+    }
+    const moved = Math.hypot(touch.clientX - touch.startX, touch.clientY - touch.startY);
+    if (moved > TWO_FINGER_TAP_MOVE_PX) {
+      candidate.cancelled = true;
+      return;
+    }
+  }
+}
+
+function isVideoRecoveryNeeded() {
+  if (!isConnectionOpen()) return true;
+  const now = performance.now();
+  if (state.decoderRecovering || state.streamWarning) return true;
+  if (state.lastVideoPacketAt && now - state.lastVideoPacketAt > MEDIA_STALL_RESET_MS) return true;
+  if (state.lastVideoFrameRenderedAt && now - state.lastVideoFrameRenderedAt > MEDIA_STALL_RESET_MS) return true;
+  return false;
+}
+
+function recoverFromTouchGesture() {
+  clearReconnectTimer();
+  if (state.connecting) {
+    setStatus("Connecting...", { hideAfterMs: 1500 });
+    return;
+  }
+  if (!isConnectionOpen()) {
+    setStatus("Reconnecting...");
+    void connect();
+    return;
+  }
+  if (isVideoRecoveryNeeded()) {
+    forceReconnect("Recovery gesture: reconnecting stream");
+    return;
+  }
+  setStatus("Stream active", { hideAfterMs: 1500 });
+}
+
+function registerRecoveryTap(center) {
+  const now = performance.now();
+  const previous = state.recoveryTapCenter;
+  const sameArea = previous
+    && Math.hypot(center.x - previous.x, center.y - previous.y) <= RECOVERY_TAP_SAME_AREA_PX;
+  if (sameArea && now - state.recoveryTapLastAt <= RECOVERY_TAP_WINDOW_MS) {
+    state.recoveryTapCount += 1;
+  } else {
+    state.recoveryTapCount = 1;
+  }
+  state.recoveryTapLastAt = now;
+  state.recoveryTapCenter = center;
+  if (state.recoveryTapCount < 3) return;
+  state.recoveryTapCount = 0;
+  state.recoveryTapCenter = null;
+  recoverFromTouchGesture();
+}
+
+function consumeTwoFingerTapEnd(event) {
+  const candidate = state.touchTwoFingerTap;
+  if (!candidate || !candidate.pointerIds.has(event.pointerId)) return false;
+  const touch = state.touchPointers.get(event.pointerId);
+  if (!touch || Math.hypot(touch.clientX - touch.startX, touch.clientY - touch.startY) > TWO_FINGER_TAP_MOVE_PX) {
+    candidate.cancelled = true;
+  }
+  if (performance.now() - candidate.startedAt > TWO_FINGER_TAP_MAX_MS) {
+    candidate.cancelled = true;
+  }
+  candidate.endedPointerIds.add(event.pointerId);
+  const completed = candidate.endedPointerIds.size >= candidate.pointerIds.size;
+  const shouldRecover = completed && !candidate.cancelled;
+  const center = candidate.center;
+  if (completed) {
+    state.touchTwoFingerTap = null;
+  }
+  if (shouldRecover) {
+    registerRecoveryTap(center);
+  }
+  return true;
 }
 
 function updateTouchPointer(event) {
@@ -3381,6 +3609,7 @@ function handleTouchPointerDown(event) {
     startY: event.clientY,
     clientX: event.clientX,
     clientY: event.clientY,
+    startAt: performance.now(),
   });
   canvas.setPointerCapture(event.pointerId);
   if (state.touchPointers.size === 1) {
@@ -3390,12 +3619,16 @@ function handleTouchPointerDown(event) {
     }
     scheduleTouchLongPress(event.pointerId);
   } else if (state.touchPointers.size === 2) {
+    startTwoFingerTapCandidate();
     if (state.touchDragPointerId === null) {
       startTouchScroll();
     } else {
       clearTouchLongPress();
     }
   } else {
+    if (state.touchTwoFingerTap) {
+      state.touchTwoFingerTap.cancelled = true;
+    }
     clearTouchLongPress();
   }
   event.preventDefault();
@@ -3404,6 +3637,11 @@ function handleTouchPointerDown(event) {
 function handleTouchPointerMove(event) {
   const previous = updateTouchPointer(event);
   if (!previous) return;
+  updateTwoFingerTapCandidate(event.pointerId);
+  if (state.touchTwoFingerTap?.endedPointerIds.size) {
+    event.preventDefault();
+    return;
+  }
   const isDragging = state.touchDragPointerId === event.pointerId;
   if (state.touchPointers.size >= 2) {
     if (state.touchDragPointerId !== null) {
@@ -3461,6 +3699,7 @@ function handleTouchPointerEnd(event) {
     ? Math.hypot(touch.clientX - touch.startX, touch.clientY - touch.startY)
     : TOUCH_MOVE_CANCEL_PX;
   const isTap = wasSingleTouch && !wasDragging && movedDistance < TOUCH_MOVE_CANCEL_PX;
+  const consumedByTwoFingerTap = consumeTwoFingerTapEnd(event);
   if (state.touchLongPressPointerId === event.pointerId) {
     clearTouchLongPress();
   }
@@ -3468,7 +3707,7 @@ function handleTouchPointerEnd(event) {
   if (wasDragging) {
     send({ type: "pointer_button", button: 1, down: false });
     state.touchDragPointerId = null;
-  } else if (isTap) {
+  } else if (!consumedByTwoFingerTap && isTap) {
     send({ type: "pointer_button", button: 1, down: true });
     send({ type: "pointer_button", button: 1, down: false });
   }
@@ -3477,7 +3716,7 @@ function handleTouchPointerEnd(event) {
   } else {
     state.touchScrollLastY = null;
   }
-  if (state.touchPointers.size === 1) {
+  if (state.touchPointers.size === 1 && !consumedByTwoFingerTap) {
     resetRemainingTouchStart();
   } else if (!state.touchPointers.size) {
     clearTouchLongPress();
@@ -3895,7 +4134,7 @@ function initControls() {
     }
   });
   canvas.addEventListener("pointerdown", (event) => {
-    if (reconnectFromViewport()) {
+    if (!isTouchPointer(event) && reconnectFromViewport()) {
       event.preventDefault();
       return;
     }
@@ -3942,6 +4181,9 @@ function initControls() {
   });
   canvas.addEventListener("pointercancel", (event) => {
     if (isTouchPointer(event)) {
+      if (state.touchTwoFingerTap) {
+        state.touchTwoFingerTap.cancelled = true;
+      }
       handleTouchPointerEnd(event);
     }
   });

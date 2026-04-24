@@ -23,7 +23,7 @@ use crate::{
     settings::{AudioStreamConfig, ServerConfig, StreamConfig},
     streamer::StreamFrame,
     system_stats::StatsSampler,
-    uinput::UInputWheelInjector,
+    uinput::{UInputPointerInjector, UInputWheelInjector},
     x11_input::X11InputInjector,
 };
 
@@ -396,6 +396,13 @@ async fn handle_client(
             None
         }
     };
+    let mut pointer_motion_injector = match UInputPointerInjector::connect() {
+        Ok(injector) => Some(injector),
+        Err(err) => {
+            warn!("uinput pointer motion unavailable, falling back to X11/xdotool: {err}");
+            None
+        }
+    };
     let mut smooth_wheel_injector = match UInputWheelInjector::connect() {
         Ok(injector) => Some(injector),
         Err(err) => {
@@ -431,6 +438,7 @@ async fn handle_client(
                                 )?;
                                 apply_pointer_motion_batch(
                                     &server.display,
+                                    &mut pointer_motion_injector,
                                     input_injector.as_ref(),
                                     &motions,
                                 )
@@ -443,6 +451,7 @@ async fn handle_client(
                                 }
                                 apply_client_message(
                                     &server.display,
+                                    &mut pointer_motion_injector,
                                     input_injector.as_ref(),
                                     smooth_wheel_injector.as_mut(),
                                     &sender,
@@ -751,6 +760,7 @@ async fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
 
 async fn apply_client_message(
     display: &str,
+    pointer_motion_injector: &mut Option<UInputPointerInjector>,
     input_injector: Option<&X11InputInjector>,
     smooth_wheel_injector: Option<&mut UInputWheelInjector>,
     sender: &mpsc::Sender<Message>,
@@ -764,16 +774,8 @@ async fn apply_client_message(
         ClientMessage::PointerMove { dx, dy } => {
             let dx = dx.round() as i32;
             let dy = dy.round() as i32;
-            if let Some(input_injector) = input_injector {
-                input_injector.queue_pointer_relative(dx, dy)?;
-                input_injector.flush()?;
-            } else {
-                run_xdotool(
-                    display,
-                    ["mousemove_relative", "--", &dx.to_string(), &dy.to_string()],
-                )
+            apply_relative_pointer_motion(display, pointer_motion_injector, input_injector, dx, dy)
                 .await?;
-            }
         }
         ClientMessage::PointerAbsolute { x, y } => {
             if let Some(input_injector) = input_injector {
@@ -916,10 +918,31 @@ async fn apply_client_message(
 
 async fn apply_pointer_motion_batch(
     display: &str,
+    pointer_motion_injector: &mut Option<UInputPointerInjector>,
     input_injector: Option<&X11InputInjector>,
     motions: &[PointerMotionCommand],
 ) -> Result<()> {
     if motions.is_empty() {
+        return Ok(());
+    }
+    if pointer_motion_injector.is_some() {
+        for motion in motions {
+            match motion {
+                PointerMotionCommand::Absolute { x, y } => {
+                    apply_absolute_pointer_motion(display, input_injector, *x, *y).await?;
+                }
+                PointerMotionCommand::Relative { dx, dy } => {
+                    apply_relative_pointer_motion(
+                        display,
+                        pointer_motion_injector,
+                        input_injector,
+                        *dx,
+                        *dy,
+                    )
+                    .await?;
+                }
+            }
+        }
         return Ok(());
     }
     if let Some(input_injector) = input_injector {
@@ -961,6 +984,53 @@ async fn apply_pointer_motion_batch(
         return Ok(());
     }
     run_xdotool(display, &args).await
+}
+
+async fn apply_relative_pointer_motion(
+    display: &str,
+    pointer_motion_injector: &mut Option<UInputPointerInjector>,
+    input_injector: Option<&X11InputInjector>,
+    dx: i32,
+    dy: i32,
+) -> Result<()> {
+    if dx == 0 && dy == 0 {
+        return Ok(());
+    }
+    if let Some(injector) = pointer_motion_injector.as_mut() {
+        match injector.emit_motion(dx, dy) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                warn!("uinput pointer motion failed, falling back to X11/xdotool: {err}");
+                *pointer_motion_injector = None;
+            }
+        }
+    }
+    if let Some(input_injector) = input_injector {
+        input_injector.queue_pointer_relative(dx, dy)?;
+        input_injector.flush()?;
+    } else {
+        run_xdotool(
+            display,
+            ["mousemove_relative", "--", &dx.to_string(), &dy.to_string()],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn apply_absolute_pointer_motion(
+    display: &str,
+    input_injector: Option<&X11InputInjector>,
+    x: i32,
+    y: i32,
+) -> Result<()> {
+    if let Some(input_injector) = input_injector {
+        input_injector.queue_pointer_absolute(x, y)?;
+        input_injector.flush()?;
+    } else {
+        run_xdotool(display, ["mousemove", &x.to_string(), &y.to_string()]).await?;
+    }
+    Ok(())
 }
 
 fn key_chord_rank(key: &str) -> usize {

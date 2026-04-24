@@ -9,7 +9,7 @@ The project currently supports:
 - H.264 default streaming path.
 - H.265 best-effort streaming path.
 - VP8 streaming path.
-- Browser-side touchpad and click controls relayed through `xdotool`.
+- Browser-side touchpad motion through uinput when available, with X11/`xdotool` fallbacks for pointer and click controls.
 - Client-selectable codec, bitrate, and FPS.
 - `?debug=1` overlay with latency, FPS, codec, encoder mode, CPU usage, memory usage, and network speed.
 - A compact bottom status tab where latency shows inline `↓`/`↑` network rates and the encoder indicator shares the regular metric grid with CPU, RAM, and Swap.

@@ -54,6 +54,7 @@ async function renderLatestFrame() {
       ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
       bitmap.close();
     }
+    self.postMessage({ type: "rendered" });
   } catch (error) {
     self.postMessage({
       type: "error",

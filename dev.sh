@@ -133,12 +133,12 @@ ensure_uinput_access() {
     #   sudo setfacl -m "u:$(id -un):rw" /dev/uinput
     if [[ "$(id -u)" -ne 0 ]]; then
         if ! command -v sudo >/dev/null 2>&1; then
-            echo "[dev] uinput: sudo is unavailable; smooth wheel will fall back to xdotool"
+            echo "[dev] uinput: sudo is unavailable; pointer motion and smooth wheel will fall back"
             return 0
         fi
 
         if ! sudo -v; then
-            echo "[dev] uinput: sudo auth failed; smooth wheel will fall back to xdotool"
+            echo "[dev] uinput: sudo auth failed; pointer motion and smooth wheel will fall back"
             return 0
         fi
     fi
@@ -150,7 +150,7 @@ ensure_uinput_access() {
     fi
 
     if [[ ! -e /dev/uinput ]]; then
-        echo "[dev] uinput: /dev/uinput is unavailable; smooth wheel will fall back to xdotool"
+        echo "[dev] uinput: /dev/uinput is unavailable; pointer motion and smooth wheel will fall back"
         return 0
     fi
 
@@ -178,7 +178,7 @@ ensure_uinput_access() {
         return 0
     fi
 
-    echo "[dev] uinput: unable to grant access; smooth wheel will fall back to xdotool"
+    echo "[dev] uinput: unable to grant access; pointer motion and smooth wheel will fall back"
 }
 
 configure_sudo_audio_env() {

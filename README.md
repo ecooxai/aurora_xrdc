@@ -1,6 +1,6 @@
 # vibe_rdesk
 
-`vibe_rdesk` is a Rust-based remote desktop MVP for X11 systems. It serves a browser UI, captures the desktop with FFmpeg, streams video to the browser over WebSocket/WebCodecs, and relays pointer and keyboard input back to the X server with `xdotool`.
+`vibe_rdesk` is a Rust-based remote desktop MVP for X11 systems. It serves a browser UI, captures the desktop with FFmpeg, streams video to the browser over WebSocket/WebCodecs, and relays input back to the host with uinput, X11 injection, and `xdotool` fallbacks.
 
 ## Features
 
@@ -17,7 +17,8 @@
 
 - Rust toolchain.
 - FFmpeg installed and available on `PATH`.
-- `xdotool` installed and available on `PATH`.
+- `xdotool` installed and available on `PATH` for keyboard input and input fallback paths.
+- `/dev/uinput` access is optional, but enables low-latency relative pointer movement and smooth wheel events.
 - An X11 session on the host machine.
 - A server password passed at startup.
 - `v4l2loopback` installed on the server host if you want camera uplink.
