@@ -472,7 +472,7 @@ function currentBufferedAudioSeconds() {
 }
 
 function renderAudioBufferMetric() {
-  if (!document.getElementById("tab-panel-status")?.classList.contains("is-active")) {
+  if (!controlPanel.open || !document.getElementById("tab-panel-audio")?.classList.contains("is-active")) {
     return;
   }
   if (!state.audioEnabled) {
@@ -586,6 +586,9 @@ function setActiveTab(tabName) {
     const active = panel.id === `tab-panel-${tabName}`;
     panel.classList.toggle("is-active", active);
     panel.hidden = !active;
+  }
+  if (tabName === "audio") {
+    renderAudioBufferMetric();
   }
 }
 
@@ -4450,6 +4453,9 @@ function initControls() {
       setActiveTab(button.dataset.tabTarget || "status");
     });
   }
+  controlPanel.addEventListener("toggle", () => {
+    renderAudioBufferMetric();
+  });
   webclientsToggle.addEventListener("click", () => {
     setWebclientsManagerOpen(!state.webclientsManagerOpen);
   });

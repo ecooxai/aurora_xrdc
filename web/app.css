@@ -9,12 +9,10 @@
   --accent-2: #f5c26b;
   --danger: #ff6f6f;
   --shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
-  --dock-edge: 10vw;
-  --dock-bottom: 6px;
-  --fab-size: 56px;
+  --dock-edge: 8px;
+  --dock-bottom: 8px;
+  --fab-size: 52px;
   --dock-gap: 8px;
-  --control-card-offset-x: 18px;
-  --control-card-offset-y: -6px;
 }
 
 * { box-sizing: border-box; }
@@ -34,7 +32,7 @@ body {
   flex-direction: column;
 }
 
-.viewport-card, .control-panel {
+.viewport-card {
   background: var(--panel);
   border: 1px solid var(--panel-border);
   box-shadow: var(--shadow);
@@ -242,34 +240,34 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   flex: 0 0 auto;
 }
 .bottom-dock {
+  position: fixed;
+  left: var(--dock-edge);
+  bottom: var(--dock-bottom);
+  z-index: 20;
   display: flex;
-  justify-content: space-between;
-  align-items: flex-end;
-  gap: 12px;
-  padding: 6px 12px;
-  background: linear-gradient(180deg, rgba(5, 6, 7, 0), rgba(5, 6, 7, 0.82) 24%, rgba(5, 6, 7, 0.96));
-}
-
-.tool-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 12px;
-}
-
-.tool-row-left {
   justify-content: flex-start;
+  align-items: flex-end;
+  pointer-events: none;
 }
 
-.tool-row-right {
-  justify-content: flex-end;
+.tool-dock {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--dock-gap);
+  padding: 6px;
+  border-radius: 999px;
+  background: rgba(7, 11, 13, 0.78);
+  border: 1px solid rgba(190, 221, 234, 0.12);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+  pointer-events: auto;
 }
 
 .control-panel {
-  position: fixed;
-  right: 0;
-  bottom: var(--dock-bottom);
-  z-index: 20;
-  border-radius: 24px;
+  position: relative;
+  z-index: 1;
+  border-radius: 999px;
   overflow: visible;
 }
 
@@ -279,16 +277,16 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 
 .control-panel[open] .control-card {
   position: fixed;
-  right: 50px;
-  bottom: 0;
-  width: min(420px, calc(100vw - 24px));
-  height: 300px;
+  left: var(--dock-edge);
+  bottom: calc(var(--dock-bottom) + var(--fab-size) + 20px);
+  width: min(520px, calc(100vw - 16px));
+  max-height: min(560px, calc(100vh - 112px));
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr) auto;
   gap: 10px;
-  padding: 12px 12px 0;
-  border-radius: 24px;
+  padding: 14px 14px 12px;
+  border-radius: 18px;
   background:
     linear-gradient(180deg, rgba(18, 29, 34, 0.98), rgba(9, 14, 17, 0.98)),
     var(--panel);
@@ -300,10 +298,10 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 .tab-row {
   grid-row: 2;
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
-  margin: 0 -1px -1px;
+  margin: 0;
   border-radius: 14px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid rgba(255, 255, 255, 0.06);
@@ -360,6 +358,12 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .view-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.audio-status-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
@@ -789,17 +793,6 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   box-shadow: var(--shadow);
 }
 
-.tool-toggle-left {
-  position: fixed;
-  left: var(--dock-edge);
-  bottom: var(--dock-bottom);
-  z-index: 20;
-}
-
-#camera-toggle {
-  left: calc(var(--dock-edge) + var(--fab-size) + var(--dock-gap));
-}
-
 .tool-toggle.is-active {
   background: rgba(18, 31, 35, 0.96);
   border-color: rgba(141, 230, 255, 0.32);
@@ -840,11 +833,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .mobile-keyboard-trigger {
-  position: fixed;
-  right: var(--dock-edge);
-  bottom: var(--dock-bottom);
-  z-index: 20;
-  display: none;
+  display: grid;
 }
 
 .mobile-keyboard-trigger.is-active {
@@ -879,45 +868,39 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 .hidden { display: none; }
 
 @media (max-width: 900px) {
-  .bottom-dock {
-    justify-content: space-between;
-  }
-
-  .tool-row-right {
-    justify-content: flex-end;
-  }
-}
-
-@media (hover: none), (pointer: coarse) {
-  .mobile-keyboard-trigger {
-    display: grid;
-  }
-
-  .control-panel {
-    right: calc(var(--fab-size) + var(--dock-gap));
-  }
-
-  #camera-toggle {
-    left: calc(var(--dock-edge) + var(--fab-size) + var(--dock-gap));
+  .control-panel[open] .control-card {
+    width: min(480px, calc(100vw - 16px));
   }
 }
 
 @media (max-width: 640px) {
   :root {
-    --dock-edge: 10px;
+    --dock-edge: 6px;
     --dock-bottom: 4px;
-    --control-card-offset-x: 12px;
-    --control-card-offset-y: -6px;
+    --fab-size: 48px;
+    --dock-gap: 6px;
   }
 
-  .bottom-dock {
-    padding: 6px 10px;
+  .tool-dock {
+    max-width: calc(100vw - 12px);
+    gap: 6px;
+    padding: 5px;
   }
 
   .control-panel[open] .control-card {
-    width: min(380px, calc(100vw - 20px));
-    right: 50px;
-    bottom: 0;
+    left: 6px;
+    bottom: calc(var(--dock-bottom) + var(--fab-size) + 16px);
+    width: calc(100vw - 12px);
+    max-height: calc(100vh - 96px);
+    border-radius: 16px;
+  }
+
+  .tab-row {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .tab-button {
+    min-height: 32px;
   }
 
   .button-row {
@@ -933,6 +916,10 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   }
 
   .status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .audio-status-grid {
     grid-template-columns: 1fr;
   }
 
