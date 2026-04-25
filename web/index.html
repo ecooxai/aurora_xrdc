@@ -93,6 +93,19 @@
                     <span class="metric-label">Audio Buffer</span>
                     <strong id="status-audio-buffer" class="metric-value">--</strong>
                   </article>
+                  <article class="metric-card metric-card-wide webclients-card">
+                    <button id="webclients-toggle" class="webclients-toggle secondary" type="button" aria-expanded="false">
+                      <span>
+                        <span class="metric-label">Webclients</span>
+                        <strong id="webclients-count" class="metric-value">--</strong>
+                      </span>
+                      <span class="metric-meta">Manage</span>
+                    </button>
+                    <div id="webclients-manager" class="webclients-manager hidden">
+                      <button id="webclients-close-others" class="secondary" type="button">Close Other Clients</button>
+                      <div id="webclients-list" class="webclients-list"></div>
+                    </div>
+                  </article>
                 </div>
               </section>
               <section id="tab-panel-view" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-view" hidden>

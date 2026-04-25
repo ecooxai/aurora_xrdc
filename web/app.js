@@ -216,6 +216,8 @@ const state = {
   statusTimer: null,
   autoDisconnectTimer: null,
   lastAutoDisconnectActivityAt: 0,
+  webclientsManagerOpen: false,
+  webclients: [],
 };
 
 const status = $("status");
@@ -284,6 +286,11 @@ const statusSpeedDownload = $("status-speed-download");
 const statusSpeedUpload = $("status-speed-upload");
 const statusAudioBuffer = $("status-audio-buffer");
 const statusUpdatedAt = $("status-updated-at");
+const webclientsToggle = $("webclients-toggle");
+const webclientsCount = $("webclients-count");
+const webclientsManager = $("webclients-manager");
+const webclientsList = $("webclients-list");
+const webclientsCloseOthers = $("webclients-close-others");
 const localClipboardSyncBtn = $("local-clipboard-sync-btn");
 const remoteClipboardSyncBtn = $("remote-clipboard-sync-btn");
 const clipboardHistoryList = $("clipboard-history-list");
@@ -1564,6 +1571,9 @@ function isAuthFailureMessage(message) {
 }
 
 function appendStreamQuery(url, settings) {
+  if (state.sessionId) {
+    url.searchParams.set("client_id", state.sessionId);
+  }
   url.searchParams.set("codec", settings.codec);
   url.searchParams.set("encode_preference", settings.encodePreference);
   url.searchParams.set("bitrate_kbps", settings.bitrate);
@@ -1637,12 +1647,121 @@ function openRoleSocket(role, settings, onMessage) {
 
 function handleRoleSocketClose(role, event) {
   if (state.manualDisconnect) return;
+  if (event.code === 4000) {
+    showToast("client_closed", "This webclient was closed from another browser");
+    closeConnection({ manual: true });
+    void refreshWebClients();
+    return;
+  }
   setStatus("Disconnected");
   if (event.code && event.code !== 1000 && !state.reconnectTimer) {
     showToast("ws_closed", `${role} WebSocket closed (${event.code})`);
   }
   closeConnection({ manual: false, preserveStatus: true });
   scheduleReconnect();
+}
+
+function appendAuthQuery(url) {
+  if (state.sessionId) {
+    url.searchParams.set("client_id", state.sessionId);
+  }
+  if (state.sessionPasswd) {
+    url.searchParams.set("passwd", state.sessionPasswd);
+  }
+  return url;
+}
+
+async function refreshWebClients() {
+  if (!state.authenticated && !state.sessionPasswd) {
+    renderWebClients([]);
+    return;
+  }
+  try {
+    const url = appendAuthQuery(apiUrl("/api/webclients"));
+    const response = await fetch(url, { cache: "no-store", credentials: "include" });
+    if (!response.ok) throw new Error(await response.text());
+    const data = await response.json();
+    renderWebClients(Array.isArray(data.clients) ? data.clients : []);
+  } catch (error) {
+    webclientsCount.textContent = "--";
+    if (state.webclientsManagerOpen) {
+      webclientsList.textContent = error.message || String(error);
+    }
+  }
+}
+
+function renderWebClients(clients) {
+  state.webclients = clients;
+  webclientsCount.textContent = `${clients.length}`;
+  webclientsList.textContent = "";
+  if (!clients.length) {
+    const empty = document.createElement("div");
+    empty.className = "metric-meta";
+    empty.textContent = "No connected webclients";
+    webclientsList.append(empty);
+    return;
+  }
+  for (const client of clients) {
+    const row = document.createElement("div");
+    row.className = "webclient-row";
+    const main = document.createElement("div");
+    main.className = "webclient-main";
+    const ip = document.createElement("div");
+    ip.className = "webclient-ip";
+    ip.textContent = client.id === state.sessionId ? `${client.ip} (this client)` : client.ip;
+    const meta = document.createElement("div");
+    meta.className = "webclient-meta";
+    meta.textContent = Array.isArray(client.roles) && client.roles.length
+      ? client.roles.join(", ")
+      : "connected";
+    main.append(ip, meta);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "danger";
+    close.textContent = "Close";
+    close.disabled = client.id === state.sessionId;
+    close.addEventListener("click", () => {
+      void closeWebClient(client.id);
+    });
+    row.append(main, close);
+    webclientsList.append(row);
+  }
+}
+
+function setWebclientsManagerOpen(open) {
+  state.webclientsManagerOpen = open;
+  webclientsManager.classList.toggle("hidden", !open);
+  webclientsToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) void refreshWebClients();
+}
+
+async function closeWebClient(clientId) {
+  if (!clientId || clientId === state.sessionId) return;
+  try {
+    const url = appendAuthQuery(apiUrl(`/api/webclients/${encodeURIComponent(clientId)}/close`));
+    const response = await fetch(url, { method: "POST", credentials: "include" });
+    if (!response.ok) throw new Error(await response.text());
+    await refreshWebClients();
+  } catch (error) {
+    showToast("webclient_close_failed", error.message || String(error));
+  }
+}
+
+async function closeOtherWebClients() {
+  if (!state.sessionId) return;
+  try {
+    const url = appendAuthQuery(apiUrl("/api/webclients/close-others"));
+    const response = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ client_id: state.sessionId }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    await refreshWebClients();
+  } catch (error) {
+    showToast("webclient_close_failed", error.message || String(error));
+  }
 }
 
 function handleControlSocketMessage(event) {
@@ -1755,6 +1874,7 @@ async function connect() {
       void startMicrophoneCapture();
     }
     maybeScheduleSettingsReconnect();
+    void refreshWebClients();
   } catch (error) {
     const message = error.message || String(error);
     closeConnection({ manual: false, preserveStatus: true });
@@ -4330,6 +4450,12 @@ function initControls() {
       setActiveTab(button.dataset.tabTarget || "status");
     });
   }
+  webclientsToggle.addEventListener("click", () => {
+    setWebclientsManagerOpen(!state.webclientsManagerOpen);
+  });
+  webclientsCloseOthers.addEventListener("click", () => {
+    void closeOtherWebClients();
+  });
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
   micToggle.addEventListener("click", toggleMicrophone);
@@ -4550,6 +4676,7 @@ renderMicToggle();
 renderCameraToggle();
 setInterval(renderAudioBufferMetric, 1000);
 setInterval(monitorConnectionHealth, HEALTH_WATCHDOG_INTERVAL_MS);
+setInterval(refreshWebClients, 3000);
 state.apiOrigin = loadStoredApiOrigin();
 authOriginInput.value = state.apiOrigin;
 state.sessionPasswd = loadStoredPasswd();

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use axum::{
     Json, Router,
-    extract::{Multipart, Query, State, ws::WebSocketUpgrade},
+    extract::{ConnectInfo, Multipart, Path as AxumPath, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     camera::CameraRelay,
+    client_manager::{ClientManager, WebClientInfo},
     clipboard::{
         ClipboardHistoryEntry, ClipboardPayload, ensure_upload_dir, read_clipboard_history,
         read_remote_clipboard, write_clipboard_history, write_remote_clipboard,
@@ -48,6 +49,7 @@ struct AppState {
     auth: Arc<AuthTracker>,
     camera: CameraRelay,
     media: MediaHub,
+    clients: Arc<ClientManager>,
 }
 
 #[derive(Debug)]
@@ -241,6 +243,7 @@ struct CodecsQuery {
 
 #[derive(Debug, Deserialize)]
 struct WsQuery {
+    client_id: Option<String>,
     role: Option<SessionRole>,
     codec: Option<CodecKind>,
     bitrate_kbps: Option<u32>,
@@ -252,6 +255,29 @@ struct WsQuery {
     buffer_ms: Option<u32>,
     scale: Option<VideoScale>,
     passwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebClientsQuery {
+    client_id: Option<String>,
+    passwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloseOthersRequest {
+    client_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WebClientsResponse {
+    current_client_id: Option<String>,
+    count: usize,
+    clients: Vec<WebClientInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloseClientsResponse {
+    closed: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,6 +297,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         auth: Arc::new(AuthTracker::new()),
         camera,
         media: media.clone(),
+        clients: Arc::new(ClientManager::default()),
     });
     let app = Router::new()
         .route("/", get(index))
@@ -281,6 +308,9 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/api/auth", get(auth_check).post(auth_login))
         .route("/api/codecs", get(codecs))
         .route("/api/encoders", get(encoders))
+        .route("/api/webclients", get(webclients))
+        .route("/api/webclients/close-others", post(close_other_webclients))
+        .route("/api/webclients/{client_id}/close", post(close_webclient))
         .route("/ws", get(ws))
         .route("/api/upload", post(upload))
         .route("/api/camera/chunk", post(upload_camera_chunk))
@@ -315,7 +345,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         let app = app.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         async move {
-            axum::serve(listener, app)
+            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.changed().await;
                 })
@@ -485,6 +515,7 @@ async fn codecs(
 async fn ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
     Query(query): Query<WsQuery>,
 ) -> Response {
@@ -525,20 +556,89 @@ async fn ws(
         bitrate_kbps: query.audio_bitrate_kbps.unwrap_or(128),
     }
     .normalized();
+    let role = query.role.unwrap_or_default();
+    let client_id = query
+        .client_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let lease = state.clients.register(client_id, peer_addr, role).await;
+    let close_rx = lease.close_rx.clone();
     ws.on_upgrade(move |socket| async move {
+        let _lease = lease;
         if let Err(err) = session::handle_socket(
             socket,
             state.server.clone(),
             state.media.clone(),
             config,
             audio_config,
-            query.role.unwrap_or_default(),
+            role,
+            close_rx,
         )
         .await
         {
             warn!(error = %err, "websocket session ended with an error");
         }
     })
+}
+
+async fn webclients(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WebClientsQuery>,
+) -> Result<Json<WebClientsResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
+    state
+        .auth
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
+        .await?;
+    let clients = state.clients.list().await;
+    Ok(Json(WebClientsResponse {
+        current_client_id: query.client_id,
+        count: clients.len(),
+        clients,
+    }))
+}
+
+async fn close_webclient(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    AxumPath(client_id): AxumPath<String>,
+    Query(query): Query<WebClientsQuery>,
+) -> Result<Json<CloseClientsResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
+    state
+        .auth
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
+        .await?;
+    let closed = usize::from(state.clients.close_client(&client_id).await);
+    Ok(Json(CloseClientsResponse { closed }))
+}
+
+async fn close_other_webclients(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WebClientsQuery>,
+    Json(body): Json<CloseOthersRequest>,
+) -> Result<Json<CloseClientsResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
+    state
+        .auth
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
+        .await?;
+    let closed = state.clients.close_other_clients(&body.client_id).await;
+    Ok(Json(CloseClientsResponse { closed }))
 }
 
 #[derive(Debug, Serialize)]

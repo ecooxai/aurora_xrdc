@@ -163,7 +163,7 @@ impl VideoHub {
             runtime.configured = true;
         }
         runtime.subscribers += 1;
-        if let Err(err) = self.ensure_active(&mut runtime, true).await {
+        if let Err(err) = self.ensure_active(&mut runtime).await {
             runtime.subscribers = runtime.subscribers.saturating_sub(1);
             return Err(err);
         }
@@ -180,21 +180,17 @@ impl VideoHub {
         let mut runtime = self.runtime.lock().await;
         runtime.desired_config = config;
         runtime.configured = true;
-        self.ensure_active(&mut runtime, false).await
+        self.ensure_active(&mut runtime).await
     }
 
-    async fn ensure_active(
-        &self,
-        runtime: &mut VideoRuntime,
-        restart_on_acquire: bool,
-    ) -> Result<()> {
+    async fn ensure_active(&self, runtime: &mut VideoRuntime) -> Result<()> {
         let desired = runtime.desired_config.clone();
         let mut active_exited = false;
         if let Some(active) = runtime.active.as_ref() {
             let active_config = active.state.config.clone();
             let child = Arc::clone(&active.child);
             if video_child_running(child, &active_config).await {
-                if active_config == desired && !restart_on_acquire {
+                if active_config == desired {
                     return Ok(());
                 }
             } else {
@@ -204,19 +200,11 @@ impl VideoHub {
         }
 
         if let Some(active) = runtime.active.take() {
-            if restart_on_acquire {
-                info!(
-                    old = ?active.state.config,
-                    new = ?desired,
-                    "restarting shared video capture for webclient connect"
-                );
-            } else {
-                info!(
-                    old = ?active.state.config,
-                    new = ?desired,
-                    "restarting shared video capture"
-                );
-            }
+            info!(
+                old = ?active.state.config,
+                new = ?desired,
+                "restarting shared video capture"
+            );
             self.state.send_replace(None);
             self.frames.send_replace(None);
             if active_exited {
@@ -372,7 +360,7 @@ impl AudioHub {
             runtime.configured = true;
         }
         runtime.subscribers += 1;
-        if let Err(err) = self.ensure_active(&mut runtime, true).await {
+        if let Err(err) = self.ensure_active(&mut runtime).await {
             runtime.subscribers = runtime.subscribers.saturating_sub(1);
             return Err(err);
         }
@@ -389,21 +377,17 @@ impl AudioHub {
         let mut runtime = self.runtime.lock().await;
         runtime.desired_config = config;
         runtime.configured = true;
-        self.ensure_active(&mut runtime, false).await
+        self.ensure_active(&mut runtime).await
     }
 
-    async fn ensure_active(
-        &self,
-        runtime: &mut AudioRuntime,
-        restart_on_acquire: bool,
-    ) -> Result<()> {
+    async fn ensure_active(&self, runtime: &mut AudioRuntime) -> Result<()> {
         let desired = runtime.desired_config.clone();
         let mut active_exited = false;
         if let Some(active) = runtime.active.as_ref() {
             let active_config = active.state.config.clone();
             let child = Arc::clone(&active.child);
             if audio_child_running(child, &active_config).await {
-                if active_config == desired && !restart_on_acquire {
+                if active_config == desired {
                     return Ok(());
                 }
             } else {
@@ -413,19 +397,11 @@ impl AudioHub {
         }
 
         if let Some(active) = runtime.active.take() {
-            if restart_on_acquire {
-                info!(
-                    old = ?active.state.config,
-                    new = ?desired,
-                    "restarting shared audio capture for webclient connect"
-                );
-            } else {
-                info!(
-                    old = ?active.state.config,
-                    new = ?desired,
-                    "restarting shared audio capture"
-                );
-            }
+            info!(
+                old = ?active.state.config,
+                new = ?desired,
+                "restarting shared audio capture"
+            );
             self.state.send_replace(None);
             if active_exited {
                 drain_audio_child(Arc::clone(&active.child), &active.state.config).await;

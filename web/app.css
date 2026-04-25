@@ -156,6 +156,7 @@ button {
 }
 button:hover, button:active { transform: translateY(-1px) scale(1.01); filter: brightness(1.02); }
 button.secondary { background: rgba(255,255,255,0.08); color: var(--text); border: 1px solid rgba(255,255,255,0.08); }
+button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border: 1px solid rgba(255,111,111,0.26); }
 
 .button-row {
   display: flex;
@@ -420,6 +421,68 @@ button.secondary { background: rgba(255,255,255,0.08); color: var(--text); borde
 .metric-meta {
   color: var(--muted);
   font-size: 0.7rem;
+}
+
+.webclients-card {
+  gap: 8px;
+}
+
+.webclients-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  border-radius: 10px;
+  text-align: left;
+}
+
+.webclients-toggle > span:first-child {
+  display: grid;
+  gap: 5px;
+}
+
+.webclients-manager {
+  display: grid;
+  gap: 8px;
+}
+
+.webclients-list {
+  display: grid;
+  gap: 6px;
+}
+
+.webclient-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.webclient-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.webclient-ip {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.86rem;
+}
+
+.webclient-meta {
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.webclient-row button {
+  padding: 7px 9px;
 }
 
 .zoom-controls {

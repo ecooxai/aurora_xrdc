@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use axum::extract::ws::{Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use serde::Deserialize;
@@ -29,7 +29,7 @@ use crate::{
     x11_input::{X11InputInjector, screen_size},
 };
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRole {
     #[default]
@@ -83,15 +83,16 @@ pub async fn handle_socket(
     config: StreamConfig,
     audio_config: AudioStreamConfig,
     role: SessionRole,
+    close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     match role {
         SessionRole::All => {
-            handle_combined_socket(socket, server, media, config, audio_config).await
+            handle_combined_socket(socket, server, media, config, audio_config, close_rx).await
         }
-        SessionRole::Control => handle_control_socket(socket, server, media).await,
-        SessionRole::Video => handle_video_socket(socket, server, media, config).await,
-        SessionRole::Audio => handle_audio_socket(socket, media, audio_config).await,
-        SessionRole::Mic => handle_mic_socket(socket, server).await,
+        SessionRole::Control => handle_control_socket(socket, server, media, close_rx).await,
+        SessionRole::Video => handle_video_socket(socket, server, media, config, close_rx).await,
+        SessionRole::Audio => handle_audio_socket(socket, media, audio_config, close_rx).await,
+        SessionRole::Mic => handle_mic_socket(socket, server, close_rx).await,
     }
 }
 
@@ -101,6 +102,7 @@ async fn handle_combined_socket(
     media: MediaHub,
     config: StreamConfig,
     audio_config: AudioStreamConfig,
+    mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
     maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
@@ -185,6 +187,9 @@ async fn handle_combined_socket(
                 warn!("websocket sender task failed: {err}");
             }
         }
+        _ = wait_for_client_close(&mut close_rx) => {
+            send_server_close(&out_tx).await;
+        }
     }
 
     let _ = shutdown_tx.send(true);
@@ -221,6 +226,7 @@ async fn handle_control_socket(
     socket: WebSocket,
     server: ServerConfig,
     media: MediaHub,
+    mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
     maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
@@ -235,7 +241,13 @@ async fn handle_control_socket(
         media.video_state_rx(),
         media.audio_state_rx(),
     ));
-    let mut recv_task = tokio::spawn(handle_client(receiver, out_tx, server, media, shutdown_rx));
+    let mut recv_task = tokio::spawn(handle_client(
+        receiver,
+        out_tx.clone(),
+        server,
+        media,
+        shutdown_rx,
+    ));
     let mut writer_task = writer_task;
     let mut state_task = state_task;
 
@@ -254,6 +266,9 @@ async fn handle_control_socket(
             if let Err(err) = result {
                 warn!("control websocket state task failed: {err}");
             }
+        }
+        _ = wait_for_client_close(&mut close_rx) => {
+            send_server_close(&out_tx).await;
         }
     }
 
@@ -276,6 +291,7 @@ async fn handle_video_socket(
     server: ServerConfig,
     media: MediaHub,
     config: StreamConfig,
+    close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let video_stream = media.acquire_video(config).await?;
     let initial_video = current_video_state(&video_stream.state_rx)?;
@@ -298,14 +314,14 @@ async fn handle_video_socket(
     .await?;
     let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
     let send_task = tokio::spawn(forward_frames(
-        out_tx,
+        out_tx.clone(),
         video_tx,
         video_stream.rx.clone(),
         video_stream.state_rx.clone(),
         Some(audio_state_rx),
     ));
     let close_task = tokio::spawn(wait_for_socket_close(receiver));
-    wait_for_role_tasks("video", writer_task, send_task, close_task).await;
+    wait_for_role_tasks("video", writer_task, send_task, close_task, out_tx, close_rx).await;
     Ok(())
 }
 
@@ -313,6 +329,7 @@ async fn handle_audio_socket(
     socket: WebSocket,
     media: MediaHub,
     audio_config: AudioStreamConfig,
+    close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let (ws_sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
@@ -333,7 +350,7 @@ async fn handle_audio_socket(
                     .into(),
                 ))
                 .await;
-            wait_for_audio_error_socket(writer_task, close_task).await;
+            wait_for_audio_error_socket(writer_task, close_task, out_tx, close_rx).await;
             return Ok(());
         }
     };
@@ -345,17 +362,42 @@ async fn handle_audio_socket(
     let audio_task = audio_stream
         .take_audio_rx()
         .map(|rx| tokio::spawn(forward_audio(audio_tx, rx)));
-    wait_for_audio_tasks(writer_task, audio_task, close_task).await;
+    wait_for_audio_tasks(writer_task, audio_task, close_task, out_tx, close_rx).await;
     Ok(())
 }
 
-async fn handle_mic_socket(socket: WebSocket, server: ServerConfig) -> Result<()> {
+async fn handle_mic_socket(
+    socket: WebSocket,
+    server: ServerConfig,
+    close_rx: watch::Receiver<bool>,
+) -> Result<()> {
     let (ws_sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(8);
     let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
-    let recv_task = tokio::spawn(handle_mic_client(receiver, out_tx, server));
-    wait_for_mic_tasks(writer_task, recv_task).await;
+    let recv_task = tokio::spawn(handle_mic_client(receiver, out_tx.clone(), server));
+    wait_for_mic_tasks(writer_task, recv_task, out_tx, close_rx).await;
     Ok(())
+}
+
+async fn wait_for_client_close(close_rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *close_rx.borrow() {
+            break;
+        }
+        if close_rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn send_server_close(sender: &mpsc::Sender<Message>) {
+    let _ = sender
+        .send(Message::Close(Some(CloseFrame {
+            code: 4000,
+            reason: "closed_by_server".into(),
+        })))
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 async fn write_control_socket(
@@ -363,10 +405,14 @@ async fn write_control_socket(
     mut control_rx: mpsc::Receiver<Message>,
 ) {
     while let Some(message) = control_rx.recv().await {
+        let should_close = matches!(message, Message::Close(_));
         if futures_util::SinkExt::send(&mut ws_sender, message)
             .await
             .is_err()
         {
+            break;
+        }
+        if should_close {
             break;
         }
     }
@@ -464,6 +510,8 @@ async fn wait_for_role_tasks(
     mut writer_task: tokio::task::JoinHandle<()>,
     mut send_task: tokio::task::JoinHandle<Result<()>>,
     mut close_task: tokio::task::JoinHandle<Result<()>>,
+    sender: mpsc::Sender<Message>,
+    mut close_rx: watch::Receiver<bool>,
 ) {
     tokio::select! {
         result = &mut writer_task => {
@@ -485,6 +533,9 @@ async fn wait_for_role_tasks(
                 Ok(Ok(())) => {}
             }
         }
+        _ = wait_for_client_close(&mut close_rx) => {
+            send_server_close(&sender).await;
+        }
     }
     if !writer_task.is_finished() {
         writer_task.abort();
@@ -500,6 +551,8 @@ async fn wait_for_role_tasks(
 async fn wait_for_audio_error_socket(
     mut writer_task: tokio::task::JoinHandle<()>,
     mut close_task: tokio::task::JoinHandle<Result<()>>,
+    sender: mpsc::Sender<Message>,
+    mut close_rx: watch::Receiver<bool>,
 ) {
     tokio::select! {
         result = &mut writer_task => {
@@ -514,6 +567,9 @@ async fn wait_for_audio_error_socket(
                 Ok(Ok(())) => {}
             }
         }
+        _ = wait_for_client_close(&mut close_rx) => {
+            send_server_close(&sender).await;
+        }
     }
     if !writer_task.is_finished() {
         writer_task.abort();
@@ -527,6 +583,8 @@ async fn wait_for_audio_tasks(
     mut writer_task: tokio::task::JoinHandle<()>,
     mut audio_task: Option<tokio::task::JoinHandle<Result<()>>>,
     mut close_task: tokio::task::JoinHandle<Result<()>>,
+    sender: mpsc::Sender<Message>,
+    mut close_rx: watch::Receiver<bool>,
 ) {
     match audio_task.as_mut() {
         Some(audio_task) => {
@@ -550,10 +608,13 @@ async fn wait_for_audio_tasks(
                         Ok(Ok(())) => {}
                     }
                 }
+                _ = wait_for_client_close(&mut close_rx) => {
+                    send_server_close(&sender).await;
+                }
             }
         }
         None => {
-            wait_for_audio_error_socket(writer_task, close_task).await;
+            wait_for_audio_error_socket(writer_task, close_task, sender, close_rx).await;
             return;
         }
     }
@@ -573,6 +634,8 @@ async fn wait_for_audio_tasks(
 async fn wait_for_mic_tasks(
     mut writer_task: tokio::task::JoinHandle<()>,
     mut recv_task: tokio::task::JoinHandle<Result<()>>,
+    sender: mpsc::Sender<Message>,
+    mut close_rx: watch::Receiver<bool>,
 ) {
     tokio::select! {
         result = &mut writer_task => {
@@ -586,6 +649,9 @@ async fn wait_for_mic_tasks(
                 Err(err) => warn!("mic websocket receiver task failed: {err}"),
                 Ok(Ok(())) => {}
             }
+        }
+        _ = wait_for_client_close(&mut close_rx) => {
+            send_server_close(&sender).await;
         }
     }
     if !writer_task.is_finished() {
@@ -677,10 +743,14 @@ async fn write_socket(
     loop {
         match control_rx.try_recv() {
             Ok(message) => {
+                let should_close = matches!(message, Message::Close(_));
                 if futures_util::SinkExt::send(&mut ws_sender, message)
                     .await
                     .is_err()
                 {
+                    break;
+                }
+                if should_close {
                     break;
                 }
                 continue;
@@ -719,7 +789,11 @@ async fn write_socket(
             maybe = control_rx.recv(), if !control_closed => {
                 match maybe {
                     Some(message) => {
+                        let should_close = matches!(message, Message::Close(_));
                         if futures_util::SinkExt::send(&mut ws_sender, message).await.is_err() {
+                            break;
+                        }
+                        if should_close {
                             break;
                         }
                     }

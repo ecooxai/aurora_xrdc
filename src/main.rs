@@ -3,6 +3,7 @@ mod app;
 mod audio;
 mod audio_streamer;
 mod camera;
+mod client_manager;
 mod clipboard;
 mod ffmpeg;
 mod media;
