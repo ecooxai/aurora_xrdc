@@ -7,6 +7,7 @@ pub struct EncodedFrame {
     pub data: Vec<u8>,
     pub keyframe: bool,
     pub description_b64: Option<String>,
+    pub sequence: u32,
 }
 
 pub struct AnnexBParser {
@@ -59,6 +60,7 @@ impl AnnexBParser {
                     keyframe: contains_keyframe(self.codec, &slice),
                     description_b64: self.description_b64(),
                     data: sample_data(self.codec, &slice),
+                    sequence: 0,
                 });
             }
         }
@@ -98,13 +100,15 @@ impl AnnexBParser {
 }
 
 pub struct IvfParser {
+    codec: CodecKind,
     header_seen: bool,
     buffer: Vec<u8>,
 }
 
 impl IvfParser {
-    pub fn new() -> Self {
+    pub fn new(codec: CodecKind) -> Self {
         Self {
+            codec,
             header_seen: false,
             buffer: Vec::new(),
         }
@@ -130,14 +134,79 @@ impl IvfParser {
             }
             let data = self.buffer[12..12 + len].to_vec();
             frames.push(EncodedFrame {
-                keyframe: data.first().map(|byte| byte & 0x01 == 0).unwrap_or(false),
+                keyframe: ivf_keyframe(self.codec, &data),
                 description_b64: None,
                 data,
+                sequence: 0,
             });
             self.buffer.drain(..12 + len);
         }
         frames
     }
+}
+
+fn ivf_keyframe(codec: CodecKind, data: &[u8]) -> bool {
+    match codec {
+        CodecKind::Vp8 => data.first().map(|byte| byte & 0x01 == 0).unwrap_or(false),
+        CodecKind::Vp9 => data.first().map(|byte| byte & 0x04 == 0).unwrap_or(false),
+        CodecKind::Av1 => av1_temporal_unit_is_keyframe(data),
+        CodecKind::H264 | CodecKind::H265 => false,
+    }
+}
+
+fn av1_temporal_unit_is_keyframe(data: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset < data.len() {
+        let header = data[offset];
+        offset += 1;
+        let obu_type = (header >> 3) & 0x0f;
+        let has_extension = header & 0x04 != 0;
+        let has_size = header & 0x02 != 0;
+        if has_extension {
+            if offset >= data.len() {
+                return false;
+            }
+            offset += 1;
+        }
+        let payload_len = if has_size {
+            let Some((value, bytes_read)) = read_leb128(&data[offset..]) else {
+                return false;
+            };
+            offset += bytes_read;
+            value
+        } else {
+            data.len().saturating_sub(offset)
+        };
+        let end = offset.saturating_add(payload_len);
+        if end > data.len() {
+            return false;
+        }
+        if matches!(obu_type, 3 | 6) && av1_frame_header_is_keyframe(&data[offset..end]) {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
+fn av1_frame_header_is_keyframe(payload: &[u8]) -> bool {
+    let Some(&first) = payload.first() else {
+        return false;
+    };
+    let show_existing_frame = first & 0x01 != 0;
+    let frame_type = (first >> 1) & 0x03;
+    !show_existing_frame && frame_type == 0
+}
+
+fn read_leb128(data: &[u8]) -> Option<(usize, usize)> {
+    let mut value = 0usize;
+    for (idx, byte) in data.iter().copied().take(8).enumerate() {
+        value |= ((byte & 0x7f) as usize) << (idx * 7);
+        if byte & 0x80 == 0 {
+            return Some((value, idx + 1));
+        }
+    }
+    None
 }
 
 fn start_codes(data: &[u8]) -> Vec<usize> {
@@ -260,7 +329,7 @@ mod tests {
 
     #[test]
     fn parses_ivf_frames() {
-        let mut parser = IvfParser::new();
+        let mut parser = IvfParser::new(CodecKind::Vp8);
         let mut data = b"DKIF".to_vec();
         data.resize(32, 0);
         data.extend_from_slice(&4u32.to_le_bytes());
@@ -269,6 +338,34 @@ mod tests {
         let frames = parser.push(&data);
         assert_eq!(frames.len(), 1);
         assert!(frames[0].keyframe);
+    }
+
+    #[test]
+    fn parses_av1_ivf_keyframes_from_frame_obus() {
+        let mut parser = IvfParser::new(CodecKind::Av1);
+        let mut data = b"DKIF".to_vec();
+        data.resize(32, 0);
+        let frame = [0x32, 0x01, 0x00];
+        data.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&frame);
+        let frames = parser.push(&data);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].keyframe);
+    }
+
+    #[test]
+    fn parses_av1_ivf_delta_frames_from_frame_obus() {
+        let mut parser = IvfParser::new(CodecKind::Av1);
+        let mut data = b"DKIF".to_vec();
+        data.resize(32, 0);
+        let frame = [0x32, 0x01, 0x02];
+        data.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&frame);
+        let frames = parser.push(&data);
+        assert_eq!(frames.len(), 1);
+        assert!(!frames[0].keyframe);
     }
 
     #[test]

@@ -33,8 +33,8 @@ use crate::{
     media::MediaHub,
     session::{self, SessionRole},
     settings::{
-        AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, ServerConfig,
-        StreamConfig, VideoPerformanceConfig, VideoScale,
+        AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, EncoderQualityMode,
+        ServerConfig, StreamConfig, VideoPerformanceConfig, VideoScale,
     },
 };
 
@@ -251,6 +251,7 @@ struct WsQuery {
     fps: Option<u32>,
     encode_preference: Option<EncodePreference>,
     encoder_latency: Option<EncoderLatencyMode>,
+    encoder_quality: Option<EncoderQualityMode>,
     gop_ms: Option<u32>,
     buffer_ms: Option<u32>,
     scale: Option<VideoScale>,
@@ -540,6 +541,7 @@ async fn ws(
         encode_preference: query.encode_preference.unwrap_or_default(),
         performance: VideoPerformanceConfig {
             encoder_latency: query.encoder_latency.unwrap_or_default(),
+            encoder_quality: query.encoder_quality.unwrap_or_default(),
             gop_ms: query
                 .gop_ms
                 .unwrap_or_else(|| VideoPerformanceConfig::default().gop_ms),

@@ -23,6 +23,15 @@ pub enum EncoderLatencyMode {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum EncoderQualityMode {
+    Fast,
+    #[default]
+    Balanced,
+    SharpText,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum VideoScale {
     #[default]
     Native,
@@ -49,6 +58,8 @@ impl VideoScale {
 pub struct VideoPerformanceConfig {
     #[serde(default)]
     pub encoder_latency: EncoderLatencyMode,
+    #[serde(default)]
+    pub encoder_quality: EncoderQualityMode,
     pub gop_ms: u32,
     pub buffer_ms: u32,
     #[serde(default)]
@@ -59,6 +70,7 @@ impl Default for VideoPerformanceConfig {
     fn default() -> Self {
         Self {
             encoder_latency: EncoderLatencyMode::Low,
+            encoder_quality: EncoderQualityMode::Balanced,
             gop_ms: 4_000,
             buffer_ms: 2_000,
             scale: VideoScale::P720,
@@ -234,7 +246,7 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             codec: CodecKind::H264,
-            bitrate_kbps: 1_024,
+            bitrate_kbps: 3_000,
             fps: 30,
             encode_preference: EncodePreference::Cpu,
             performance: VideoPerformanceConfig::default(),

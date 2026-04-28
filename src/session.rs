@@ -43,6 +43,7 @@ pub enum SessionRole {
 const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
 const KEY_STATE_WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
+const VIDEO_PACKET_QUEUE_CAPACITY: usize = 64;
 const AUDIO_PACKET_QUEUE_CAPACITY: usize = 128;
 const DISPLAY_WAKE_INTERVAL: Duration = Duration::from_millis(350);
 // The X11 backend injects wheel input as button clicks. Keep pixel-mode input
@@ -106,7 +107,7 @@ async fn handle_combined_socket(
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
     maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
-    let video_stream = media.acquire_video(config.clone()).await?;
+    let mut video_stream = media.acquire_video(config.clone()).await?;
     let mut audio_stream = match media.acquire_audio(audio_config).await {
         Ok(stream) => Some(stream),
         Err(_) => None,
@@ -117,7 +118,7 @@ async fn handle_combined_socket(
         .and_then(|stream| stream.state_rx.borrow().clone());
     let (ws_sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
-    let (video_tx, video_rx) = watch::channel(None::<Bytes>);
+    let (video_tx, video_rx) = mpsc::channel::<Bytes>(VIDEO_PACKET_QUEUE_CAPACITY);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let session_id = format!("{:x}", rand_id());
@@ -146,7 +147,9 @@ async fn handle_combined_socket(
     let send_task = tokio::spawn(forward_frames(
         out_tx.clone(),
         video_tx,
-        video_stream.rx.clone(),
+        video_stream
+            .take_video_rx()
+            .expect("video lease receiver already taken"),
         video_stream.state_rx.clone(),
         audio_stream.as_ref().map(|stream| stream.state_rx.clone()),
     ));
@@ -293,13 +296,13 @@ async fn handle_video_socket(
     config: StreamConfig,
     close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let video_stream = media.acquire_video(config).await?;
+    let mut video_stream = media.acquire_video(config).await?;
     let initial_video = current_video_state(&video_stream.state_rx)?;
     let audio_state_rx = media.audio_state_rx();
     let initial_audio = current_audio_state(Some(&audio_state_rx));
     let (ws_sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
-    let (video_tx, video_rx) = watch::channel(None::<Bytes>);
+    let (video_tx, video_rx) = mpsc::channel::<Bytes>(VIDEO_PACKET_QUEUE_CAPACITY);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(1);
     drop(audio_tx);
     let session_id = format!("{:x}", rand_id());
@@ -316,7 +319,9 @@ async fn handle_video_socket(
     let send_task = tokio::spawn(forward_frames(
         out_tx.clone(),
         video_tx,
-        video_stream.rx.clone(),
+        video_stream
+            .take_video_rx()
+            .expect("video lease receiver already taken"),
         video_stream.state_rx.clone(),
         Some(audio_state_rx),
     ));
@@ -333,7 +338,7 @@ async fn handle_audio_socket(
 ) -> Result<()> {
     let (ws_sender, receiver) = socket.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
-    let (video_tx, video_rx) = watch::channel(None::<Bytes>);
+    let (video_tx, video_rx) = mpsc::channel::<Bytes>(1);
     drop(video_tx);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
     let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
@@ -664,25 +669,31 @@ async fn wait_for_mic_tasks(
 
 async fn forward_frames(
     sender: mpsc::Sender<Message>,
-    media_sender: watch::Sender<Option<Bytes>>,
-    mut rx: watch::Receiver<Option<StreamFrame>>,
+    media_sender: mpsc::Sender<Bytes>,
+    mut rx: broadcast::Receiver<StreamFrame>,
     mut video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
     mut audio_state_rx: Option<watch::Receiver<Option<ActiveAudioState>>>,
 ) -> Result<()> {
+    let mut last_description_b64: Option<String> = None;
     loop {
         tokio::select! {
-            changed = rx.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                let Some(frame) = rx.borrow_and_update().clone() else {
-                    continue;
-                };
-                let _ = media_sender.send(Some(frame.packet.clone()));
-                if frame.description_b64.is_some() {
-                    let video_state = current_video_state(&video_state_rx)?;
-                    let audio_state = current_audio_state(audio_state_rx.as_ref());
-                    send_hello(&sender, None, None, &video_state, audio_state.as_ref(), frame.description_b64.clone()).await?;
+            frame = rx.recv() => {
+                match frame {
+                    Ok(frame) => {
+                        if frame.description_b64.is_some() && frame.description_b64 != last_description_b64 {
+                            let video_state = current_video_state(&video_state_rx)?;
+                            let audio_state = current_audio_state(audio_state_rx.as_ref());
+                            send_hello(&sender, None, None, &video_state, audio_state.as_ref(), frame.description_b64.clone()).await?;
+                            last_description_b64 = frame.description_b64.clone();
+                        }
+                        if media_sender.send(frame.packet.clone()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "video subscriber lagged behind live stream");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             changed = video_state_rx.changed() => {
@@ -731,7 +742,7 @@ async fn forward_audio(
 async fn write_socket(
     mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
     mut control_rx: mpsc::Receiver<Message>,
-    mut video_rx: watch::Receiver<Option<Bytes>>,
+    mut video_rx: mpsc::Receiver<Bytes>,
     mut audio_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut control_closed = false;
@@ -786,6 +797,7 @@ async fn write_socket(
         }
 
         tokio::select! {
+            biased;
             maybe = control_rx.recv(), if !control_closed => {
                 match maybe {
                     Some(message) => {
@@ -800,12 +812,12 @@ async fn write_socket(
                     None => control_closed = true,
                 }
             }
-            changed = video_rx.changed(), if !video_closed => {
-                match changed {
-                    Ok(()) => {
-                        pending_video = video_rx.borrow_and_update().clone();
+            maybe = video_rx.recv(), if !video_closed => {
+                match maybe {
+                    Some(bytes) => {
+                        pending_video = Some(bytes);
                     }
-                    Err(_) => video_closed = true,
+                    None => video_closed = true,
                 }
             }
             maybe = audio_rx.recv(), if !audio_closed => {

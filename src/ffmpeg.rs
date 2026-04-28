@@ -10,8 +10,8 @@ use tokio::{
 use tracing::warn;
 
 use crate::settings::{
-    AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, ServerConfig, StreamConfig,
-    VideoScale,
+    AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, EncoderQualityMode,
+    ServerConfig, StreamConfig, VideoScale,
 };
 
 #[derive(Debug, Clone)]
@@ -411,9 +411,14 @@ async fn ffmpeg_probe_encoder(profile: EncoderProfile) -> Result<bool> {
     ]);
     append_video_filter_args(&mut cmd, profile.backend, VideoScale::Native);
     cmd.args(["-c:v", profile.ffmpeg_encoder]);
-    append_bitrate_args(&mut cmd, "200k", "100k");
+    append_bitrate_args(&mut cmd, 200, 500, EncoderQualityMode::Balanced);
     append_gop_args(&mut cmd, "1", profile.backend);
-    append_encoder_specific_args(&mut cmd, profile.ffmpeg_encoder, EncoderLatencyMode::Low);
+    append_encoder_specific_args(
+        &mut cmd,
+        profile.ffmpeg_encoder,
+        EncoderLatencyMode::Low,
+        EncoderQualityMode::Balanced,
+    );
     let output = cmd
         .args(["-f", "null", "-"])
         .stdout(Stdio::null())
@@ -429,10 +434,8 @@ pub fn spawn_capture(
     stream: &StreamConfig,
     encoder: &EncoderChoice,
 ) -> Result<tokio::process::Child> {
-    let bitrate = format!("{}k", stream.bitrate_kbps);
     let fps = stream.fps.to_string();
     let gop = video_gop_frames(stream.fps, stream.performance.gop_ms).to_string();
-    let buffer = video_buffer_size(stream.bitrate_kbps, stream.performance.buffer_ms);
     let backend = encoder_backend(&encoder.ffmpeg_encoder);
     let mut cmd = Command::new("ffmpeg");
     cmd.env("DISPLAY", &server.display).args([
@@ -466,12 +469,18 @@ pub fn spawn_capture(
     ]);
     append_video_filter_args(&mut cmd, backend, stream.performance.scale);
     cmd.args(["-c:v", &encoder.ffmpeg_encoder]);
-    append_bitrate_args(&mut cmd, &bitrate, &buffer);
+    append_bitrate_args(
+        &mut cmd,
+        stream.bitrate_kbps,
+        stream.performance.buffer_ms,
+        stream.performance.encoder_quality,
+    );
     append_gop_args(&mut cmd, &gop, backend);
     append_encoder_specific_args(
         &mut cmd,
         &encoder.ffmpeg_encoder,
         stream.performance.encoder_latency,
+        stream.performance.encoder_quality,
     );
     append_bitstream_filter_args(&mut cmd, encoder.output_format);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -528,8 +537,16 @@ fn append_video_filter_args(cmd: &mut Command, backend: EncoderBackend, scale: V
     }
 }
 
-fn append_bitrate_args(cmd: &mut Command, bitrate: &str, buffer: &str) {
-    cmd.args(["-b:v", bitrate, "-maxrate", bitrate, "-bufsize", buffer]);
+fn append_bitrate_args(
+    cmd: &mut Command,
+    bitrate_kbps: u32,
+    buffer_ms: u32,
+    quality: EncoderQualityMode,
+) {
+    let bitrate = format!("{bitrate_kbps}k");
+    let maxrate = format!("{}k", video_maxrate_kbps(bitrate_kbps, quality));
+    let buffer = video_buffer_size(video_maxrate_kbps(bitrate_kbps, quality), buffer_ms);
+    cmd.args(["-b:v", &bitrate, "-maxrate", &maxrate, "-bufsize", &buffer]);
 }
 
 fn append_gop_args(cmd: &mut Command, gop: &str, backend: EncoderBackend) {
@@ -542,20 +559,34 @@ fn append_gop_args(cmd: &mut Command, gop: &str, backend: EncoderBackend) {
     }
 }
 
-fn append_encoder_specific_args(cmd: &mut Command, encoder: &str, latency: EncoderLatencyMode) {
+fn append_encoder_specific_args(
+    cmd: &mut Command,
+    encoder: &str,
+    latency: EncoderLatencyMode,
+    quality: EncoderQualityMode,
+) {
     match encoder {
         "h264_nvenc" | "hevc_nvenc" | "av1_nvenc" => {
             let tune = match latency {
                 EncoderLatencyMode::UltraLow => "ull",
                 EncoderLatencyMode::Low | EncoderLatencyMode::Balanced => "ll",
             };
-            let preset = match latency {
-                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "p1",
-                EncoderLatencyMode::Balanced => "p3",
+            let preset = match (latency, quality) {
+                (EncoderLatencyMode::UltraLow, _) => "p1",
+                (_, EncoderQualityMode::Fast) => "p2",
+                (EncoderLatencyMode::Low, EncoderQualityMode::Balanced) => "p3",
+                (EncoderLatencyMode::Balanced, EncoderQualityMode::Balanced)
+                | (_, EncoderQualityMode::SharpText) => "p4",
             };
-            let rc = match latency {
-                EncoderLatencyMode::Balanced => "cbr_hq",
-                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "cbr_ld_hq",
+            let rc = match (latency, quality) {
+                (_, EncoderQualityMode::SharpText) => "vbr_hq",
+                (EncoderLatencyMode::Balanced, _) => "cbr_hq",
+                (EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low, _) => "cbr_ld_hq",
+            };
+            let rc_lookahead = match (latency, quality) {
+                (EncoderLatencyMode::UltraLow, _) | (_, EncoderQualityMode::Fast) => "0",
+                (_, EncoderQualityMode::Balanced) => "4",
+                (_, EncoderQualityMode::SharpText) => "8",
             };
             cmd.args([
                 "-preset",
@@ -573,20 +604,35 @@ fn append_encoder_specific_args(cmd: &mut Command, encoder: &str, latency: Encod
                 "-delay",
                 "0",
                 "-rc-lookahead",
-                "0",
+                rc_lookahead,
                 "-aud",
                 "1",
             ]);
             if matches!(latency, EncoderLatencyMode::UltraLow) {
                 cmd.args(["-surfaces", "2"]);
-            } else if matches!(latency, EncoderLatencyMode::Balanced) {
-                cmd.args(["-spatial-aq", "1"]);
+            } else if !matches!(quality, EncoderQualityMode::Fast) {
+                let aq_strength = match quality {
+                    EncoderQualityMode::Fast => "6",
+                    EncoderQualityMode::Balanced => "8",
+                    EncoderQualityMode::SharpText => "12",
+                };
+                cmd.args([
+                    "-spatial-aq",
+                    "1",
+                    "-temporal-aq",
+                    "1",
+                    "-aq-strength",
+                    aq_strength,
+                ]);
             }
         }
         "libx264" => {
-            let preset = match latency {
-                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "ultrafast",
-                EncoderLatencyMode::Balanced => "veryfast",
+            let preset = match (latency, quality) {
+                (EncoderLatencyMode::UltraLow, _) | (_, EncoderQualityMode::Fast) => "ultrafast",
+                (EncoderLatencyMode::Low, EncoderQualityMode::Balanced) => "veryfast",
+                (EncoderLatencyMode::Balanced, EncoderQualityMode::Balanced)
+                | (EncoderLatencyMode::Low, EncoderQualityMode::SharpText) => "faster",
+                (EncoderLatencyMode::Balanced, EncoderQualityMode::SharpText) => "fast",
             };
             let params = match latency {
                 EncoderLatencyMode::UltraLow => {
@@ -606,9 +652,12 @@ fn append_encoder_specific_args(cmd: &mut Command, encoder: &str, latency: Encod
             ]);
         }
         "libx265" => {
-            let preset = match latency {
-                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "ultrafast",
-                EncoderLatencyMode::Balanced => "veryfast",
+            let preset = match (latency, quality) {
+                (EncoderLatencyMode::UltraLow, _) | (_, EncoderQualityMode::Fast) => "ultrafast",
+                (EncoderLatencyMode::Low, EncoderQualityMode::Balanced) => "veryfast",
+                (EncoderLatencyMode::Balanced, EncoderQualityMode::Balanced)
+                | (EncoderLatencyMode::Low, EncoderQualityMode::SharpText) => "faster",
+                (EncoderLatencyMode::Balanced, EncoderQualityMode::SharpText) => "fast",
             };
             cmd.args([
                 "-preset",
@@ -622,35 +671,36 @@ fn append_encoder_specific_args(cmd: &mut Command, encoder: &str, latency: Encod
             ]);
         }
         "h264_qsv" | "hevc_qsv" | "vp9_qsv" | "av1_qsv" => {
-            let preset = match latency {
-                EncoderLatencyMode::UltraLow | EncoderLatencyMode::Low => "veryfast",
-                EncoderLatencyMode::Balanced => "faster",
+            let preset = match (latency, quality) {
+                (EncoderLatencyMode::UltraLow, _) | (_, EncoderQualityMode::Fast) => "veryfast",
+                (EncoderLatencyMode::Low, EncoderQualityMode::Balanced) => "faster",
+                (EncoderLatencyMode::Balanced, EncoderQualityMode::Balanced)
+                | (_, EncoderQualityMode::SharpText) => "fast",
             };
-            cmd.args([
-                "-preset",
-                preset,
-                "-look_ahead",
-                "0",
-                "-async_depth",
-                "1",
-                "-bf",
-                "0",
-            ]);
+            cmd.args(["-preset", preset, "-async_depth", "1", "-bf", "0"]);
+            if matches!(quality, EncoderQualityMode::Fast) {
+                cmd.args(["-look_ahead", "0"]);
+            } else {
+                cmd.args(["-look_ahead", "1"]);
+            }
             if matches!(latency, EncoderLatencyMode::UltraLow) {
                 cmd.args(["-low_power", "1", "-low_delay_brc", "1"]);
             }
         }
         "h264_vaapi" | "hevc_vaapi" | "vp9_vaapi" | "av1_vaapi" => {
             cmd.args(["-bf", "0"]);
-            match latency {
-                EncoderLatencyMode::UltraLow => {
+            match (latency, quality) {
+                (EncoderLatencyMode::UltraLow, _) | (_, EncoderQualityMode::Fast) => {
                     cmd.args(["-low_power", "1", "-quality", "7"]);
                 }
-                EncoderLatencyMode::Low => {
+                (EncoderLatencyMode::Low, EncoderQualityMode::Balanced) => {
                     cmd.args(["-quality", "6"]);
                 }
-                EncoderLatencyMode::Balanced => {
+                (EncoderLatencyMode::Balanced, EncoderQualityMode::Balanced) => {
                     cmd.args(["-quality", "4"]);
+                }
+                (_, EncoderQualityMode::SharpText) => {
+                    cmd.args(["-quality", "2"]);
                 }
             };
             if matches!(encoder, "h264_vaapi" | "hevc_vaapi") {
@@ -658,10 +708,27 @@ fn append_encoder_specific_args(cmd: &mut Command, encoder: &str, latency: Encod
             }
         }
         "libvpx" => {
-            cmd.args(["-deadline", "realtime", "-cpu-used", "8"]);
+            let cpu_used = if matches!(quality, EncoderQualityMode::SharpText) {
+                "6"
+            } else {
+                "8"
+            };
+            cmd.args(["-deadline", "realtime", "-cpu-used", cpu_used]);
         }
         "libvpx-vp9" => {
-            cmd.args(["-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1"]);
+            let cpu_used = if matches!(quality, EncoderQualityMode::SharpText) {
+                "6"
+            } else {
+                "8"
+            };
+            cmd.args([
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                cpu_used,
+                "-row-mt",
+                "1",
+            ]);
         }
         "libsvtav1" => {
             cmd.args(["-preset", "12", "-svtav1-params", "scd=0:lookahead=0"]);
@@ -721,6 +788,15 @@ fn render_device_path() -> Result<PathBuf> {
 
 fn video_gop_frames(fps: u32, gop_ms: u32) -> u32 {
     fps.saturating_mul(gop_ms).saturating_add(999) / 1_000
+}
+
+fn video_maxrate_kbps(bitrate_kbps: u32, quality: EncoderQualityMode) -> u32 {
+    let (num, den) = match quality {
+        EncoderQualityMode::Fast => (1, 1),
+        EncoderQualityMode::Balanced => (3, 2),
+        EncoderQualityMode::SharpText => (5, 2),
+    };
+    bitrate_kbps.saturating_mul(num).saturating_add(den - 1) / den
 }
 
 fn video_buffer_size(bitrate_kbps: u32, buffer_ms: u32) -> String {

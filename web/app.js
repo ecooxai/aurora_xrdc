@@ -116,6 +116,9 @@ const state = {
   micProcessorNode: null,
   micSilenceNode: null,
   micStreamId: 0,
+  micDeviceId: "",
+  micDevices: [],
+  micDeviceMenuOpen: false,
   micEnabled: false,
   micStarting: false,
   cameraRecorder: null,
@@ -145,7 +148,8 @@ const state = {
   audioResumeBlockedUntil: 0,
   audioUnderrunActive: false,
   audioPlaybackBlocked: false,
-  audioUserActivated: false,
+  audioUserActivated: true,
+  audioMuted: false,
   audioLargeBufferSinceAt: 0,
   audioHighLatencySinceAt: 0,
   audioRateIntegral: 0,
@@ -186,6 +190,7 @@ const state = {
   localClipboardUpdatedAt: 0,
   remoteClipboardUpdatedAt: 0,
   clipboardHistory: [],
+  errors: [],
   encoderOptionsByCodec: {},
   apiOrigin: window.location.origin,
   authenticated: false,
@@ -200,6 +205,7 @@ const state = {
   latencyProbeSeq: 0,
   latencyProbeSentAt: new Map(),
   serverClockOffsetMs: 0,
+  lastVideoSeq: null,
   lastVideoPacketAt: 0,
   lastVideoFrameRenderedAt: 0,
   lastAudioPacketAt: 0,
@@ -233,8 +239,15 @@ const authOriginInput = $("auth-origin");
 const authInput = $("auth-passwd");
 const authError = $("auth-error");
 const controlPanel = $("control-panel");
+const transferPanel = $("transfer-panel");
+const errorPanel = $("error-panel");
+const errorCount = $("error-count");
+const errorList = $("error-list");
+const errorClear = $("error-clear");
 const mobileKeyboardTrigger = $("mobile-keyboard-trigger");
 const micToggle = $("mic-toggle");
+const micDeviceMenu = $("mic-device-menu");
+const audioToggle = $("audio-toggle");
 const cameraToggle = $("camera-toggle");
 const mobileKeyboardInput = $("mobile-keyboard-input");
 const encoderStatus = $("encoder-status");
@@ -258,6 +271,7 @@ const audioClockRateValue = $("audio-clock-rate-value");
 const audioClockAutoInput = $("audio-clock-auto");
 const autoDisconnectMinutesInput = $("auto-disconnect-minutes");
 const encoderLatencySelect = $("encoder-latency");
+const encoderQualitySelect = $("encoder-quality");
 const videoScaleSelect = $("video-scale");
 const gopMsInput = $("gop-ms");
 const gopMsValue = $("gop-ms-value");
@@ -332,21 +346,23 @@ const CAMERA_MIME_CANDIDATES = [
 const PERFORMANCE_PRESETS = {
   speed: {
     codec: "h264",
-    bitrate: 1024,
+    bitrate: 3000,
     fps: 30,
     encoderLatency: "low",
+    encoderQuality: "balanced",
     videoScale: "720p",
-    gopMs: 4000,
-    bufferMs: 2000,
-    staleDropMs: 250,
-    stallResetMs: 350,
+    gopMs: 1000,
+    bufferMs: 1000,
+    staleDropMs: 400,
+    stallResetMs: 600,
     maxDecodeQueue: 4,
   },
   quality: {
     codec: "h264",
-    bitrate: 6000,
+    bitrate: 10000,
     fps: 30,
     encoderLatency: "balanced",
+    encoderQuality: "sharp_text",
     videoScale: "1080p",
     gopMs: 1000,
     bufferMs: 500,
@@ -475,6 +491,10 @@ function renderAudioBufferMetric() {
   if (!controlPanel.open || !document.getElementById("tab-panel-audio")?.classList.contains("is-active")) {
     return;
   }
+  if (state.audioMuted) {
+    statusAudioBuffer.textContent = "Muted";
+    return;
+  }
   if (!state.audioEnabled) {
     statusAudioBuffer.textContent = "--";
     return;
@@ -593,11 +613,61 @@ function setActiveTab(tabName) {
 }
 
 function showToast(code, message) {
+  if (isErrorNotice(code)) {
+    pushError(code, message);
+    return;
+  }
   toast.textContent = `${code}: ${message}`;
   toast.dataset.copy = `${code}: ${message}`;
   toast.classList.remove("hidden");
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => toast.classList.add("hidden"), 10000);
+}
+
+function isErrorNotice(code = "") {
+  return /(?:error|fail|failed|unsupported|unavailable|missing|insecure|denied)/i.test(code);
+}
+
+function pushError(code, message) {
+  state.errors.unshift({
+    code: String(code || "error"),
+    message: String(message || "Unknown error"),
+    at: Date.now(),
+  });
+  renderErrors();
+}
+
+function clearErrors() {
+  state.errors = [];
+  errorPanel.open = false;
+  renderErrors();
+}
+
+function renderErrors() {
+  errorPanel.classList.toggle("hidden", state.errors.length === 0);
+  errorCount.textContent = String(Math.min(state.errors.length, 99));
+  errorList.replaceChildren();
+  const fragment = document.createDocumentFragment();
+  for (const error of state.errors) {
+    const item = document.createElement("article");
+    item.className = "error-item";
+
+    const code = document.createElement("span");
+    code.className = "error-item-code";
+    code.textContent = error.code;
+
+    const message = document.createElement("div");
+    message.className = "error-item-message";
+    message.textContent = error.message;
+
+    const time = document.createElement("span");
+    time.className = "error-item-time";
+    time.textContent = new Date(error.at).toLocaleTimeString();
+
+    item.append(code, message, time);
+    fragment.append(item);
+  }
+  errorList.append(fragment);
 }
 
 function markStaleDrop(message) {
@@ -640,6 +710,7 @@ function streamReconnectSettingsKey(settings = readSettingsFromControls()) {
     audioBitrateKbps: settings.audioBitrateKbps,
     fps: settings.fps,
     encoderLatency: settings.encoderLatency,
+    encoderQuality: settings.encoderQuality,
     videoScale: settings.videoScale,
     gopMs: settings.gopMs,
     bufferMs: settings.bufferMs,
@@ -671,6 +742,7 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
     audioBitrateKbps: audioConfig?.bitrate_kbps,
     fps: streamConfig?.fps,
     encoderLatency: streamConfig?.performance?.encoder_latency,
+    encoderQuality: streamConfig?.performance?.encoder_quality,
     videoScale: streamConfig?.performance?.scale,
     gopMs: streamConfig?.performance?.gop_ms,
     bufferMs: streamConfig?.performance?.buffer_ms,
@@ -713,6 +785,7 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
     audioBitrateKbps: incoming.audioBitrateKbps,
     fps: incoming.fps,
     encoderLatency: incoming.encoderLatency,
+    encoderQuality: incoming.encoderQuality,
     videoScale: incoming.videoScale,
     gopMs: incoming.gopMs,
     bufferMs: incoming.bufferMs,
@@ -737,6 +810,7 @@ function pushSharedStreamSettings(reason) {
       fps: settings.fps,
       performance: {
         encoder_latency: settings.encoderLatency,
+        encoder_quality: settings.encoderQuality,
         gop_ms: settings.gopMs,
         buffer_ms: settings.bufferMs,
         scale: settings.videoScale,
@@ -778,7 +852,7 @@ function monitorConnectionHealth() {
   const socketOpen = isConnected();
 
   let warning = "";
-  if (socketOpen && state.audioUnderrunActive) {
+  if (socketOpen && state.audioUnderrunActive && !state.audioMuted) {
     warning = state.streamWarning || AUDIO_UNDERRUN_WARNING;
   } else if (socketOpen && state.lastVideoPacketAt && now - state.lastVideoPacketAt > state.mediaStallResetMs) {
     warning = "Video stalled";
@@ -809,6 +883,10 @@ function monitorConnectionHealth() {
 }
 
 toast.addEventListener("click", async () => {
+  if (!canUseBrowserClipboard()) {
+    setStatus("Focus window before copying");
+    return;
+  }
   try {
     await navigator.clipboard.writeText(toast.dataset.copy || toast.textContent || "");
     setStatus("Error copied");
@@ -897,6 +975,7 @@ function normalizeSettings(settings = {}) {
   const allowedMicBitrates = new Set(Array.from(micBitrateSelect.options, (option) => Number(option.value)));
   const allowedTouchModes = new Set(Array.from(touchModeSelect.options, (option) => option.value));
   const allowedEncoderLatency = new Set(Array.from(encoderLatencySelect.options, (option) => option.value));
+  const allowedEncoderQuality = new Set(Array.from(encoderQualitySelect.options, (option) => option.value));
   const allowedVideoScales = new Set(Array.from(videoScaleSelect.options, (option) => option.value));
   const defaultCodec = codecSelect.options[0]?.value || "h264";
   const defaultBitrate = Number(bitrateInput.value);
@@ -922,12 +1001,17 @@ function normalizeSettings(settings = {}) {
     touchMode: allowedTouchModes.has(settings.touchMode) ? settings.touchMode : touchModeSelect.value,
     directTouchScroll: settings.directTouchScroll === true,
     micEnabled: settings.micEnabled === true,
+    micDeviceId: typeof settings.micDeviceId === "string" ? settings.micDeviceId : "",
+    audioMuted: settings.audioMuted === true,
     audioLatencyMs: clampControlValue(audioLatencyInput, settings.audioLatencyMs, Number(audioLatencyInput.value)),
     audioClockRate: clampControlValue(audioClockRateInput, settings.audioClockRate, defaultAudioClockRate),
     audioClockAuto: settings.audioClockAuto !== false,
     encoderLatency: allowedEncoderLatency.has(settings.encoderLatency)
       ? settings.encoderLatency
       : encoderLatencySelect.value,
+    encoderQuality: allowedEncoderQuality.has(settings.encoderQuality)
+      ? settings.encoderQuality
+      : encoderQualitySelect.value,
     videoScale: allowedVideoScales.has(settings.videoScale)
       ? settings.videoScale
       : videoScaleSelect.value,
@@ -1042,6 +1126,7 @@ function readSettingsFromControls() {
     audioClockRate: audioClockRateInput.value,
     audioClockAuto: audioClockAutoInput.checked,
     encoderLatency: encoderLatencySelect.value,
+    encoderQuality: encoderQualitySelect.value,
     videoScale: videoScaleSelect.value,
     gopMs: gopMsInput.value,
     bufferMs: bufferMsInput.value,
@@ -1052,6 +1137,8 @@ function readSettingsFromControls() {
     touchMode: touchModeSelect.value,
     directTouchScroll: directTouchScrollInput.checked,
     micEnabled: state.micEnabled,
+    micDeviceId: state.micDeviceId,
+    audioMuted: state.audioMuted,
     viewZoomPercent: state.viewZoomPercent,
   });
 }
@@ -1068,7 +1155,10 @@ function loadStoredSettings() {
   try {
     const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (!raw) return readSettingsFromControls();
-    return normalizeSettings(JSON.parse(raw));
+    return {
+      ...normalizeSettings(JSON.parse(raw)),
+      audioMuted: false,
+    };
   } catch {
     return readSettingsFromControls();
   }
@@ -1106,7 +1196,184 @@ function renderMicToggle() {
   micToggle.classList.toggle("is-active", state.micEnabled);
   micToggle.classList.toggle("is-pending", state.micStarting);
   micToggle.setAttribute("aria-pressed", state.micEnabled ? "true" : "false");
-  micToggle.setAttribute("aria-label", state.micEnabled ? "Disable microphone" : "Enable microphone");
+  micToggle.setAttribute("aria-expanded", state.micDeviceMenuOpen ? "true" : "false");
+  micToggle.setAttribute(
+    "aria-label",
+    state.micEnabled ? `Microphone: ${currentMicDeviceLabel()}` : "Choose microphone",
+  );
+}
+
+function renderAudioToggle() {
+  const active = !state.audioMuted && state.audioUserActivated && !state.audioPlaybackBlocked;
+  audioToggle.classList.toggle("is-active", active);
+  audioToggle.setAttribute("aria-pressed", active ? "true" : "false");
+  audioToggle.setAttribute("aria-label", active ? "Mute server audio" : "Play server audio");
+}
+
+function micDeviceLabel(device, index = 0) {
+  const label = device?.label?.trim();
+  if (label) return label;
+  if (device?.deviceId === "default") return "Default microphone";
+  return `Microphone ${index + 1}`;
+}
+
+function currentMicDeviceLabel() {
+  const selectedIndex = state.micDevices.findIndex((device) => (
+    (device.deviceId || "") === (state.micDeviceId || "")
+  ));
+  if (selectedIndex >= 0) {
+    return micDeviceLabel(state.micDevices[selectedIndex], selectedIndex);
+  }
+  return state.micDeviceId ? "Selected microphone" : "Default microphone";
+}
+
+function createMicMenuItem({
+  name,
+  meta = "",
+  active = false,
+  danger = false,
+  disabled = false,
+  onClick = null,
+}) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "device-menu-item";
+  button.setAttribute("role", danger || !onClick ? "menuitem" : "menuitemradio");
+  if (!danger && onClick) {
+    button.setAttribute("aria-checked", active ? "true" : "false");
+  }
+  if (active) {
+    button.classList.add("is-active");
+  }
+  if (danger) {
+    button.classList.add("is-danger");
+  }
+  button.disabled = disabled;
+
+  const nameEl = document.createElement("span");
+  nameEl.className = "device-menu-name";
+  nameEl.textContent = name;
+  button.append(nameEl);
+
+  const metaEl = document.createElement("span");
+  metaEl.className = "device-menu-meta";
+  metaEl.textContent = meta;
+  button.append(metaEl);
+
+  if (onClick) {
+    button.addEventListener("click", onClick);
+  }
+  return button;
+}
+
+function renderMicDeviceMenu({ loading = false } = {}) {
+  const fragment = document.createDocumentFragment();
+  if (loading) {
+    fragment.append(createMicMenuItem({
+      name: "Loading microphones...",
+      disabled: true,
+    }));
+  } else if (!navigator.mediaDevices?.getUserMedia) {
+    fragment.append(createMicMenuItem({
+      name: "Microphone unavailable",
+      disabled: true,
+    }));
+  } else if (state.micDevices.length > 0) {
+    state.micDevices.forEach((device, index) => {
+      const deviceId = device.deviceId || "";
+      const active = state.micEnabled && (state.micDeviceId || "") === deviceId;
+      fragment.append(createMicMenuItem({
+        name: micDeviceLabel(device, index),
+        meta: active ? "Selected" : "",
+        active,
+        onClick: () => {
+          void selectMicrophoneDevice(deviceId);
+        },
+      }));
+    });
+  } else {
+    fragment.append(createMicMenuItem({
+      name: "No microphones found",
+      disabled: true,
+    }));
+  }
+
+  fragment.append(createMicMenuItem({
+    name: "Disable microphone",
+    meta: state.micEnabled ? "On" : "Off",
+    danger: true,
+    onClick: disableMicrophoneFromMenu,
+  }));
+  micDeviceMenu.replaceChildren(fragment);
+}
+
+async function refreshMicDevices({ silent = false } = {}) {
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    state.micDevices = [];
+    renderMicDeviceMenu();
+    renderMicToggle();
+    return [];
+  }
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    state.micDevices = devices.filter((device) => device.kind === "audioinput");
+  } catch (error) {
+    state.micDevices = [];
+    if (!silent) {
+      showToast("mic_devices_failed", error.message || String(error));
+    }
+  }
+  renderMicDeviceMenu();
+  renderMicToggle();
+  return state.micDevices;
+}
+
+async function openMicDeviceMenu() {
+  controlPanel.open = false;
+  transferPanel.open = false;
+  errorPanel.open = false;
+  releaseInput();
+  state.micDeviceMenuOpen = true;
+  micDeviceMenu.classList.remove("hidden");
+  renderMicToggle();
+  renderMicDeviceMenu({ loading: true });
+  await refreshMicDevices({ silent: true });
+}
+
+function closeMicDeviceMenu() {
+  if (!state.micDeviceMenuOpen) return;
+  state.micDeviceMenuOpen = false;
+  micDeviceMenu.classList.add("hidden");
+  renderMicToggle();
+}
+
+function toggleMicDeviceMenu(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  if (state.micDeviceMenuOpen) {
+    closeMicDeviceMenu();
+    return;
+  }
+  void openMicDeviceMenu();
+}
+
+async function selectMicrophoneDevice(deviceId = "") {
+  closeMicDeviceMenu();
+  state.micDeviceId = deviceId || "";
+  state.micEnabled = true;
+  persistCurrentSettings();
+  renderMicToggle();
+  if (isConnected()) {
+    stopMicrophoneCapture();
+    await startMicrophoneCapture();
+  }
+}
+
+function disableMicrophoneFromMenu() {
+  closeMicDeviceMenu();
+  state.micEnabled = false;
+  persistCurrentSettings();
+  stopMicrophoneCapture();
 }
 
 function renderCameraToggle() {
@@ -1130,6 +1397,7 @@ function applySettings(settings) {
   audioClockRateInput.value = String(normalized.audioClockRate);
   audioClockAutoInput.checked = normalized.audioClockAuto;
   encoderLatencySelect.value = normalized.encoderLatency;
+  encoderQualitySelect.value = normalized.encoderQuality;
   videoScaleSelect.value = normalized.videoScale;
   gopMsInput.value = String(normalized.gopMs);
   bufferMsInput.value = String(normalized.bufferMs);
@@ -1140,6 +1408,8 @@ function applySettings(settings) {
   touchModeSelect.value = normalized.touchMode;
   directTouchScrollInput.checked = normalized.directTouchScroll;
   state.micEnabled = normalized.micEnabled;
+  state.micDeviceId = normalized.micDeviceId;
+  state.audioMuted = normalized.audioMuted;
   state.viewZoomPercent = normalized.viewZoomPercent;
   state.liveMediaMaxAgeMs = normalized.staleDropMs;
   state.mediaStallResetMs = normalized.stallResetMs;
@@ -1147,6 +1417,7 @@ function applySettings(settings) {
   renderSettingsValues(normalized);
   syncTouchModeControls(normalized);
   renderMicToggle();
+  renderAudioToggle();
   applyCanvasZoom();
 }
 
@@ -1583,6 +1854,7 @@ function appendStreamQuery(url, settings) {
   url.searchParams.set("audio_bitrate_kbps", settings.audioBitrateKbps);
   url.searchParams.set("fps", settings.fps);
   url.searchParams.set("encoder_latency", settings.encoderLatency);
+  url.searchParams.set("encoder_quality", settings.encoderQuality);
   url.searchParams.set("scale", settings.videoScale);
   url.searchParams.set("gop_ms", settings.gopMs);
   url.searchParams.set("buffer_ms", settings.bufferMs);
@@ -1904,6 +2176,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   clearInterval(startPing.timer);
   state.latencyProbeSentAt.clear();
   state.lastVideoPacketAt = 0;
+  state.lastVideoSeq = null;
   state.lastAudioPacketAt = 0;
   if (!preserveStatus) {
     state.wsLatencyMs = null;
@@ -2046,9 +2319,15 @@ function handleServerMessage(message) {
       state.activeCodec = message.config.codec;
     }
     if (message.description_b64) {
-      state.description = Uint8Array.from(atob(message.description_b64), (c) => c.charCodeAt(0));
+      const description = Uint8Array.from(atob(message.description_b64), (c) => c.charCodeAt(0));
+      const descriptionChanged = !byteArraysEqual(state.description, description);
+      state.description = description;
+      if (descriptionChanged) {
+        closeVideoDecoderForReconfigure();
+      }
     } else if (codecStringChanged) {
       state.description = null;
+      closeVideoDecoderForReconfigure();
     }
     state.audioEnabled = !!message.audio_enabled;
     void setupDecoder();
@@ -2071,10 +2350,19 @@ function handleServerMessage(message) {
       renderLatencyMetric();
     }
   } else if (message.type === "error") {
-    showToast(message.code, message.message);
+    pushError(message.code, message.message);
   } else if (message.type === "clipboard" && message.side === "remote") {
     updateClipboardState("remote", message.payload, { announce: true });
   }
+}
+
+function byteArraysEqual(left, right) {
+  if (left === right) return true;
+  if (!left || !right || left.length !== right.length) return false;
+  for (let idx = 0; idx < left.length; idx += 1) {
+    if (left[idx] !== right[idx]) return false;
+  }
+  return true;
 }
 
 async function setupDecoder() {
@@ -2116,11 +2404,25 @@ async function setupDecoder() {
     state.codecString = selectedCodecString;
     state.decoderConfigKey = configKey;
     state.waitingForKeyframe = true;
+    state.lastVideoSeq = null;
   } catch (error) {
     state.decoder?.close();
     state.decoder = null;
     state.decoderConfigKey = "";
     showToast("decoder_config_failed", error.message || String(error));
+  }
+}
+
+function closeVideoDecoderForReconfigure() {
+  const decoder = state.decoder;
+  state.decoder = null;
+  state.decoderConfigKey = "";
+  state.waitingForKeyframe = true;
+  state.lastVideoSeq = null;
+  try {
+    decoder?.close();
+  } catch {
+    // The decoder may already be closed by an internal WebCodecs error.
   }
 }
 
@@ -2135,6 +2437,7 @@ function recoverVideoDecoder(reason = "", { toastCode = "decoder_error" } = {}) 
   state.decoder = null;
   state.decoderConfigKey = "";
   state.waitingForKeyframe = true;
+  state.lastVideoSeq = null;
   try {
     decoder?.close();
   } catch {
@@ -2350,8 +2653,9 @@ function handleVideoFrame(buffer, view) {
   const key = !!view.getUint8(1);
   const sentAt = Number(view.getBigUint64(2, true));
   const receivedAt = performance.now();
-  const length = view.getUint32(10, true);
-  const bytes = new Uint8Array(buffer, 14, length);
+  const seq = view.getUint32(10, true);
+  const length = view.getUint32(14, true);
+  const bytes = new Uint8Array(buffer, 18, length);
   state.bytesReceived += length;
   state.netWindowBytes += length;
   const deltaSec = (receivedAt - state.lastNetAt) / 1000;
@@ -2374,6 +2678,16 @@ function handleVideoFrame(buffer, view) {
     return;
   }
   const timestamp = sentAt * 1000;
+  if (state.lastVideoSeq !== null && ((state.lastVideoSeq + 1) >>> 0) !== seq) {
+    state.lastVideoSeq = seq;
+    if (!key) {
+      markStaleDrop("Video frame gap");
+      resetVideoDecoderForLiveCatchup();
+      return;
+    }
+  } else {
+    state.lastVideoSeq = seq;
+  }
   if (state.waitingForKeyframe) {
     if (!key) return;
     state.waitingForKeyframe = false;
@@ -2390,7 +2704,7 @@ function handleVideoFrame(buffer, view) {
 }
 
 function handleAudioFrame(buffer, view) {
-  if (!state.audioEnabled || !state.audioUserActivated) return;
+  if (!state.audioEnabled || !state.audioUserActivated || state.audioMuted) return;
   const sentAt = Number(view.getBigUint64(1, true));
   const receivedAt = performance.now();
   const stalledForMs = state.lastAudioPacketAt ? receivedAt - state.lastAudioPacketAt : 0;
@@ -2768,6 +3082,7 @@ function scheduleAudioBuffer(
 function pumpPendingAudioDecode() {
   const audioDecoder = state.audioDecoder;
   if (!audioDecoder || audioDecoder.state === "closed") return;
+  if (state.audioMuted) return;
   if (state.audioPlaybackBlocked) return;
   const profile = currentAudioBufferProfile();
   const decodeTargetSeconds = state.audioUnderrunActive
@@ -2803,6 +3118,7 @@ function pumpPendingAudioDecode() {
 
 function driveAudioPlayback(audioContext = state.audioContext) {
   if (!audioContext || audioContext.state === "closed") return;
+  if (state.audioMuted) return;
   pumpPendingAudioDecode();
   flushPendingAudioPlayback(audioContext);
   pumpPendingAudioDecode();
@@ -2902,6 +3218,10 @@ async function ensureAudioContext() {
 }
 
 async function primeAudioPlayback() {
+  if (state.audioMuted) {
+    renderAudioToggle();
+    return;
+  }
   const wasBlocked = state.audioPlaybackBlocked;
   try {
     await ensureAudioContext();
@@ -2916,6 +3236,8 @@ async function primeAudioPlayback() {
   } catch {
     // Autoplay policy may require a user gesture; playback will retry later.
     state.audioPlaybackBlocked = true;
+  } finally {
+    renderAudioToggle();
   }
 }
 
@@ -2933,15 +3255,17 @@ async function startMicrophoneCapture() {
     if (!mimeType) {
       throw new Error("This browser cannot record microphone uplink as Opus");
     }
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        latency: 0.02,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
+    const audioConstraints = {
+      channelCount: 1,
+      latency: 0.02,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    if (state.micDeviceId) {
+      audioConstraints.deviceId = { exact: state.micDeviceId };
+    }
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
     if (!isConnected()) {
       for (const track of stream.getTracks()) {
         track.stop();
@@ -2974,6 +3298,7 @@ async function startMicrophoneCapture() {
     recorder.start(MIC_CHUNK_MS);
     state.micRecorder = recorder;
     state.micStream = stream;
+    void refreshMicDevices({ silent: true });
   } catch (error) {
     showToast("mic_access_failed", error.message || String(error));
     state.micEnabled = false;
@@ -3227,9 +3552,14 @@ async function stopCameraCapture({ notifyServer = true, keepEnabled = false } = 
 async function playAudioData(audioData) {
   const audioDuration = audioData.numberOfFrames / audioData.sampleRate;
   state.audioDecodingDuration = Math.max(0, state.audioDecodingDuration - audioDuration);
+  if (state.audioMuted) {
+    audioData.close();
+    return;
+  }
   const audioContext = await ensureAudioContext().catch(() => null);
   if (!audioContext) {
     state.audioPlaybackBlocked = true;
+    renderAudioToggle();
     audioData.close();
     return;
   }
@@ -3245,6 +3575,7 @@ async function playAudioData(audioData) {
     });
   }
   state.audioPlaybackBlocked = false;
+  renderAudioToggle();
   state.pendingAudioBuffers.push(audioBuffer);
   state.pendingAudioDuration += audioBuffer.duration;
   driveAudioPlayback(audioContext);
@@ -3297,18 +3628,31 @@ function sendBinary(bytes) {
   }
 }
 
-function toggleMicrophone() {
-  state.micEnabled = !state.micEnabled;
-  persistCurrentSettings();
-  if (!state.micEnabled) {
-    stopMicrophoneCapture();
+function setServerAudioMuted(muted) {
+  const nextMuted = muted === true;
+  if (state.audioMuted === nextMuted) {
+    if (!nextMuted) {
+      void primeAudioPlayback();
+    }
+    renderAudioToggle();
     return;
   }
-  if (isConnected()) {
-    void startMicrophoneCapture();
-  } else {
-    renderMicToggle();
+  state.audioMuted = nextMuted;
+  resetAudioDecoderForLiveCatchup();
+  if (!state.audioMuted) {
+    void primeAudioPlayback();
   }
+  renderAudioToggle();
+  renderAudioBufferMetric();
+  persistCurrentSettings();
+}
+
+function toggleServerAudio() {
+  if (state.audioMuted || !state.audioUserActivated || state.audioPlaybackBlocked) {
+    setServerAudioMuted(false);
+    return;
+  }
+  setServerAudioMuted(true);
 }
 
 function toggleCamera() {
@@ -4133,6 +4477,15 @@ function hasClipboardContent(payload) {
   return !!(normalized.text || normalized.image_png_b64);
 }
 
+function canUseBrowserClipboard() {
+  return document.visibilityState === "visible" && document.hasFocus();
+}
+
+function isClipboardFocusError(error) {
+  const message = error?.message || String(error || "");
+  return /document is not focused|document.*focus|not focused/i.test(message);
+}
+
 function renderClipboardHistory() {
   clipboardHistoryList.replaceChildren();
   const entries = state.clipboardHistory;
@@ -4165,10 +4518,18 @@ function renderClipboardHistory() {
     if (entry.payload.text) {
       text.classList.add("is-copyable");
       text.addEventListener("click", async () => {
+        if (!canUseBrowserClipboard()) {
+          setStatus("Focus window before copying");
+          return;
+        }
         try {
           await navigator.clipboard.writeText(entry.payload.text);
           showToast("clipboard_history_copied", "History text copied");
         } catch (error) {
+          if (isClipboardFocusError(error)) {
+            setStatus("Focus window before copying");
+            return;
+          }
           showToast("clipboard_history_copy_failed", error.message || String(error));
         }
       });
@@ -4198,6 +4559,18 @@ function pushClipboardHistory(side, payload) {
   });
 }
 
+function flashClipboardCard(side) {
+  const card = $(`${side}-clipboard-card`);
+  flashClipboardCard.timers ??= {};
+  card.classList.remove("is-flashing");
+  void card.offsetWidth;
+  card.classList.add("is-flashing");
+  clearTimeout(flashClipboardCard.timers[side]);
+  flashClipboardCard.timers[side] = setTimeout(() => {
+    card.classList.remove("is-flashing");
+  }, 2000);
+}
+
 function updateClipboardState(side, payload, { announce = false } = {}) {
   const normalized = normalizeClipboardPayload(payload);
   const signature = clipboardSignature(normalized);
@@ -4216,7 +4589,7 @@ function updateClipboardState(side, payload, { announce = false } = {}) {
     state[sigKey] = signature;
     state[timeKey] = Date.now();
     if (announce && (normalized.text || normalized.image_png_b64) && previousSignature) {
-      showToast(`${side}_clipboard_changed`, clipboardPreview(normalized));
+      flashClipboardCard(side);
     }
   }
   renderClipboardCard(side, normalized);
@@ -4251,6 +4624,9 @@ function renderClipboardCard(side, payload) {
 }
 
 async function readLocalClipboard() {
+  if (!canUseBrowserClipboard()) {
+    return state.localClipboard;
+  }
   const payload = { text: null, image_png_b64: null };
   if (!navigator.clipboard?.read) {
     if (navigator.clipboard?.readText) {
@@ -4281,15 +4657,24 @@ async function readLocalClipboard() {
 }
 
 async function refreshLocalClipboard() {
+  if (!canUseBrowserClipboard()) {
+    return state.localClipboard;
+  }
   try {
     return updateClipboardState("local", await readLocalClipboard(), { announce: true });
   } catch (error) {
+    if (isClipboardFocusError(error)) {
+      return state.localClipboard;
+    }
     showToast("local_clipboard_read_failed", error.message || String(error));
     return state.localClipboard;
   }
 }
 
 async function writeLocalClipboard(payload) {
+  if (!canUseBrowserClipboard()) {
+    return false;
+  }
   const normalized = normalizeClipboardPayload(payload);
   if (navigator.clipboard?.write && normalized.image_png_b64) {
     const items = {};
@@ -4304,11 +4689,16 @@ async function writeLocalClipboard(payload) {
     throw new Error("Browser clipboard write is unavailable");
   }
   updateClipboardState("local", normalized, { announce: true });
+  return true;
 }
 
 async function pasteLocalClipboardToRemote() {
   if (!isConnected()) {
     showToast("paste_unavailable", "Connect to the server first");
+    return;
+  }
+  if (!canUseBrowserClipboard()) {
+    setStatus("Focus window before reading clipboard");
     return;
   }
   const payload = await refreshLocalClipboard();
@@ -4326,9 +4716,17 @@ async function copyRemoteClipboardToLocal() {
     return;
   }
   try {
-    await writeLocalClipboard(state.remoteClipboard);
+    const copied = await writeLocalClipboard(state.remoteClipboard);
+    if (!copied) {
+      setStatus("Focus window before copying");
+      return;
+    }
     showToast("clipboard_copied", "Remote clipboard copied locally");
   } catch (error) {
+    if (isClipboardFocusError(error)) {
+      setStatus("Focus window before copying");
+      return;
+    }
     showToast("local_clipboard_write_failed", error.message || String(error));
   }
 }
@@ -4419,6 +4817,7 @@ function initControls() {
   fpsInput.addEventListener("input", persistCurrentSettings);
   fpsInput.addEventListener("change", persistCurrentSettings);
   encoderLatencySelect.addEventListener("change", persistCurrentSettings);
+  encoderQualitySelect.addEventListener("change", persistCurrentSettings);
   videoScaleSelect.addEventListener("change", persistCurrentSettings);
   gopMsInput.addEventListener("input", persistCurrentSettings);
   gopMsInput.addEventListener("change", persistCurrentSettings);
@@ -4453,8 +4852,29 @@ function initControls() {
       setActiveTab(button.dataset.tabTarget || "status");
     });
   }
+  errorPanel.addEventListener("toggle", () => {
+    if (errorPanel.open) {
+      controlPanel.open = false;
+      transferPanel.open = false;
+      releaseInput();
+    }
+  });
+  errorClear.addEventListener("click", clearErrors);
   controlPanel.addEventListener("toggle", () => {
+    if (controlPanel.open && transferPanel.open) {
+      transferPanel.open = false;
+    }
+    if (controlPanel.open && errorPanel.open) {
+      errorPanel.open = false;
+    }
     renderAudioBufferMetric();
+  });
+  transferPanel.addEventListener("toggle", () => {
+    if (transferPanel.open) {
+      controlPanel.open = false;
+      errorPanel.open = false;
+      releaseInput();
+    }
   });
   webclientsToggle.addEventListener("click", () => {
     setWebclientsManagerOpen(!state.webclientsManagerOpen);
@@ -4464,7 +4884,9 @@ function initControls() {
   });
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
-  micToggle.addEventListener("click", toggleMicrophone);
+  micToggle.addEventListener("click", toggleMicDeviceMenu);
+  micDeviceMenu.addEventListener("click", (event) => event.stopPropagation());
+  audioToggle.addEventListener("click", toggleServerAudio);
   cameraToggle.addEventListener("click", toggleCamera);
   uploadAction.addEventListener("click", () => uploadInput.click());
   uploadInput.addEventListener("change", () => {
@@ -4516,8 +4938,10 @@ function initControls() {
     }
   });
   document.addEventListener("pointerdown", (event) => {
-    void primeAudioPlayback();
-    if (event.target instanceof HTMLElement && event.target.closest("#control-panel")) {
+    if (!(event.target instanceof HTMLElement && event.target.closest("#audio-toggle"))) {
+      void primeAudioPlayback();
+    }
+    if (event.target instanceof HTMLElement && event.target.closest("#error-panel, #control-panel, #transfer-panel")) {
       releaseInput();
     }
   });
@@ -4582,7 +5006,9 @@ function initControls() {
     sendWheelDelta(event.deltaX, event.deltaY, event.deltaMode);
   }, { passive: false });
   window.addEventListener("keydown", (event) => {
-    void primeAudioPlayback();
+    if (!(event.target instanceof HTMLElement && event.target.closest("#audio-toggle"))) {
+      void primeAudioPlayback();
+    }
     if (isReleaseInputChord(event)) {
       event.preventDefault();
       releaseInput();
@@ -4633,6 +5059,19 @@ function initControls() {
   window.addEventListener("resize", applyCanvasZoom);
   window.visualViewport?.addEventListener("resize", applyCanvasZoom);
   window.addEventListener("blur", releaseInput);
+  document.addEventListener("click", (event) => {
+    if (!state.micDeviceMenuOpen) return;
+    if (micToggle.contains(event.target) || micDeviceMenu.contains(event.target)) return;
+    closeMicDeviceMenu();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      closeMicDeviceMenu();
+    }
+  });
+  navigator.mediaDevices?.addEventListener?.("devicechange", () => {
+    void refreshMicDevices({ silent: true });
+  });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       releaseInput();
@@ -4679,7 +5118,9 @@ initVideoRenderer();
 initControls();
 void removeServiceWorker();
 renderMicToggle();
+renderAudioToggle();
 renderCameraToggle();
+void refreshMicDevices({ silent: true });
 setInterval(renderAudioBufferMetric, 1000);
 setInterval(monitorConnectionHealth, HEALTH_WATCHDOG_INTERVAL_MS);
 setInterval(refreshWebClients, 3000);

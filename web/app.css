@@ -264,15 +264,157 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   pointer-events: auto;
 }
 
-.control-panel {
+.dock-menu-anchor {
+  position: relative;
+  display: grid;
+}
+
+.device-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 12px);
+  z-index: 2;
+  width: min(300px, calc(100vw - 16px));
+  max-height: min(320px, calc(100vh - 112px));
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(18, 29, 34, 0.98), rgba(9, 14, 17, 0.98)),
+    var(--panel);
+  border: 1px solid rgba(190, 221, 234, 0.14);
+  box-shadow: var(--shadow);
+}
+
+.device-menu-item {
+  width: 100%;
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  text-align: left;
+  box-shadow: none;
+}
+
+.device-menu-item:hover,
+.device-menu-item:active {
+  transform: none;
+}
+
+.device-menu-item.is-active {
+  border-color: rgba(141, 230, 255, 0.32);
+  background: rgba(141, 230, 255, 0.12);
+}
+
+.device-menu-item.is-danger {
+  color: var(--danger);
+  border-color: rgba(255, 111, 111, 0.22);
+  background: rgba(255, 111, 111, 0.08);
+}
+
+.device-menu-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.device-menu-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.82rem;
+}
+
+.device-menu-meta {
+  color: var(--accent);
+  font-size: 0.68rem;
+}
+
+.error-panel,
+.control-panel,
+.transfer-panel {
   position: relative;
   z-index: 1;
   border-radius: 999px;
   overflow: visible;
 }
 
-.control-card {
+.error-card,
+.control-card,
+.transfer-card {
   display: none;
+}
+
+.error-panel[open] .error-card {
+  position: fixed;
+  left: var(--dock-edge);
+  bottom: calc(var(--dock-bottom) + var(--fab-size) + 20px);
+  width: min(460px, calc(100vw - 16px));
+  max-height: min(420px, calc(100vh - 112px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px;
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(34, 18, 18, 0.98), rgba(13, 8, 8, 0.98)),
+    var(--panel);
+  border: 1px solid rgba(255, 111, 111, 0.32);
+  box-shadow: var(--shadow);
+  font-size: 12.5px;
+}
+
+.error-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.error-list {
+  display: grid;
+  gap: 8px;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+
+.error-item {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(30, 10, 10, 0.72);
+  border: 1px solid rgba(255, 111, 111, 0.22);
+}
+
+.error-item-code {
+  color: var(--danger);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.error-item-message {
+  color: var(--text);
+  font-size: 0.78rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.error-item-time {
+  color: var(--muted);
+  font-size: 0.68rem;
 }
 
 .control-panel[open] .control-card {
@@ -295,10 +437,37 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   font-size: 12.5px;
 }
 
+.transfer-panel[open] .transfer-card {
+  position: fixed;
+  left: var(--dock-edge);
+  bottom: calc(var(--dock-bottom) + var(--fab-size) + 20px);
+  width: min(440px, calc(100vw - 16px));
+  max-height: min(560px, calc(100vh - 112px));
+  display: grid;
+  padding: 14px;
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(18, 29, 34, 0.98), rgba(9, 14, 17, 0.98)),
+    var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--shadow);
+  font-size: 12.5px;
+}
+
+.transfer-content {
+  display: grid;
+  min-height: 0;
+  gap: 10px;
+  overflow: auto;
+  align-content: start;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+
 .tab-row {
   grid-row: 2;
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
   margin: 0;
@@ -551,6 +720,23 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.clipboard-card.is-flashing {
+  animation: clipboard-flash 2s ease-out;
+}
+
+@keyframes clipboard-flash {
+  0%,
+  100% {
+    border-color: rgba(255, 255, 255, 0.08);
+    box-shadow: none;
+  }
+  12%,
+  72% {
+    border-color: rgba(141, 230, 255, 0.66);
+    box-shadow: 0 0 0 1px rgba(141, 230, 255, 0.24), 0 0 18px rgba(141, 230, 255, 0.16);
+  }
+}
+
 .clipboard-header {
   display: flex;
   justify-content: space-between;
@@ -694,17 +880,24 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   font-size: 0.76rem;
 }
 
+.error-card button,
 .control-card select,
 .control-card input,
-.control-card button {
+.control-card button,
+.transfer-card input,
+.transfer-card button {
   font-size: 0.78rem;
 }
 
-.control-card button:not(.tool-toggle) {
+.error-card button:not(.tool-toggle),
+.control-card button:not(.tool-toggle),
+.transfer-card button:not(.tool-toggle) {
   padding: 8px 10px;
 }
 
-.control-card button:disabled {
+.error-card button:disabled,
+.control-card button:disabled,
+.transfer-card button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
   transform: none;
@@ -818,18 +1011,48 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .tool-toggle .mic-off-slash,
-.tool-toggle .camera-off-slash {
+.tool-toggle .camera-off-slash,
+.tool-toggle .sound-off-slash {
   opacity: 0;
   transition: opacity 120ms ease;
 }
 
 #mic-toggle:not(.is-active) .mic-off-slash,
-#camera-toggle:not(.is-active) .camera-off-slash {
+#camera-toggle:not(.is-active) .camera-off-slash,
+#audio-toggle:not(.is-active) .sound-off-slash {
   opacity: 1;
 }
 
-.control-panel[open] .tool-toggle {
+.error-panel[open] .tool-toggle,
+.control-panel[open] .tool-toggle,
+.transfer-panel[open] .tool-toggle {
   background: rgba(18, 31, 35, 0.96);
+}
+
+.error-toggle {
+  border-color: rgba(255, 111, 111, 0.32);
+  position: relative;
+}
+
+.error-toggle svg {
+  stroke: var(--danger);
+}
+
+.error-count {
+  position: absolute;
+  right: -2px;
+  top: -2px;
+  min-width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 0.66rem;
+  line-height: 1;
+  font-weight: 700;
 }
 
 .mobile-keyboard-trigger {
@@ -877,17 +1100,33 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   :root {
     --dock-edge: 6px;
     --dock-bottom: 4px;
-    --fab-size: 48px;
-    --dock-gap: 6px;
+    --fab-size: 44px;
+    --dock-gap: 5px;
   }
 
   .tool-dock {
     max-width: calc(100vw - 12px);
-    gap: 6px;
+    gap: var(--dock-gap);
     padding: 5px;
   }
 
   .control-panel[open] .control-card {
+    left: 6px;
+    bottom: calc(var(--dock-bottom) + var(--fab-size) + 16px);
+    width: calc(100vw - 12px);
+    max-height: calc(100vh - 96px);
+    border-radius: 16px;
+  }
+
+  .error-panel[open] .error-card {
+    left: 6px;
+    bottom: calc(var(--dock-bottom) + var(--fab-size) + 16px);
+    width: calc(100vw - 12px);
+    max-height: calc(100vh - 96px);
+    border-radius: 16px;
+  }
+
+  .transfer-panel[open] .transfer-card {
     left: 6px;
     bottom: calc(var(--dock-bottom) + var(--fab-size) + 16px);
     width: calc(100vw - 12px);
@@ -936,4 +1175,20 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
     grid-template-columns: 1fr;
   }
 
+}
+
+@media (max-width: 360px) {
+  :root {
+    --fab-size: 38px;
+    --dock-gap: 4px;
+  }
+
+  .tool-dock {
+    padding: 4px;
+  }
+
+  .tool-toggle svg {
+    width: 20px;
+    height: 20px;
+  }
 }

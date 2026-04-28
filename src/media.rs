@@ -35,7 +35,7 @@ pub struct MediaHub {
 
 struct VideoHub {
     server: ServerConfig,
-    frames: watch::Sender<Option<StreamFrame>>,
+    frames: broadcast::Sender<StreamFrame>,
     state: watch::Sender<Option<ActiveVideoState>>,
     runtime: Mutex<VideoRuntime>,
 }
@@ -72,7 +72,7 @@ struct AudioProcess {
 }
 
 pub struct VideoLease {
-    pub rx: watch::Receiver<Option<StreamFrame>>,
+    rx: Option<broadcast::Receiver<StreamFrame>>,
     pub state_rx: watch::Receiver<Option<ActiveVideoState>>,
     release: Option<ReleaseVideo>,
 }
@@ -93,7 +93,7 @@ struct ReleaseAudio {
 
 impl MediaHub {
     pub fn new(server: ServerConfig) -> Self {
-        let (video_frames, _) = watch::channel(None);
+        let (video_frames, _) = broadcast::channel(256);
         let (video_state, _) = watch::channel(None);
         let (audio_frames, _) = broadcast::channel(256);
         let (audio_state, _) = watch::channel(None);
@@ -157,6 +157,7 @@ impl MediaHub {
 
 impl VideoHub {
     async fn acquire(self: &Arc<Self>, requested: StreamConfig) -> Result<VideoLease> {
+        let rx = self.frames.subscribe();
         let mut runtime = self.runtime.lock().await;
         if !runtime.configured {
             runtime.desired_config = requested;
@@ -168,7 +169,7 @@ impl VideoHub {
             return Err(err);
         }
         Ok(VideoLease {
-            rx: self.frames.subscribe(),
+            rx: Some(rx),
             state_rx: self.state.subscribe(),
             release: Some(ReleaseVideo {
                 hub: Arc::clone(self),
@@ -206,7 +207,6 @@ impl VideoHub {
                 "restarting shared video capture"
             );
             self.state.send_replace(None);
-            self.frames.send_replace(None);
             if active_exited {
                 drain_video_child(
                     "video",
@@ -244,7 +244,6 @@ impl VideoHub {
             }
             Err(err) => {
                 self.state.send_replace(None);
-                self.frames.send_replace(None);
                 Err(err)
             }
         }
@@ -313,7 +312,6 @@ impl VideoHub {
             let removed = runtime.active.take();
             if removed.is_some() {
                 self.state.send_replace(None);
-                self.frames.send_replace(None);
             }
             removed
         };
@@ -334,7 +332,6 @@ impl VideoHub {
             runtime.subscribers = 0;
             let removed = runtime.active.take();
             self.state.send_replace(None);
-            self.frames.send_replace(None);
             removed
         };
         if let Some(active) = removed {
@@ -476,6 +473,12 @@ impl AudioHub {
             );
             shutdown_audio_child(Arc::clone(&active.child), &active.state.config).await;
         }
+    }
+}
+
+impl VideoLease {
+    pub fn take_video_rx(&mut self) -> Option<broadcast::Receiver<StreamFrame>> {
+        self.rx.take()
     }
 }
 

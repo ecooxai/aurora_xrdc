@@ -25,13 +25,24 @@
 
       <section class="bottom-dock">
         <div class="tool-dock" aria-label="Session tools">
-          <button id="mic-toggle" class="tool-toggle" type="button" aria-label="Enable microphone" aria-pressed="false">
+          <div class="dock-menu-anchor">
+            <button id="mic-toggle" class="tool-toggle" type="button" aria-label="Choose microphone" aria-pressed="false" aria-haspopup="menu" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path class="mic-off-slash" d="M5 5l14 14" />
+                <rect x="9" y="3.5" width="6" height="10" rx="3" />
+                <path d="M6.5 10.5a5.5 5.5 0 0 0 11 0" />
+                <path d="M12 16v4.5" />
+                <path d="M8.5 20.5h7" />
+              </svg>
+            </button>
+            <div id="mic-device-menu" class="device-menu hidden" role="menu" aria-label="Microphone devices"></div>
+          </div>
+          <button id="audio-toggle" class="tool-toggle is-active" type="button" aria-label="Mute server audio" aria-pressed="true">
             <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path class="mic-off-slash" d="M5 5l14 14" />
-              <rect x="9" y="3.5" width="6" height="10" rx="3" />
-              <path d="M6.5 10.5a5.5 5.5 0 0 0 11 0" />
-              <path d="M12 16v4.5" />
-              <path d="M8.5 20.5h7" />
+              <path d="M4 9.5h3.5L12.5 5v14l-5-4.5H4z" />
+              <path d="M16 9a4.5 4.5 0 0 1 0 6" />
+              <path d="M18.5 6.5a8.5 8.5 0 0 1 0 11" />
+              <path class="sound-off-slash" d="M5 5l14 14" />
             </svg>
           </button>
           <button id="camera-toggle" class="tool-toggle" type="button" aria-label="Enable camera uplink" aria-pressed="false">
@@ -49,6 +60,23 @@
               <path d="M8 16.5h8" />
             </svg>
           </button>
+          <details id="error-panel" class="error-panel hidden">
+            <summary id="error-trigger" class="tool-toggle error-toggle" aria-label="Show errors">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="8.5" />
+                <path d="M12 7.5v5" />
+                <path d="M12 16.5h.01" />
+              </svg>
+              <span id="error-count" class="error-count">0</span>
+            </summary>
+            <div class="error-card">
+              <div class="error-card-header">
+                <span>Errors</span>
+                <button id="error-clear" class="secondary" type="button">Clear</button>
+              </div>
+              <div id="error-list" class="error-list"></div>
+            </div>
+          </details>
           <details id="control-panel" class="control-panel">
             <summary id="control-trigger" class="tool-toggle control-toggle" aria-label="Controls">
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -65,7 +93,6 @@
                 <button id="tab-button-audio" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-audio" data-tab-target="audio">Audio</button>
                 <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Settings</button>
                 <button id="tab-button-performance" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-performance" data-tab-target="performance">Performance</button>
-                <button id="tab-button-transfer" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-transfer" data-tab-target="transfer">Transfer</button>
               </div>
               <section id="tab-panel-status" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-button-status">
                 <div class="status-grid">
@@ -262,8 +289,8 @@
                 </div>
                 <div class="menu-grid">
                   <label>Bitrate
-                    <input id="bitrate" type="range" min="128" max="12000" step="16" value="1024" />
-                    <span id="bitrate-value">1024 kbps</span>
+                    <input id="bitrate" type="range" min="128" max="25000" step="16" value="3000" />
+                    <span id="bitrate-value">3000 kbps</span>
                   </label>
                   <label>FPS
                     <input id="fps" type="range" min="1" max="60" step="1" value="30" />
@@ -274,6 +301,13 @@
                       <option value="ultra_low">Ultra low</option>
                       <option value="low" selected>Low</option>
                       <option value="balanced">Balanced</option>
+                    </select>
+                  </label>
+                  <label>Quality detail
+                    <select id="encoder-quality">
+                      <option value="fast">Fast</option>
+                      <option value="balanced" selected>Balanced</option>
+                      <option value="sharp_text">Sharp text</option>
                     </select>
                   </label>
                   <label>Stream size
@@ -306,7 +340,19 @@
                   </label>
                 </div>
               </section>
-              <section id="tab-panel-transfer" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-transfer" hidden>
+            </div>
+          </details>
+          <details id="transfer-panel" class="transfer-panel">
+            <summary id="transfer-trigger" class="tool-toggle transfer-toggle" aria-label="Transfer">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3v12" />
+                <path d="M8 7l4-4 4 4" />
+                <path d="M4.5 14.5v3.2a2.8 2.8 0 0 0 2.8 2.8h9.4a2.8 2.8 0 0 0 2.8-2.8v-3.2" />
+                <path d="M8 17.5h8" />
+              </svg>
+            </summary>
+            <div class="transfer-card">
+              <section id="transfer-content" class="transfer-content" aria-label="Transfer">
                 <div class="upload-stack">
                   <button id="upload-action" type="button">Upload File</button>
                   <input id="upload-input" type="file" class="hidden" />

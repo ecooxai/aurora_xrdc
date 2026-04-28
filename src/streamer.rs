@@ -2,7 +2,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
-use tokio::{io::AsyncReadExt, process::Child, sync::watch};
+use tokio::{io::AsyncReadExt, process::Child, sync::broadcast};
 
 use crate::{
     annexb::{AnnexBParser, EncodedFrame, IvfParser},
@@ -19,7 +19,7 @@ pub struct StreamFrame {
 pub async fn start(
     server: ServerConfig,
     config: StreamConfig,
-    tx: watch::Sender<Option<StreamFrame>>,
+    tx: broadcast::Sender<StreamFrame>,
 ) -> Result<(EncoderChoice, Child)> {
     let encoder = choose_encoder(config.codec, config.encode_preference).await?;
     let mut child = spawn_capture(&server, &config, &encoder)?;
@@ -27,7 +27,8 @@ pub async fn start(
     tokio::spawn(async move {
         let mut buf = [0u8; 64 * 1024];
         let mut h26x = AnnexBParser::new(config.codec);
-        let mut ivf = IvfParser::new();
+        let mut ivf = IvfParser::new(config.codec);
+        let mut sequence = 0u32;
         loop {
             let read = match stdout.read(&mut buf).await {
                 Ok(0) => break,
@@ -38,8 +39,10 @@ pub async fn start(
                 CodecKind::Vp8 | CodecKind::Vp9 | CodecKind::Av1 => ivf.push(&buf[..read]),
                 CodecKind::H264 | CodecKind::H265 => h26x.push(&buf[..read]),
             };
-            for frame in frames {
-                tx.send_replace(Some(pack_frame(frame)));
+            for mut frame in frames {
+                frame.sequence = sequence;
+                sequence = sequence.wrapping_add(1);
+                let _ = tx.send(pack_frame(frame));
             }
         }
     });
@@ -48,10 +51,11 @@ pub async fn start(
 
 fn pack_frame(frame: EncodedFrame) -> StreamFrame {
     let sent_at_ms = now_ms();
-    let mut packet = Vec::with_capacity(14 + frame.data.len());
+    let mut packet = Vec::with_capacity(18 + frame.data.len());
     packet.push(1);
     packet.push(u8::from(frame.keyframe));
     packet.extend_from_slice(&sent_at_ms.to_le_bytes());
+    packet.extend_from_slice(&frame.sequence.to_le_bytes());
     packet.extend_from_slice(&(frame.data.len() as u32).to_le_bytes());
     packet.extend_from_slice(&frame.data);
     StreamFrame {
