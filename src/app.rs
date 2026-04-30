@@ -7,6 +7,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use axum_server::{Handle, tls_rustls::RustlsConfig};
 use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -288,6 +289,7 @@ struct CameraStopRequest {
 
 pub async fn run(server: ServerConfig) -> Result<()> {
     let bind = server.bind.clone();
+    let tls_paths = server.tls_cert.clone().zip(server.tls_key.clone());
     let camera = CameraRelay::new();
     let media = MediaHub::new(server.clone());
     if let Err(err) = ffmpeg::warm_audio_stack().await {
@@ -334,27 +336,67 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let listen_urls = listeners
         .iter()
-        .map(|listener| listener.local_addr().map(|addr| format!("http://{addr}")))
+        .map(|listener| {
+            listener.local_addr().map(|addr| {
+                let scheme = if tls_paths.is_some() { "https" } else { "http" };
+                format!("{scheme}://{addr}")
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     info!("listening on {}", listen_urls.join(", "));
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = shutdown_tx.send(true);
-    });
-    let result = try_join_all(listeners.into_iter().map(|listener| {
-        let app = app.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-        async move {
-            axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+    let result = if let Some((cert_path, key_path)) = tls_paths {
+        let tls_config = RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
+        let handles = listeners
+            .iter()
+            .map(|_| Handle::new())
+            .collect::<Vec<Handle<SocketAddr>>>();
+        let shutdown_handles = handles.clone();
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            for handle in shutdown_handles {
+                handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            }
+        });
+        try_join_all(
+            listeners
+                .into_iter()
+                .zip(handles)
+                .map(|(listener, handle)| {
+                    let app = app.clone();
+                    let tls_config = tls_config.clone();
+                    async move {
+                        let listener = listener.into_std()?;
+                        axum_server::from_tcp_rustls(listener, tls_config)?
+                            .handle(handle)
+                            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                            .await
+                    }
+                }),
+        )
+        .await
+    } else {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            let _ = shutdown_tx.send(true);
+        });
+        try_join_all(listeners.into_iter().map(|listener| {
+            let app = app.clone();
+            let mut shutdown_rx = shutdown_rx.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
                 .with_graceful_shutdown(async move {
                     let _ = shutdown_rx.changed().await;
                 })
                 .into_future()
                 .await
-        }
-    }))
-    .await;
+            }
+        }))
+        .await
+    };
     media.shutdown().await;
     result?;
     Ok(())

@@ -299,6 +299,8 @@ pub struct ServerConfig {
     pub display: String,
     pub upload_dir: String,
     pub passwd: String,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
 }
 
 impl ServerConfig {
@@ -328,6 +330,8 @@ impl ServerConfig {
                 .to_string_lossy()
                 .into_owned(),
             passwd: String::new(),
+            tls_cert: std::env::var("VIBE_RDESK_TLS_CERT").ok(),
+            tls_key: std::env::var("VIBE_RDESK_TLS_KEY").ok(),
         }
     }
 
@@ -353,6 +357,17 @@ impl ServerConfig {
                     let value = args.next().context("missing value for -p/--port")?;
                     let port = parse_port(&value)?;
                     server.bind = bind_with_port(&server.bind, port);
+                }
+                "--localhost" => {
+                    let value = args.next().context("missing value for --localhost")?;
+                    match value.as_str() {
+                        "yes" => {
+                            let port = first_bind_port(&server.bind).unwrap_or(8001);
+                            server.bind = localhost_bind(port);
+                        }
+                        "no" => {}
+                        _ => anyhow::bail!("--localhost must be yes or no"),
+                    }
                 }
                 "--passwd" => {
                     let value = args.next().context("missing value for --passwd")?;
@@ -423,6 +438,16 @@ fn bind_with_port(bind: &str, port: u16) -> String {
 
 fn default_bind(port: u16) -> String {
     format!("0.0.0.0:{port},[::]:{port}")
+}
+
+fn localhost_bind(port: u16) -> String {
+    format!("127.0.0.1:{port},[::1]:{port}")
+}
+
+fn first_bind_port(bind: &str) -> Option<u16> {
+    split_bind_list(bind)
+        .into_iter()
+        .find_map(|bind| bind.rsplit_once(':')?.1.parse::<u16>().ok())
 }
 
 fn split_bind_list(bind: &str) -> Vec<&str> {
@@ -558,6 +583,35 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.bind, "0.0.0.0:9000,[::]:9000");
         assert_eq!(cfg.passwd, "secret");
+    }
+
+    #[test]
+    fn server_config_applies_localhost_override() {
+        let cfg = ServerConfig::from_args_with(
+            [
+                "vibe_rdesk",
+                "--port",
+                "8443",
+                "--localhost",
+                "yes",
+                "--passwd",
+                "secret",
+            ],
+            ServerConfig::from_env_with(None, None, None, None),
+        )
+        .unwrap();
+        assert_eq!(cfg.bind, "127.0.0.1:8443,[::1]:8443");
+        assert_eq!(cfg.passwd, "secret");
+    }
+
+    #[test]
+    fn server_config_rejects_invalid_localhost_value() {
+        let err = ServerConfig::from_args_with(
+            ["vibe_rdesk", "--localhost", "maybe", "--passwd", "secret"],
+            ServerConfig::from_env_with(None, None, None, None),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--localhost"));
     }
 
     #[test]

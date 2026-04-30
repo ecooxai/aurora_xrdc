@@ -37,7 +37,13 @@ XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
 XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
-DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:8001,[::]:8001}"
+DEFAULT_HTTPS_PORT=18443
+DEFAULT_HTTP_PORT=18080
+VIBE_RDESK_BIND_WAS_SET=0
+if [[ -n "${VIBE_RDESK_BIND+x}" ]]; then
+    VIBE_RDESK_BIND_WAS_SET=1
+fi
+DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:${DEFAULT_HTTPS_PORT},[::]:${DEFAULT_HTTPS_PORT}}"
 export VIBE_RDESK_BIND="${DEFAULT_BIND}"
 DEV_LOG_UID="${SUDO_UID:-$(id -u)}"
 DEV_LOG_DIR="${VIBE_RDESK_LOG_DIR:-/tmp/vibe_rdesk-${DEV_LOG_UID}}"
@@ -52,6 +58,11 @@ JWM_PID=""
 XTERM_PID=""
 PULSE_PID=""
 PIPEWIRE_LOOPBACK_PID=""
+HTTPS_ENABLED="yes"
+
+SSL_DIR="${VIBE_RDESK_SSL_DIR:-ssl_keys}"
+SSL_CERT="${VIBE_RDESK_TLS_CERT:-${SSL_DIR}/server.crt}"
+SSL_KEY="${VIBE_RDESK_TLS_KEY:-${SSL_DIR}/server.key}"
 
 require_passwd_arg() {
     local args=("$@")
@@ -60,7 +71,7 @@ require_passwd_arg() {
         case "${args[$i]}" in
             --passwd)
                 if (( i + 1 >= ${#args[@]} )) || [[ -z "${args[$((i + 1))]}" ]]; then
-                    echo "[dev] --passwd requires a non-empty value. Start with: ./dev.sh --passwd <password>" >&2
+                    echo "[run] --passwd requires a non-empty value. Start with: ./run.sh --passwd <password>" >&2
                     exit 1
                 fi
                 return 0
@@ -68,7 +79,7 @@ require_passwd_arg() {
         esac
     done
 
-    echo "[dev] missing required --passwd. Start with: ./dev.sh --passwd <password>" >&2
+    echo "[run] missing required --passwd. Start with: ./run.sh --passwd <password>" >&2
     exit 1
 }
 
@@ -83,34 +94,54 @@ first_bind_port() {
             return 0
         fi
     done
-    printf '8001\n'
+    if [[ "${HTTPS_ENABLED}" == "yes" ]]; then
+        printf '%s\n' "${DEFAULT_HTTPS_PORT}"
+    else
+        printf '%s\n' "${DEFAULT_HTTP_PORT}"
+    fi
 }
 
 configure_bind_args() {
     local args=("$@")
     local port=""
+    local port_explicit="no"
     local localhost="no"
     local i value
 
     for ((i = 0; i < ${#args[@]}; i++)); do
         case "${args[$i]}" in
+            --https)
+                if (( i + 1 >= ${#args[@]} )); then
+                    echo "[run] --https requires yes or no" >&2
+                    exit 1
+                fi
+                value="${args[$((i + 1))]}"
+                case "${value}" in
+                    yes|no) HTTPS_ENABLED="${value}" ;;
+                    *)
+                        echo "[run] --https must be yes or no" >&2
+                        exit 1
+                        ;;
+                esac
+                ;;
             -p|--port)
                 if (( i + 1 >= ${#args[@]} )) || [[ ! "${args[$((i + 1))]}" =~ ^[0-9]+$ ]]; then
-                    echo "[dev] -p/--port requires a numeric port value" >&2
+                    echo "[run] -p/--port requires a numeric port value" >&2
                     exit 1
                 fi
                 port="${args[$((i + 1))]}"
+                port_explicit="yes"
                 ;;
             --localhost)
                 if (( i + 1 >= ${#args[@]} )); then
-                    echo "[dev] --localhost requires yes or no" >&2
+                    echo "[run] --localhost requires yes or no" >&2
                     exit 1
                 fi
                 value="${args[$((i + 1))]}"
                 case "${value}" in
                     yes|no) localhost="${value}" ;;
                     *)
-                        echo "[dev] --localhost must be yes or no" >&2
+                        echo "[run] --localhost must be yes or no" >&2
                         exit 1
                         ;;
                 esac
@@ -119,12 +150,18 @@ configure_bind_args() {
     done
 
     if [[ -z "${port}" ]]; then
-        port="$(first_bind_port "${VIBE_RDESK_BIND}")"
+        if [[ "${VIBE_RDESK_BIND_WAS_SET}" == "1" ]]; then
+            port="$(first_bind_port "${VIBE_RDESK_BIND}")"
+        elif [[ "${HTTPS_ENABLED}" == "yes" ]]; then
+            port="${DEFAULT_HTTPS_PORT}"
+        else
+            port="${DEFAULT_HTTP_PORT}"
+        fi
     fi
 
     if [[ "${localhost}" == "yes" ]]; then
         export VIBE_RDESK_BIND="127.0.0.1:${port},[::1]:${port}"
-    elif [[ -n "${port}" ]]; then
+    elif [[ "${port_explicit}" == "yes" || "${VIBE_RDESK_BIND_WAS_SET}" == "0" ]]; then
         export VIBE_RDESK_BIND="0.0.0.0:${port},[::]:${port}"
     fi
 }
@@ -134,14 +171,75 @@ show_startup_help() {
     local port
     port="$(first_bind_port "${VIBE_RDESK_BIND}")"
 
+    local server_label="HTTPS"
+    local reminder="use https://, not http://."
+    if [[ "${protocol}" == "http" ]]; then
+        server_label="HTTP"
+        reminder="using normal http:// because --https no was specified."
+    fi
+
     cat <<EOF
-[dev] starting vibe_rdesk development server
-[dev] URL: ${protocol}://127.0.0.1:${port}/
-[dev] LAN URL: ${protocol}://<this-machine-ip>:${port}/
-[dev] bind: ${VIBE_RDESK_BIND}
-[dev] default is all IPv4/IPv6 interfaces; use --localhost yes for loopback only.
+[run] starting vibe_rdesk ${server_label} server
+[run] URL: ${protocol}://127.0.0.1:${port}/
+[run] LAN URL: ${protocol}://<this-machine-ip>:${port}/
+[run] bind: ${VIBE_RDESK_BIND}
+[run] ${reminder} Default is all IPv4/IPv6 interfaces; use --localhost yes for loopback only.
 EOF
     sleep "${VIBE_RDESK_HELP_SECONDS:-3}"
+}
+
+ensure_tls_keys() {
+    if [[ -f "${SSL_CERT}" && -f "${SSL_KEY}" ]]; then
+        echo "[run] using TLS certificate ${SSL_CERT}"
+        return 0
+    fi
+
+    if [[ -f "${SSL_CERT}" || -f "${SSL_KEY}" ]]; then
+        echo "[run] TLS certificate/key pair is incomplete; expected both ${SSL_CERT} and ${SSL_KEY}" >&2
+        exit 1
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "[run] openssl is required to generate test TLS keys in ${SSL_DIR}" >&2
+        exit 1
+    fi
+
+    mkdir -p "${SSL_DIR}"
+    chmod 700 "${SSL_DIR}" 2>/dev/null || true
+
+    local openssl_config="${SSL_DIR}/server.openssl.cnf"
+    cat >"${openssl_config}" <<'EOF'
+[req]
+default_bits = 2048
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+
+[dn]
+CN = vibe-rdesk-local
+
+[v3_req]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = vibe-rdesk-local
+IP.1 = 127.0.0.1
+IP.2 = ::1
+EOF
+
+    echo "[run] generating self-signed test TLS certificate in ${SSL_DIR}"
+    openssl req \
+        -x509 \
+        -newkey rsa:2048 \
+        -sha256 \
+        -days "${VIBE_RDESK_TEST_CERT_DAYS:-3650}" \
+        -nodes \
+        -keyout "${SSL_KEY}" \
+        -out "${SSL_CERT}" \
+        -config "${openssl_config}" \
+        >/dev/null 2>&1
+    chmod 600 "${SSL_KEY}" 2>/dev/null || true
 }
 
 normalize_display() {
@@ -785,25 +883,20 @@ cleanup() {
 }
 
 build_and_run() {
-    while true; do
-        echo "[dev] building..."
-        if ./test.sh; then
-            break
-        fi
-
-        echo "[dev] build failed, retrying in ${REBUILD_RETRY_SECONDS}s..."
-        sleep "${REBUILD_RETRY_SECONDS}"
-    done
-
-    if [[ -n "${APP_PID}" ]] && kill -0 "${APP_PID}" 2>/dev/null; then
-        echo "[dev] stopping running app..."
-        kill "${APP_PID}" 2>/dev/null || true
-        wait "${APP_PID}" 2>/dev/null || true
+    echo "[run] building optimized release binary..."
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-1}"
+    export CARGO_PROFILE_RELEASE_INCREMENTAL="${CARGO_PROFILE_RELEASE_INCREMENTAL:-false}"
+    export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-thin}"
+    export CARGO_PROFILE_RELEASE_PANIC="${CARGO_PROFILE_RELEASE_PANIC:-abort}"
+    if [[ "${VIBE_RDESK_TARGET_CPU_NATIVE:-1}" == "1" ]]; then
+        export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
     fi
+    cargo build --release
 
-    echo "[dev] starting app..."
-    cargo run -- "$@" &
+    echo "[run] starting HTTPS app on ${VIBE_RDESK_BIND}"
+    target/release/vibe_rdesk "$@" &
     APP_PID=$!
+    wait "${APP_PID}"
 }
 
 wait_for_change_polling() {
@@ -825,7 +918,16 @@ trap cleanup EXIT INT TERM
 
 require_passwd_arg "$@"
 configure_bind_args "$@"
-show_startup_help "http"
+if [[ "${HTTPS_ENABLED}" == "yes" ]]; then
+    show_startup_help "https"
+    ensure_tls_keys
+    export VIBE_RDESK_TLS_CERT="${SSL_CERT}"
+    export VIBE_RDESK_TLS_KEY="${SSL_KEY}"
+else
+    show_startup_help "http"
+    unset VIBE_RDESK_TLS_CERT
+    unset VIBE_RDESK_TLS_KEY
+fi
 configure_sudo_audio_env
 ensure_dev_log_dir
 ensure_uinput_access
@@ -834,15 +936,3 @@ start_audio_server
 ensure_virtual_mic
 
 build_and_run "$@"
-
-while true; do
-    if command -v inotifywait >/dev/null 2>&1; then
-        inotifywait -qq -r -e modify -e create -e delete -e move "${WATCH_DIRS[@]}"
-    else
-        wait_for_change_polling
-    fi
-
-    echo "[dev] change detected, waiting ${DEBOUNCE_SECONDS}s before rebuild..."
-    sleep "${DEBOUNCE_SECONDS}"
-    build_and_run "$@"
-done

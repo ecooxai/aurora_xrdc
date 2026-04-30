@@ -326,7 +326,15 @@ async fn handle_video_socket(
         Some(audio_state_rx),
     ));
     let close_task = tokio::spawn(wait_for_socket_close(receiver));
-    wait_for_role_tasks("video", writer_task, send_task, close_task, out_tx, close_rx).await;
+    wait_for_role_tasks(
+        "video",
+        writer_task,
+        send_task,
+        close_task,
+        out_tx,
+        close_rx,
+    )
+    .await;
     Ok(())
 }
 
