@@ -901,19 +901,28 @@ async fn handle_client(
             None
         }
     };
-    let mut pointer_motion_injector = match UInputPointerInjector::connect() {
-        Ok(injector) => Some(injector),
-        Err(err) => {
-            warn!("uinput pointer motion unavailable, falling back to X11/xdotool: {err}");
-            None
+    let use_uinput = uinput_input_enabled();
+    let mut pointer_motion_injector = if use_uinput {
+        match UInputPointerInjector::connect() {
+            Ok(injector) => Some(injector),
+            Err(err) => {
+                warn!("uinput pointer motion unavailable, falling back to X11/xdotool: {err}");
+                None
+            }
         }
+    } else {
+        None
     };
-    let mut smooth_wheel_injector = match UInputWheelInjector::connect() {
-        Ok(injector) => Some(injector),
-        Err(err) => {
-            warn!("smooth uinput wheel unavailable, falling back to X11 wheel clicks: {err}");
-            None
+    let mut smooth_wheel_injector = if use_uinput {
+        match UInputWheelInjector::connect() {
+            Ok(injector) => Some(injector),
+            Err(err) => {
+                warn!("smooth uinput wheel unavailable, falling back to X11 wheel clicks: {err}");
+                None
+            }
         }
+    } else {
+        None
     };
     let mut pending_message = None;
     let mut key_watchdog = tokio::time::interval(KEY_STATE_WATCHDOG_INTERVAL);
@@ -1012,6 +1021,16 @@ fn should_wake_display_for_message(message: &ClientMessage) -> bool {
             | ClientMessage::PasteClipboard { .. }
             | ClientMessage::ResetInput
     )
+}
+
+fn uinput_input_enabled() -> bool {
+    match std::env::var("VIBE_RDESK_INPUT_BACKEND") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "x11" | "xdotool" | "no-uinput" | "nouinput" | "0" | "false" | "no"
+        ),
+        Err(_) => true,
+    }
 }
 
 fn is_pointer_motion_message(message: &ClientMessage) -> bool {

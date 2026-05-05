@@ -10,8 +10,8 @@ const VIEW_ZOOM_STEP_PERCENT = 10;
 const VIEW_ZOOM_MIN_PERCENT = 10;
 const VIEW_ZOOM_MAX_PERCENT = 300;
 const LATENCY_PROBE_INTERVAL_MS = 3000;
-const DEFAULT_LIVE_MEDIA_MAX_AGE_MS = 250;
-const DEFAULT_MEDIA_STALL_RESET_MS = 350;
+const DEFAULT_LIVE_MEDIA_MAX_AGE_MS = 2000;
+const DEFAULT_MEDIA_STALL_RESET_MS = 2500;
 const HIGH_LATENCY_RECONNECT_MS = 1500;
 const HIGH_LATENCY_RECONNECT_GRACE_MS = 5000;
 const HEALTH_WATCHDOG_INTERVAL_MS = 1000;
@@ -22,7 +22,7 @@ const TWO_FINGER_TAP_MOVE_PX = 24;
 const RECOVERY_TAP_WINDOW_MS = 1600;
 const RECOVERY_TAP_SAME_AREA_PX = 70;
 const KEY_STATE_SYNC_INTERVAL_MS = 500;
-const DEFAULT_MAX_VIDEO_DECODE_QUEUE = 4;
+const DEFAULT_MAX_VIDEO_DECODE_QUEUE = 6;
 const MAX_AUDIO_DECODE_QUEUE = 24;
 const AUDIO_MIN_BUFFER_SECONDS = 0.05;
 const AUDIO_UNDERRUN_RETRY_MS = 2000;
@@ -36,7 +36,8 @@ const AUDIO_TRIM_TARGET_EXTRA_SECONDS = 0.2;
 const AUDIO_GOOD_LATENCY_BUFFER_SECONDS = 0.75;
 const AUDIO_UNDERRUN_WARNING = "Audio buffer too small, pausing playback";
 const AAC_SAMPLES_PER_FRAME = 1024;
-const AUDIO_BASE_PLAYBACK_RATE = 0.9650;
+const AUDIO_BASE_PLAYBACK_RATE = 1.0000;
+const DEFAULT_AUDIO_LATENCY_MS = 400;
 const AUDIO_AUTO_CLOCK_STEP = 0.005;
 const AUDIO_AUTO_CLOCK_SLOW_TUNE_STEP = 0.0005;
 const AUDIO_AUTO_CLOCK_SLOW_TUNE_TARGET_EXTRA_SECONDS = 0.2;
@@ -353,9 +354,11 @@ const PERFORMANCE_PRESETS = {
     videoScale: "720p",
     gopMs: 1000,
     bufferMs: 1000,
-    staleDropMs: 400,
-    stallResetMs: 600,
-    maxDecodeQueue: 4,
+    audioLatencyMs: DEFAULT_AUDIO_LATENCY_MS,
+    audioClockRate: AUDIO_BASE_PLAYBACK_RATE,
+    staleDropMs: 2000,
+    stallResetMs: 2500,
+    maxDecodeQueue: 6,
   },
   quality: {
     codec: "h264",
@@ -1145,7 +1148,10 @@ function readSettingsFromControls() {
 
 function saveSettings(settings = readSettingsFromControls()) {
   try {
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+    const stored = { ...settings };
+    delete stored.audioLatencyMs;
+    delete stored.audioClockRate;
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(stored));
   } catch {
     // Ignore storage failures; the session still works for this visit.
   }
@@ -1155,8 +1161,11 @@ function loadStoredSettings() {
   try {
     const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
     if (!raw) return readSettingsFromControls();
+    const stored = JSON.parse(raw);
+    delete stored.audioLatencyMs;
+    delete stored.audioClockRate;
     return {
-      ...normalizeSettings(JSON.parse(raw)),
+      ...normalizeSettings(stored),
       audioMuted: false,
     };
   } catch {

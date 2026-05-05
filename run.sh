@@ -35,6 +35,9 @@ XVFB_SCREEN="${VIBE_RDESK_XVFB_SCREEN:-1280x720x24}"
 WINDOW_MANAGER_DELAY_SECONDS=2
 XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
 XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
+HEADLESS_LAUNCHER="${VIBE_RDESK_HEADLESS_LAUNCHER:-jwm}"
+HEADLESS_INPUT_BACKEND="${VIBE_RDESK_HEADLESS_INPUT_BACKEND:-x11}"
+FORCE_HEADLESS_DISPLAY="${VIBE_RDESK_FORCE_HEADLESS_DISPLAY:-no}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
 DEFAULT_HTTPS_PORT=18443
@@ -54,8 +57,7 @@ SUDO_AUDIO_HOME=""
 SUDO_AUDIO_RUNTIME_DIR=""
 APP_PID=""
 XVFB_PID=""
-JWM_PID=""
-XTERM_PID=""
+LAUNCHER_PID=""
 PULSE_PID=""
 PIPEWIRE_LOOPBACK_PID=""
 HTTPS_ENABLED="yes"
@@ -63,6 +65,33 @@ HTTPS_ENABLED="yes"
 SSL_DIR="${VIBE_RDESK_SSL_DIR:-ssl_keys}"
 SSL_CERT="${VIBE_RDESK_TLS_CERT:-${SSL_DIR}/server.crt}"
 SSL_KEY="${VIBE_RDESK_TLS_KEY:-${SSL_DIR}/server.key}"
+
+APP_ARGS=()
+
+parse_script_args() {
+    local args=("$@")
+    local i
+    APP_ARGS=()
+
+    for ((i = 0; i < ${#args[@]}; i++)); do
+        case "${args[$i]}" in
+            --launcher)
+                if (( i + 1 >= ${#args[@]} )) || [[ -z "${args[$((i + 1))]}" ]]; then
+                    echo "[run] --launcher requires a command. Example: ./run.sh --launcher jwm --passwd <password>" >&2
+                    exit 1
+                fi
+                HEADLESS_LAUNCHER="${args[$((i + 1))]}"
+                ((i += 1))
+                ;;
+            --headless|--force-headless)
+                FORCE_HEADLESS_DISPLAY="yes"
+                ;;
+            *)
+                APP_ARGS+=("${args[$i]}")
+                ;;
+        esac
+    done
+}
 
 require_passwd_arg() {
     local args=("$@")
@@ -98,6 +127,78 @@ first_bind_port() {
         printf '%s\n' "${DEFAULT_HTTPS_PORT}"
     else
         printf '%s\n' "${DEFAULT_HTTP_PORT}"
+    fi
+}
+
+format_access_url() {
+    local protocol="$1"
+    local host="$2"
+    local port="$3"
+    local iface="${4:-}"
+
+    if [[ "${host}" == *:* ]]; then
+        if [[ "${host}" == fe80:* && -n "${iface}" ]]; then
+            host="${host}%25${iface}"
+        fi
+        printf '%s://[%s]:%s/' "${protocol}" "${host}" "${port}"
+    else
+        printf '%s://%s:%s/' "${protocol}" "${host}" "${port}"
+    fi
+}
+
+show_access_urls() {
+    local label="$1"
+    local protocol="$2"
+    local port="$3"
+    local ifname family cidr addr key url
+    local -A seen=()
+    local printed=0
+
+    echo "${label} URLs:"
+
+    if command -v ip >/dev/null 2>&1; then
+        while read -r ifname family cidr; do
+            [[ -n "${ifname}" && -n "${family}" && -n "${cidr}" ]] || continue
+            case "${family}" in
+                inet|inet6) ;;
+                *) continue ;;
+            esac
+
+            ifname="${ifname%%@*}"
+            addr="${cidr%%/*}"
+            [[ -n "${addr}" ]] || continue
+
+            key="${ifname}|${addr}"
+            if [[ -n "${seen[$key]+x}" ]]; then
+                continue
+            fi
+            seen[$key]=1
+
+            url="$(format_access_url "${protocol}" "${addr}" "${port}" "${ifname}")"
+            echo "${label}   ${ifname}: ${url}"
+            printed=1
+        done < <(ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" {print $2, $3, $4}')
+    fi
+
+    if [[ "${printed}" == "0" && "$(command -v hostname || true)" ]]; then
+        for addr in $(hostname -I 2>/dev/null || true); do
+            addr="${addr%%%*}"
+            [[ -n "${addr}" ]] || continue
+
+            key="hostname|${addr}"
+            if [[ -n "${seen[$key]+x}" ]]; then
+                continue
+            fi
+            seen[$key]=1
+
+            url="$(format_access_url "${protocol}" "${addr}" "${port}")"
+            echo "${label}   ${url}"
+            printed=1
+        done
+    fi
+
+    if [[ "${printed}" == "0" ]]; then
+        echo "${label}   unable to detect interface addresses"
     fi
 }
 
@@ -180,11 +281,10 @@ show_startup_help() {
 
     cat <<EOF
 [run] starting vibe_rdesk ${server_label} server
-[run] URL: ${protocol}://127.0.0.1:${port}/
-[run] LAN URL: ${protocol}://<this-machine-ip>:${port}/
 [run] bind: ${VIBE_RDESK_BIND}
 [run] ${reminder} Default is all IPv4/IPv6 interfaces; use --localhost yes for loopback only.
 EOF
+    show_access_urls "[run]" "${protocol}" "${port}"
     sleep "${VIBE_RDESK_HELP_SECONDS:-3}"
 }
 
@@ -768,6 +868,7 @@ ensure_virtual_mic() {
 start_headless_display() {
     export DISPLAY
     DISPLAY="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
+    export VIBE_RDESK_INPUT_BACKEND="${VIBE_RDESK_INPUT_BACKEND:-${HEADLESS_INPUT_BACKEND}}"
 
     if is_display_available "${DISPLAY}"; then
         echo "[dev] using existing X server on ${DISPLAY}"
@@ -779,19 +880,14 @@ start_headless_display() {
         exit 1
     fi
 
-    if ! command -v jwm >/dev/null 2>&1; then
-        echo "[dev] jwm is required for headless startup. Install it first." >&2
-        exit 1
-    fi
-
-    if ! command -v xterm >/dev/null 2>&1; then
-        echo "[dev] xterm is required for headless startup. Install it first." >&2
+    local launcher_program="${HEADLESS_LAUNCHER%%[[:space:]]*}"
+    if [[ -z "${launcher_program}" ]] || ! command -v "${launcher_program}" >/dev/null 2>&1; then
+        echo "[dev] launcher '${HEADLESS_LAUNCHER}' is not available. Install it first or use --launcher <command>." >&2
         exit 1
     fi
 
     local xvfb_log="${DEV_LOG_DIR}/xvfb.log"
-    local jwm_log="${DEV_LOG_DIR}/jwm.log"
-    local xterm_log="${DEV_LOG_DIR}/xterm.log"
+    local launcher_log="${DEV_LOG_DIR}/launcher.log"
 
     echo "[dev] starting Xvfb on ${DISPLAY}"
     prepare_dev_log_file "${xvfb_log}"
@@ -805,29 +901,23 @@ start_headless_display() {
 
     sleep "${WINDOW_MANAGER_DELAY_SECONDS}"
 
-    echo "[dev] starting jwm on ${DISPLAY}"
-    prepare_dev_log_file "${jwm_log}"
-    DISPLAY="${DISPLAY}" jwm >"${jwm_log}" 2>&1 &
-    JWM_PID=$!
-
-    if ! wait_for_process "${JWM_PID}" 4; then
-        echo "[dev] jwm exited during startup; see ${jwm_log}" >&2
-        exit 1
+    echo "[dev] starting launcher '${HEADLESS_LAUNCHER}' on ${DISPLAY}"
+    prepare_dev_log_file "${launcher_log}"
+    if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]]; then
+        DISPLAY="${DISPLAY}" xterm \
+            -display "${DISPLAY}" \
+            -title "vibe_rdesk" \
+            -fa "${XTERM_FONT_FAMILY}" \
+            -fs "${XTERM_FONT_SIZE}" \
+            -geometry 120x30+40+40 \
+            >"${launcher_log}" 2>&1 &
+    else
+        DISPLAY="${DISPLAY}" bash -lc "exec ${HEADLESS_LAUNCHER}" >"${launcher_log}" 2>&1 &
     fi
+    LAUNCHER_PID=$!
 
-    echo "[dev] starting xterm on ${DISPLAY}"
-    prepare_dev_log_file "${xterm_log}"
-    DISPLAY="${DISPLAY}" xterm \
-        -display "${DISPLAY}" \
-        -title "vibe_rdesk" \
-        -fa "${XTERM_FONT_FAMILY}" \
-        -fs "${XTERM_FONT_SIZE}" \
-        -geometry 120x30+40+40 \
-        >"${xterm_log}" 2>&1 &
-    XTERM_PID=$!
-
-    if ! wait_for_process "${XTERM_PID}" 4; then
-        echo "[dev] xterm exited during startup; see ${xterm_log}" >&2
+    if ! wait_for_process "${LAUNCHER_PID}" 4; then
+        echo "[dev] launcher '${HEADLESS_LAUNCHER}' exited during startup; see ${launcher_log}" >&2
         exit 1
     fi
 }
@@ -835,6 +925,12 @@ start_headless_display() {
 ensure_display() {
     local fallback_display
     fallback_display="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
+
+    if [[ "${FORCE_HEADLESS_DISPLAY}" == "yes" ]]; then
+        echo "[dev] force-starting headless X11 on ${fallback_display}"
+        start_headless_display
+        return 0
+    fi
 
     if [[ -n "${DISPLAY:-}" ]]; then
         if is_display_available "${DISPLAY}"; then
@@ -856,14 +952,9 @@ cleanup() {
         wait "${APP_PID}" 2>/dev/null || true
     fi
 
-    if [[ -n "${XTERM_PID}" ]] && kill -0 "${XTERM_PID}" 2>/dev/null; then
-        kill "${XTERM_PID}" 2>/dev/null || true
-        wait "${XTERM_PID}" 2>/dev/null || true
-    fi
-
-    if [[ -n "${JWM_PID}" ]] && kill -0 "${JWM_PID}" 2>/dev/null; then
-        kill "${JWM_PID}" 2>/dev/null || true
-        wait "${JWM_PID}" 2>/dev/null || true
+    if [[ -n "${LAUNCHER_PID}" ]] && kill -0 "${LAUNCHER_PID}" 2>/dev/null; then
+        kill "${LAUNCHER_PID}" 2>/dev/null || true
+        wait "${LAUNCHER_PID}" 2>/dev/null || true
     fi
 
     if [[ -n "${XVFB_PID}" ]] && kill -0 "${XVFB_PID}" 2>/dev/null; then
@@ -916,8 +1007,9 @@ wait_for_change_polling() {
 
 trap cleanup EXIT INT TERM
 
-require_passwd_arg "$@"
-configure_bind_args "$@"
+parse_script_args "$@"
+require_passwd_arg "${APP_ARGS[@]}"
+configure_bind_args "${APP_ARGS[@]}"
 if [[ "${HTTPS_ENABLED}" == "yes" ]]; then
     show_startup_help "https"
     ensure_tls_keys
@@ -935,4 +1027,4 @@ ensure_display
 start_audio_server
 ensure_virtual_mic
 
-build_and_run "$@"
+build_and_run "${APP_ARGS[@]}"

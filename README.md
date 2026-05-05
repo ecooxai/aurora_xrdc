@@ -71,6 +71,20 @@ Open the server URL in a browser after starting the app. The client supports:
 ./dev.sh
 ```
 
+`run.sh` and `dev.sh` start a headless X11 display when `DISPLAY` is unavailable. They default to `jwm`, and you can choose another desktop/session or a terminal with `--launcher`:
+
+```bash
+./dev.sh --launcher xfce4-session --passwd <password>
+./run.sh --launcher xterm --passwd <password>
+./run.sh --launcher "openbox-session" --passwd <password>
+```
+
+On a machine with a real X11 display, use `--headless` to force the app onto the Xvfb display instead of reusing the host `DISPLAY`. Headless script launches default to X11-targeted input so wheel events stay on the virtual display; set `VIBE_RDESK_INPUT_BACKEND=uinput` only when you intentionally want host-seat uinput injection.
+
+```bash
+./run.sh --headless --launcher xfce4-session --passwd <password>
+```
+
 ## Project layout
 
 - `src/`: Rust server, session, streaming, clipboard, and input code.
