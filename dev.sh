@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Prefer a rustup-managed toolchain when available. Under sudo, use the
 # invoking user's rustup path because root often does not have cargo installed.
 CARGO_ENV_HOME="${HOME}"
@@ -30,18 +32,23 @@ fi
 WATCH_DIRS=(src web Cargo.toml)
 DEBOUNCE_SECONDS=5
 REBUILD_RETRY_SECONDS=10
-HEADLESS_DISPLAY_RAW="${VIBE_RDESK_HEADLESS_DISPLAY:-11}"
+HEADLESS_DISPLAY_RAW="${VIBE_RDESK_HEADLESS_DISPLAY:-${DISPLAY:-11}}"
 XVFB_SCREEN="${VIBE_RDESK_XVFB_SCREEN:-1280x720x24}"
 WINDOW_MANAGER_DELAY_SECONDS=2
 XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
 XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
-HEADLESS_LAUNCHER="${VIBE_RDESK_HEADLESS_LAUNCHER:-jwm}"
+HEADLESS_LAUNCHER="${VIBE_RDESK_HEADLESS_LAUNCHER:-${SCRIPT_DIR}/vendor/aurora-wm}"
 HEADLESS_INPUT_BACKEND="${VIBE_RDESK_HEADLESS_INPUT_BACKEND:-x11}"
 FORCE_HEADLESS_DISPLAY="${VIBE_RDESK_FORCE_HEADLESS_DISPLAY:-no}"
+NEW_DISPLAY_NOTICE_SECONDS="${VIBE_RDESK_NEW_DISPLAY_NOTICE_SECONDS:-3}"
+STARTUP_HELP_SECONDS="${VIBE_RDESK_HELP_SECONDS:-3}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
 DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:8001,[::]:8001}"
 export VIBE_RDESK_BIND="${DEFAULT_BIND}"
+SSL_DIR="${VIBE_RDESK_SSL_DIR:-ssl_keys}"
+SSL_CERT="${VIBE_RDESK_TLS_CERT:-${SSL_DIR}/server.crt}"
+SSL_KEY="${VIBE_RDESK_TLS_KEY:-${SSL_DIR}/server.key}"
 DEV_LOG_UID="${SUDO_UID:-$(id -u)}"
 DEV_LOG_DIR="${VIBE_RDESK_LOG_DIR:-/tmp/vibe_rdesk-${DEV_LOG_UID}}"
 AUDIO_BACKEND=""
@@ -66,14 +73,19 @@ parse_script_args() {
         case "${args[$i]}" in
             --launcher)
                 if (( i + 1 >= ${#args[@]} )) || [[ -z "${args[$((i + 1))]}" ]]; then
-                    echo "[dev] --launcher requires a command. Example: ./dev.sh --launcher jwm --passwd <password>" >&2
+                    echo "[dev] --launcher requires a command. Example: ./dev.sh --launcher xterm --passwd <password>" >&2
                     exit 1
                 fi
                 HEADLESS_LAUNCHER="${args[$((i + 1))]}"
                 ((i += 1))
                 ;;
             --headless|--force-headless)
-                FORCE_HEADLESS_DISPLAY="yes"
+                if (( i + 1 < ${#args[@]} )) && [[ "${args[$((i + 1))]}" =~ ^(yes|no)$ ]]; then
+                    FORCE_HEADLESS_DISPLAY="${args[$((i + 1))]}"
+                    ((i += 1))
+                else
+                    FORCE_HEADLESS_DISPLAY="yes"
+                fi
                 ;;
             *)
                 APP_ARGS+=("${args[$i]}")
@@ -89,7 +101,7 @@ require_passwd_arg() {
         case "${args[$i]}" in
             --passwd)
                 if (( i + 1 >= ${#args[@]} )) || [[ -z "${args[$((i + 1))]}" ]]; then
-                    echo "[dev] --passwd requires a non-empty value. Start with: ./dev.sh --passwd <password>" >&2
+                    echo "[dev] --passwd requires a non-empty value. Start with: bash dev.sh --passwd passwd" >&2
                     exit 1
                 fi
                 return 0
@@ -97,7 +109,7 @@ require_passwd_arg() {
         esac
     done
 
-    echo "[dev] missing required --passwd. Start with: ./dev.sh --passwd <password>" >&2
+    echo "[dev] missing required --passwd. Start with: bash dev.sh --passwd passwd" >&2
     exit 1
 }
 
@@ -231,17 +243,99 @@ configure_bind_args() {
 }
 
 show_startup_help() {
+    cat <<EOF
+[dev] Development: bash dev.sh --passwd passwd
+[dev] Starts a self-signed HTTPS development server with automatic rebuilds.
+[dev] Production:  bash run.sh --passwd passwd --port 18443 --https yes --headless no
+[dev] starting vibe_rdesk HTTPS development server
+[dev] bind: ${VIBE_RDESK_BIND}
+[dev] use https://, not http://. Default is all IPv4/IPv6 interfaces; use --localhost yes for loopback only.
+[dev] starting in ${STARTUP_HELP_SECONDS}s...
+EOF
+}
+
+show_server_access_urls() {
     local protocol="$1"
     local port
     port="$(first_bind_port "${VIBE_RDESK_BIND}")"
 
-    cat <<EOF
-[dev] starting vibe_rdesk development server
-[dev] bind: ${VIBE_RDESK_BIND}
-[dev] default is all IPv4/IPv6 interfaces; use --localhost yes for loopback only.
-EOF
+    if ! wait_for_server_port "${port}" && [[ -n "${APP_PID}" ]] && ! kill -0 "${APP_PID}" 2>/dev/null; then
+        return 1
+    fi
+    echo "[dev] server started on ${VIBE_RDESK_BIND}"
     show_access_urls "[dev]" "${protocol}" "${port}"
-    sleep "${VIBE_RDESK_HELP_SECONDS:-3}"
+}
+
+wait_for_server_port() {
+    local port="$1"
+    local attempts="${2:-60}"
+
+    while (( attempts > 0 )); do
+        if bash -c ":</dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ -n "${APP_PID}" ]] && ! kill -0 "${APP_PID}" 2>/dev/null; then
+            return 1
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
+}
+
+ensure_tls_keys() {
+    if [[ -f "${SSL_CERT}" && -f "${SSL_KEY}" ]]; then
+        echo "[dev] using TLS certificate ${SSL_CERT}"
+        return 0
+    fi
+
+    if [[ -f "${SSL_CERT}" || -f "${SSL_KEY}" ]]; then
+        echo "[dev] TLS certificate/key pair is incomplete; expected both ${SSL_CERT} and ${SSL_KEY}" >&2
+        exit 1
+    fi
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "[dev] openssl is required to generate test TLS keys in ${SSL_DIR}" >&2
+        exit 1
+    fi
+
+    mkdir -p "${SSL_DIR}"
+    chmod 700 "${SSL_DIR}" 2>/dev/null || true
+
+    local openssl_config="${SSL_DIR}/server.openssl.cnf"
+    cat >"${openssl_config}" <<'EOF'
+[req]
+default_bits = 2048
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+
+[dn]
+CN = vibe-rdesk-local
+
+[v3_req]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = vibe-rdesk-local
+IP.1 = 127.0.0.1
+IP.2 = ::1
+EOF
+
+    echo "[dev] generating self-signed test TLS certificate in ${SSL_DIR}"
+    openssl req \
+        -x509 \
+        -newkey rsa:2048 \
+        -sha256 \
+        -days "${VIBE_RDESK_TEST_CERT_DAYS:-3650}" \
+        -nodes \
+        -keyout "${SSL_KEY}" \
+        -out "${SSL_CERT}" \
+        -config "${openssl_config}" \
+        >/dev/null 2>&1
+    chmod 600 "${SSL_KEY}" 2>/dev/null || true
 }
 
 normalize_display() {
@@ -264,11 +358,60 @@ is_display_available() {
     fi
 
     if command -v xdpyinfo >/dev/null 2>&1; then
-        xdpyinfo -display "${display}" >/dev/null 2>&1
-        return $?
+        local info
+        if ! info="$(xdpyinfo -display "${display}" -ext XTEST 2>&1)"; then
+            return 1
+        fi
+        if printf '%s\n' "${info}" | grep -q "XTEST extension not supported"; then
+            return 1
+        fi
+        return 0
     fi
 
     DISPLAY="${display}" xdotool getmouselocation >/dev/null 2>&1
+}
+
+display_number() {
+    local display="${1:-}"
+    local normalized number
+
+    normalized="$(normalize_display "${display}")" || return 1
+    number="${normalized#:}"
+    number="${number%%.*}"
+
+    if [[ ! "${number}" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${number}"
+}
+
+is_display_reserved() {
+    local display="${1:-}"
+    local number
+
+    number="$(display_number "${display}")" || return 0
+
+    [[ -e "/tmp/.X11-unix/X${number}" || -e "/tmp/.X${number}-lock" ]]
+}
+
+find_free_headless_display() {
+    local start_display="${1:-11}"
+    local start_number candidate attempts=100
+
+    start_number="$(display_number "${start_display}")" || start_number="11"
+
+    while (( attempts > 0 )); do
+        candidate=":${start_number}"
+        if ! is_display_reserved "${candidate}" && ! is_display_available "${candidate}"; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+        ((start_number++))
+        ((attempts--))
+    done
+
+    return 1
 }
 
 wait_for_display() {
@@ -769,13 +912,11 @@ ensure_virtual_mic() {
 
 start_headless_display() {
     export DISPLAY
-    DISPLAY="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
-    export VIBE_RDESK_INPUT_BACKEND="${VIBE_RDESK_INPUT_BACKEND:-${HEADLESS_INPUT_BACKEND}}"
-
-    if is_display_available "${DISPLAY}"; then
-        echo "[dev] using existing X server on ${DISPLAY}"
-        return 0
+    if ! DISPLAY="$(find_free_headless_display "${HEADLESS_DISPLAY_RAW}")"; then
+        echo "[dev] could not find a free X11 display starting at $(normalize_display "${HEADLESS_DISPLAY_RAW}")" >&2
+        exit 1
     fi
+    export VIBE_RDESK_INPUT_BACKEND="${VIBE_RDESK_INPUT_BACKEND:-${HEADLESS_INPUT_BACKEND}}"
 
     if ! command -v Xvfb >/dev/null 2>&1; then
         echo "[dev] Xvfb is required for headless startup. Install it first." >&2
@@ -801,6 +942,9 @@ start_headless_display() {
         exit 1
     fi
 
+    echo "[dev] created headless X11 display ${DISPLAY}"
+    sleep "${NEW_DISPLAY_NOTICE_SECONDS}"
+
     sleep "${WINDOW_MANAGER_DELAY_SECONDS}"
 
     echo "[dev] starting launcher '${HEADLESS_LAUNCHER}' on ${DISPLAY}"
@@ -825,11 +969,11 @@ start_headless_display() {
 }
 
 ensure_display() {
-    local fallback_display
-    fallback_display="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
+    local start_display
+    start_display="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
 
     if [[ "${FORCE_HEADLESS_DISPLAY}" == "yes" ]]; then
-        echo "[dev] force-starting headless X11 on ${fallback_display}"
+        echo "[dev] force-starting headless X11 at first free display from ${start_display}"
         start_headless_display
         return 0
     fi
@@ -840,9 +984,9 @@ ensure_display() {
             return 0
         fi
 
-        echo "[dev] DISPLAY=${DISPLAY} is set but unavailable; falling back to ${fallback_display}"
+        echo "[dev] DISPLAY=${DISPLAY} is set but unavailable or missing XTEST; starting headless X11 at first free display from ${start_display}"
     else
-        echo "[dev] DISPLAY is not set; starting headless X11 on ${fallback_display}"
+        echo "[dev] DISPLAY is not set; starting headless X11 at first free display from ${start_display}"
     fi
 
     start_headless_display
@@ -895,6 +1039,7 @@ build_and_run() {
     echo "[dev] starting app..."
     cargo run -- "$@" &
     APP_PID=$!
+    show_server_access_urls "https"
 }
 
 wait_for_change_polling() {
@@ -917,7 +1062,11 @@ trap cleanup EXIT INT TERM
 parse_script_args "$@"
 require_passwd_arg "${APP_ARGS[@]}"
 configure_bind_args "${APP_ARGS[@]}"
-show_startup_help "http"
+show_startup_help
+sleep "${STARTUP_HELP_SECONDS}"
+ensure_tls_keys
+export VIBE_RDESK_TLS_CERT="${SSL_CERT}"
+export VIBE_RDESK_TLS_KEY="${SSL_KEY}"
 configure_sudo_audio_env
 ensure_dev_log_dir
 ensure_uinput_access

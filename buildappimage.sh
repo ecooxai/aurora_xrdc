@@ -17,14 +17,19 @@ NATIVE_CPU="${NATIVE_CPU:-0}"
 RUNTIME_PACKAGES=(
   ca-certificates
   curl
+  adwaita-icon-theme
   dbus
+  dbus-user-session
   dbus-x11
   ffmpeg
   fontconfig
-  jwm
+  fonts-dejavu-core
+  iproute2
+  kmod
   libasound2
   libgl1
   libpulse0
+  libxtst6
   libva2
   libvdpau1
   libx11-6
@@ -48,12 +53,18 @@ RUNTIME_PACKAGES=(
   openssl
   pipewire
   pipewire-pulse
+  pulseaudio
+  pulseaudio-utils
+  udev
   vdpau-driver-all
   wireplumber
+  x11-xserver-utils
   x11-utils
+  x11-xkb-utils
   xauth
   xclip
   xdotool
+  xkb-data
   xterm
   xvfb
 )
@@ -61,12 +72,15 @@ RUNTIME_PACKAGES=(
 ARCH_RUNTIME_PACKAGES=(
   ca-certificates
   curl
+  adwaita-icon-theme
   dbus
   ffmpeg
   fontconfig
-  jwm
+  iproute2
+  kmod
   libglvnd
   libpulse
+  libxtst
   libva
   libvdpau
   libx11
@@ -87,6 +101,7 @@ ARCH_RUNTIME_PACKAGES=(
   openssl
   pipewire
   pipewire-pulse
+  pulseaudio
   vdpauinfo
   wireplumber
   xclip
@@ -94,7 +109,9 @@ ARCH_RUNTIME_PACKAGES=(
   xorg-server-xvfb
   xorg-xauth
   xorg-xdpyinfo
+  xorg-xkbcomp
   xorg-xset
+  xkeyboard-config
   xterm
 )
 
@@ -146,7 +163,7 @@ resolve_deb_dependencies() {
     "${packages[@]}" |
     awk '
       /^[A-Za-z0-9][A-Za-z0-9+.-]*$/ { print $1; next }
-      /^[[:space:]]*Depends:/ {
+      /^[[:space:]]*(PreDepends|Depends):/ {
         pkg = $2
         gsub(/[<>()]/, "", pkg)
         if (pkg != "") print pkg
@@ -164,6 +181,7 @@ download_and_extract_runtime_debs() {
   need_cmd apt-cache
   need_cmd dpkg-deb
 
+  rm -rf "${DEB_CACHE}"
   mkdir -p "${DEB_CACHE}" "${APPDIR}"
   log "resolving runtime package dependencies"
   mapfile -t packages < <(resolve_deb_dependencies "${RUNTIME_PACKAGES[@]}")
@@ -215,13 +233,17 @@ download_and_extract_runtime_packages() {
 copy_binary_closure() {
   local bin="$1"
   local libdir="${APPDIR}/usr/lib"
+  local ldd_output
   mkdir -p "${libdir}"
 
   if ! command -v ldd >/dev/null 2>&1; then
     return 0
   fi
 
-  ldd "${bin}" 2>/dev/null |
+  ldd_output="$(ldd "${bin}" 2>/dev/null || true)"
+  [[ -n "${ldd_output}" ]] || return 0
+
+  printf '%s\n' "${ldd_output}" |
     awk '
       /=> \// { print $3 }
       /^[[:space:]]*\// { print $1 }
@@ -235,6 +257,8 @@ copy_binary_closure() {
           ;;
       esac
     done
+
+  return 0
 }
 
 copy_important_host_binaries() {
@@ -243,12 +267,14 @@ copy_important_host_binaries() {
     xdotool
     xclip
     Xvfb
-    jwm
     xterm
     xdpyinfo
     xset
+    ip
     dbus-launch
+    dbus-daemon
     dbus-send
+    modprobe
     pactl
     pipewire
     pipewire-pulse
@@ -256,6 +282,7 @@ copy_important_host_binaries() {
     pw-loopback
     wireplumber
     openssl
+    udevadm
   )
   local name path
 
@@ -266,6 +293,122 @@ copy_important_host_binaries() {
       copy_binary_closure "${path}"
     fi
   done
+}
+
+copy_bundled_aurora_wm() {
+  local source="${PROJECT_ROOT}/vendor/aurora-wm"
+  local target="${APPDIR}/usr/bin/vendor/aurora-wm"
+
+  [[ -x "${source}" ]] || die "missing executable bundled launcher: ${source}"
+  mkdir -p "$(dirname "${target}")"
+  cp "${source}" "${target}"
+  chmod +x "${target}"
+  copy_binary_closure "${target}"
+}
+
+wrap_xkbcomp() {
+  local real_xkbcomp="${APPDIR}/usr/bin/xkbcomp.real"
+  local wrapper="${APPDIR}/usr/bin/xkbcomp"
+  local wrapper_src="${BUILD_DIR}/xkbcomp-wrapper.c"
+
+  [[ -x "${wrapper}" ]] || return 0
+  [[ -e "${real_xkbcomp}" ]] || mv "${wrapper}" "${real_xkbcomp}"
+
+  need_cmd cc
+  cat >"${wrapper_src}" <<'EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void dirname_in_place(char *path) {
+  char *slash = strrchr(path, '/');
+  if (slash == NULL) {
+    strcpy(path, ".");
+  } else if (slash == path) {
+    slash[1] = '\0';
+  } else {
+    *slash = '\0';
+  }
+}
+
+static char *prefix_arg(const char *prefix, const char *value) {
+  char *out = NULL;
+  if (asprintf(&out, "%s%s", prefix, value) < 0) {
+    return NULL;
+  }
+  return out;
+}
+
+int main(int argc, char **argv) {
+  char exe[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  if (len < 0) {
+    perror("readlink /proc/self/exe");
+    return 127;
+  }
+  exe[len] = '\0';
+
+  char bindir[PATH_MAX];
+  snprintf(bindir, sizeof(bindir), "%s", exe);
+  dirname_in_place(bindir);
+
+  char usrdir[PATH_MAX];
+  snprintf(usrdir, sizeof(usrdir), "%s", bindir);
+  dirname_in_place(usrdir);
+
+  char appdir[PATH_MAX];
+  snprintf(appdir, sizeof(appdir), "%s", usrdir);
+  dirname_in_place(appdir);
+
+  const char *env_root = getenv("XKB_CONFIG_ROOT");
+  char default_root[PATH_MAX];
+  snprintf(default_root, sizeof(default_root), "%s/usr/share/X11/xkb", appdir);
+  const char *xkb_root = (env_root != NULL && env_root[0] != '\0') ? env_root : default_root;
+
+  char real[PATH_MAX];
+  snprintf(real, sizeof(real), "%s/xkbcomp.real", bindir);
+
+  char **new_argv = calloc((size_t)argc + 2, sizeof(char *));
+  if (new_argv == NULL) {
+    perror("calloc");
+    return 127;
+  }
+
+  char *include_root = prefix_arg("-I", xkb_root);
+  if (include_root == NULL) {
+    perror("alloc arg");
+    return 127;
+  }
+
+  new_argv[0] = real;
+  new_argv[1] = include_root;
+  for (int i = 1; i < argc; i++) {
+    int out_i = i + 1;
+    if (strcmp(argv[i], "-R/usr/share/X11/xkb") == 0 || strcmp(argv[i], "-R/usr/share/X11/xkb/") == 0) {
+      new_argv[out_i] = prefix_arg("-R", xkb_root);
+    } else if (strcmp(argv[i], "-I/usr/share/X11/xkb") == 0 || strcmp(argv[i], "-I/usr/share/X11/xkb/") == 0) {
+      new_argv[out_i] = prefix_arg("-I", xkb_root);
+    } else {
+      new_argv[out_i] = argv[i];
+    }
+    if (new_argv[out_i] == NULL) {
+      perror("alloc arg");
+      return 127;
+    }
+  }
+  new_argv[argc + 1] = NULL;
+
+  execv(real, new_argv);
+  fprintf(stderr, "xkbcomp wrapper: failed to exec %s: %s\n", real, strerror(errno));
+  return 127;
+}
+EOF
+  cc -O2 -Wall -Wextra -o "${wrapper}" "${wrapper_src}"
+  chmod +x "${wrapper}"
 }
 
 patch_elf_rpaths() {
@@ -346,19 +489,26 @@ done
 APPDIR="$(cd -P "$(dirname "${SELF_PATH}")" && pwd)"
 
 export PATH="${APPDIR}/usr/bin:${APPDIR}/usr/sbin:${PATH}"
-export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${APPDIR}/usr/lib/x86_64-linux-gnu:${APPDIR}/usr/lib/aarch64-linux-gnu:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${APPDIR}/usr/lib/x86_64-linux-gnu:${APPDIR}/usr/lib/aarch64-linux-gnu:${APPDIR}/usr/lib/x86_64-linux-gnu/pulseaudio:${APPDIR}/usr/lib/aarch64-linux-gnu/pulseaudio:${APPDIR}/usr/lib/pulseaudio:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 export FONTCONFIG_PATH="${APPDIR}/etc/fonts:${FONTCONFIG_PATH:-/etc/fonts}"
+export XKB_CONFIG_ROOT="${XKB_CONFIG_ROOT:-${APPDIR}/usr/share/X11/xkb}"
 export SSL_CERT_FILE="${SSL_CERT_FILE:-${APPDIR}/etc/ssl/certs/ca-certificates.crt}"
-export VIBE_RDESK_SSL_DIR="${VIBE_RDESK_SSL_DIR:-${HOME}/.local/share/vibe_rdesk/ssl_keys}"
+export VIBE_RDESK_SSL_DIR="${VIBE_RDESK_SSL_DIR:-${APPDIR}/ssl_keys}"
 export VIBE_RDESK_LOG_DIR="${VIBE_RDESK_LOG_DIR:-${XDG_RUNTIME_DIR:-/tmp}/vibe_rdesk-$(id -u)}"
 export VIBE_RDESK_BIND="${VIBE_RDESK_BIND:-0.0.0.0:8001,[::]:8001}"
+export APPDIR
+export VIBE_RDESK_BINARY="${VIBE_RDESK_BINARY:-${APPDIR}/usr/bin/vibe_rdesk}"
 
-HEADLESS_DISPLAY_RAW="${VIBE_RDESK_HEADLESS_DISPLAY:-11}"
+exec "${APPDIR}/usr/bin/run.sh" "$@"
+
+HEADLESS_DISPLAY_RAW="${VIBE_RDESK_HEADLESS_DISPLAY:-${DISPLAY:-11}}"
 XVFB_SCREEN="${VIBE_RDESK_XVFB_SCREEN:-1280x720x24}"
 WINDOW_MANAGER_DELAY_SECONDS="${VIBE_RDESK_WINDOW_MANAGER_DELAY_SECONDS:-2}"
+NEW_DISPLAY_NOTICE_SECONDS="${VIBE_RDESK_NEW_DISPLAY_NOTICE_SECONDS:-3}"
 XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
 XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
+HEADLESS_LAUNCHER="${VIBE_RDESK_HEADLESS_LAUNCHER:-${APPDIR}/usr/bin/vendor/aurora-wm}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
 SSL_DIR="${VIBE_RDESK_SSL_DIR}"
@@ -368,8 +518,7 @@ DEV_LOG_DIR="${VIBE_RDESK_LOG_DIR}"
 AUDIO_BACKEND=""
 APP_PID=""
 XVFB_PID=""
-JWM_PID=""
-XTERM_PID=""
+LAUNCHER_PID=""
 PULSE_PID=""
 PIPEWIRE_LOOPBACK_PID=""
 
@@ -403,10 +552,50 @@ is_display_available() {
   local display="${1:-}"
   [[ -n "${display}" ]] || return 1
   if command -v xdpyinfo >/dev/null 2>&1; then
-    xdpyinfo -display "${display}" >/dev/null 2>&1
+    local info
+    if ! info="$(xdpyinfo -display "${display}" -ext XTEST 2>&1)"; then
+      return 1
+    fi
+    if printf '%s\n' "${info}" | grep -q "XTEST extension not supported"; then
+      return 1
+    fi
+    return 0
   else
     DISPLAY="${display}" xdotool getmouselocation >/dev/null 2>&1
   fi
+}
+
+display_number() {
+  local display="${1:-}"
+  local normalized number
+  normalized="$(normalize_display "${display}")" || return 1
+  number="${normalized#:}"
+  number="${number%%.*}"
+  [[ "${number}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${number}"
+}
+
+is_display_reserved() {
+  local display="${1:-}"
+  local number
+  number="$(display_number "${display}")" || return 0
+  [[ -e "/tmp/.X11-unix/X${number}" || -e "/tmp/.X${number}-lock" ]]
+}
+
+find_free_headless_display() {
+  local start_display="${1:-11}"
+  local start_number candidate attempts=100
+  start_number="$(display_number "${start_display}")" || start_number="11"
+  while (( attempts > 0 )); do
+    candidate=":${start_number}"
+    if ! is_display_reserved "${candidate}" && ! is_display_available "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+    ((start_number++))
+    ((attempts--))
+  done
+  return 1
 }
 
 wait_for_display() {
@@ -541,6 +730,16 @@ start_audio_server() {
     echo "[vibe_rdesk] audio backend: PipeWire Pulse compatibility"
     return 0
   fi
+
+  if command -v pulseaudio >/dev/null 2>&1; then
+    pulseaudio --start >/dev/null 2>&1 || pulseaudio --daemonize=yes >/dev/null 2>&1 || true
+    if wait_for_pulse_server; then
+      AUDIO_BACKEND="pulseaudio"
+      echo "[vibe_rdesk] audio backend: PulseAudio"
+      return 0
+    fi
+  fi
+
   echo "[vibe_rdesk] audio server did not start; video/control may still work, audio capture may not" >&2
   return 0
 }
@@ -562,53 +761,64 @@ ensure_virtual_mic() {
 
 start_headless_display() {
   export DISPLAY
-  DISPLAY="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
-  if is_display_available "${DISPLAY}"; then
-    echo "[vibe_rdesk] using existing X server on ${DISPLAY}"
-    return 0
+  if ! DISPLAY="$(find_free_headless_display "${HEADLESS_DISPLAY_RAW}")"; then
+    echo "[vibe_rdesk] could not find a free X11 display starting at $(normalize_display "${HEADLESS_DISPLAY_RAW}")" >&2
+    exit 1
   fi
   command -v Xvfb >/dev/null 2>&1 || {
     echo "[vibe_rdesk] Xvfb is unavailable" >&2
     exit 1
   }
+  local launcher_program="${HEADLESS_LAUNCHER%%[[:space:]]*}"
+  if [[ -z "${launcher_program}" ]] || ! command -v "${launcher_program}" >/dev/null 2>&1; then
+    echo "[vibe_rdesk] launcher '${HEADLESS_LAUNCHER}' is unavailable" >&2
+    exit 1
+  fi
   local xvfb_log="${DEV_LOG_DIR}/xvfb.log"
-  local jwm_log="${DEV_LOG_DIR}/jwm.log"
-  local xterm_log="${DEV_LOG_DIR}/xterm.log"
+  local launcher_log="${DEV_LOG_DIR}/launcher.log"
+  local xkb_args=()
+  if [[ -d "${APPDIR}/usr/share/X11/xkb" ]]; then
+    xkb_args=(-xkbdir "${APPDIR}/usr/share/X11/xkb")
+  fi
   echo "[vibe_rdesk] starting Xvfb on ${DISPLAY}"
-  Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp >"${xvfb_log}" 2>&1 &
+  Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp "${xkb_args[@]}" >"${xvfb_log}" 2>&1 &
   XVFB_PID=$!
   wait_for_display "${DISPLAY}" || {
     echo "[vibe_rdesk] Xvfb on ${DISPLAY} did not become ready; see ${xvfb_log}" >&2
     exit 1
   }
+  echo "[vibe_rdesk] created headless X11 display ${DISPLAY}"
+  sleep "${NEW_DISPLAY_NOTICE_SECONDS}"
   sleep "${WINDOW_MANAGER_DELAY_SECONDS}"
-  if command -v jwm >/dev/null 2>&1; then
-    DISPLAY="${DISPLAY}" jwm >"${jwm_log}" 2>&1 &
-    JWM_PID=$!
-    wait_for_process "${JWM_PID}" 4 || true
-  fi
-  if command -v xterm >/dev/null 2>&1; then
+  echo "[vibe_rdesk] starting launcher '${HEADLESS_LAUNCHER}' on ${DISPLAY}"
+  if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]]; then
     DISPLAY="${DISPLAY}" xterm -display "${DISPLAY}" -title "vibe_rdesk" \
       -fa "${XTERM_FONT_FAMILY}" -fs "${XTERM_FONT_SIZE}" -geometry 120x30+40+40 \
-      >"${xterm_log}" 2>&1 &
-    XTERM_PID=$!
-    wait_for_process "${XTERM_PID}" 4 || true
+      >"${launcher_log}" 2>&1 &
+  else
+    DISPLAY="${DISPLAY}" bash -lc "exec ${HEADLESS_LAUNCHER}" >"${launcher_log}" 2>&1 &
   fi
+  LAUNCHER_PID=$!
+  wait_for_process "${LAUNCHER_PID}" 4 || true
 }
 
 ensure_display() {
-  local fallback_display
-  fallback_display="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
+  local start_display
+  start_display="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
   if [[ -n "${DISPLAY:-}" ]] && is_display_available "${DISPLAY}"; then
     echo "[vibe_rdesk] using existing X server on ${DISPLAY}"
     return 0
   fi
-  [[ -n "${DISPLAY:-}" ]] && echo "[vibe_rdesk] DISPLAY=${DISPLAY} is unavailable; falling back to ${fallback_display}"
+  if [[ -n "${DISPLAY:-}" ]]; then
+    echo "[vibe_rdesk] DISPLAY=${DISPLAY} is unavailable or missing XTEST; starting headless X11 at first free display from ${start_display}"
+  else
+    echo "[vibe_rdesk] DISPLAY is not set; starting headless X11 at first free display from ${start_display}"
+  fi
   start_headless_display
 }
 
 cleanup() {
-  for pid in "${APP_PID}" "${XTERM_PID}" "${JWM_PID}" "${XVFB_PID}" "${PULSE_PID}" "${PIPEWIRE_LOOPBACK_PID}"; do
+  for pid in "${APP_PID}" "${LAUNCHER_PID}" "${XVFB_PID}" "${PULSE_PID}" "${PIPEWIRE_LOOPBACK_PID}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
       kill "${pid}" 2>/dev/null || true
       wait "${pid}" 2>/dev/null || true
@@ -687,12 +897,29 @@ assemble_appdir() {
 
   download_and_extract_runtime_packages
 
+  log "copying release binary"
   cp "${PROJECT_ROOT}/target/release/${APP_NAME}" "${APPDIR}/usr/bin/${APP_NAME}"
   chmod +x "${APPDIR}/usr/bin/${APP_NAME}"
+  log "copying run.sh"
+  cp "${PROJECT_ROOT}/run.sh" "${APPDIR}/usr/bin/run.sh"
+  chmod +x "${APPDIR}/usr/bin/run.sh"
+  log "copying bundled aurora-wm launcher"
+  copy_bundled_aurora_wm
+  if [[ -d "${PROJECT_ROOT}/ssl_keys" ]]; then
+    log "copying ssl_keys"
+    mkdir -p "${APPDIR}/ssl_keys"
+    cp -a "${PROJECT_ROOT}/ssl_keys/." "${APPDIR}/ssl_keys/"
+  fi
+  log "copying main binary library closure"
   copy_binary_closure "${APPDIR}/usr/bin/${APP_NAME}"
+  log "copying important host binaries"
   copy_important_host_binaries
+  log "wrapping xkbcomp"
+  wrap_xkbcomp
 
+  log "writing desktop metadata"
   write_desktop_metadata
+  log "writing AppRun"
   write_apprun
   remove_nonportable_core_libs
   patch_elf_rpaths
@@ -704,7 +931,7 @@ make_appimage() {
   local out_file="${OUT_DIR}/${APP_NAME}-${VERSION}-${ARCH}.AppImage"
   rm -f "${out_file}"
   log "creating ${out_file}"
-  ARCH="${ARCH}" VERSION="${VERSION}" "${APPIMAGETOOL}" "${APPDIR}" "${out_file}"
+  APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}" ARCH="${ARCH}" VERSION="${VERSION}" "${APPIMAGETOOL}" "${APPDIR}" "${out_file}"
   chmod +x "${out_file}"
   log "created ${out_file}"
 }

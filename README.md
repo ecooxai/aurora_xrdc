@@ -2,6 +2,22 @@
 
 `vibe_rdesk` is a Rust-based remote desktop MVP for X11 systems. It serves a browser UI, captures the desktop with FFmpeg, streams video to the browser over WebSocket/WebCodecs, and relays input back to the host with uinput, X11 injection, and `xdotool` fallbacks.
 
+## Quick Start
+
+Run the HTTPS server:
+
+```bash
+bash run.sh --passwd passwd --port 18443 --https yes --headless no
+```
+
+Run the development server with automatic rebuilds and a generated self-signed HTTPS certificate:
+
+```bash
+bash dev.sh --passwd passwd
+```
+
+Open the HTTPS URL printed at startup. Replace `passwd` with your server password. `run.sh` and `dev.sh` show these startup commands and wait three seconds before continuing.
+
 ## Features
 
 - H.264 streaming by default.
@@ -23,24 +39,19 @@
 - A server password passed at startup.
 - `v4l2loopback` installed on the server host if you want camera uplink.
 
-## Run
-
-```bash
-cargo run -- --passwd <password>
-```
-
-The server listens on `0.0.0.0:8001` and `[::]:8001` by default.
-
 ## Configuration
 
 ### Command-line flags
 
 - `--passwd <password>`: required server password.
 - `-p, --port <port>`: override the listening port.
+- `--https yes|no`: enable or disable built-in HTTPS in `run.sh`; HTTPS is enabled by default.
+- `--headless yes|no`: force Xvfb or use an available host display; bare `--headless` means `yes`.
+- `--launcher <command>`: override the bundled `vendor/aurora-wm` headless launcher.
 
 ### Environment variables
 
-- `VIBE_RDESK_BIND`: bind address list, defaults to `0.0.0.0:8001,[::]:8001`.
+- `VIBE_RDESK_BIND`: bind address list; `run.sh` defaults HTTPS to port `18443`, and `dev.sh` defaults HTTPS to port `8001`.
 - `DISPLAY`: X11 display, defaults to `:0.0`.
 - `VIBE_RDESK_UPLOAD_DIR`: upload directory, defaults to `~/Desktop`. A leading `~/` is expanded against the server user's home directory.
 
@@ -64,25 +75,20 @@ Open the server URL in a browser after starting the app. The client supports:
 - Clipboard push/pull through the clipboard cards.
 - `?debug=1` for the debug overlay.
 
-## Development
+## Launcher
+
+`run.sh` and `dev.sh` start a headless X11 display when requested or when `DISPLAY` is unavailable. They default to the bundled lightweight `vendor/aurora-wm`, and you can choose another desktop/session or a terminal with `--launcher`:
 
 ```bash
-./test.sh
-./dev.sh
+bash dev.sh --passwd passwd --launcher xfce4-session
+bash run.sh --passwd passwd --launcher xterm
+bash run.sh --passwd passwd --launcher "openbox-session"
 ```
 
-`run.sh` and `dev.sh` start a headless X11 display when `DISPLAY` is unavailable. They default to `jwm`, and you can choose another desktop/session or a terminal with `--launcher`:
+Use `--headless yes` to force the app onto Xvfb or `--headless no` to reuse an available host `DISPLAY`. Bare `--headless` is equivalent to `--headless yes`. Headless launches default to X11-targeted input so wheel events stay on the virtual display; set `VIBE_RDESK_INPUT_BACKEND=uinput` only when you intentionally want host-seat uinput injection.
 
 ```bash
-./dev.sh --launcher xfce4-session --passwd <password>
-./run.sh --launcher xterm --passwd <password>
-./run.sh --launcher "openbox-session" --passwd <password>
-```
-
-On a machine with a real X11 display, use `--headless` to force the app onto the Xvfb display instead of reusing the host `DISPLAY`. Headless script launches default to X11-targeted input so wheel events stay on the virtual display; set `VIBE_RDESK_INPUT_BACKEND=uinput` only when you intentionally want host-seat uinput injection.
-
-```bash
-./run.sh --headless --launcher xfce4-session --passwd <password>
+bash run.sh --passwd passwd --headless yes --launcher xfce4-session
 ```
 
 ## Project layout

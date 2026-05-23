@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "${SCRIPT_PATH}" ]]; do
+    SCRIPT_DIR="$(cd -P "$(dirname "${SCRIPT_PATH}")" && pwd)"
+    SCRIPT_PATH="$(readlink "${SCRIPT_PATH}")"
+    [[ "${SCRIPT_PATH}" == /* ]] || SCRIPT_PATH="${SCRIPT_DIR}/${SCRIPT_PATH}"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "${SCRIPT_PATH}")" && pwd)"
+
+APP_BINARY="${VIBE_RDESK_BINARY:-}"
+if [[ -z "${APP_BINARY}" && -x "${SCRIPT_DIR}/vibe_rdesk" ]]; then
+    APP_BINARY="${SCRIPT_DIR}/vibe_rdesk"
+elif [[ -z "${APP_BINARY}" && -n "${APPDIR:-}" && -x "${APPDIR}/usr/bin/vibe_rdesk" ]]; then
+    APP_BINARY="${APPDIR}/usr/bin/vibe_rdesk"
+elif [[ -z "${APP_BINARY}" ]]; then
+    APP_BINARY="target/release/vibe_rdesk"
+fi
+
 # Prefer a rustup-managed toolchain when available. Under sudo, use the
 # invoking user's rustup path because root often does not have cargo installed.
 CARGO_ENV_HOME="${HOME}"
@@ -35,9 +52,11 @@ XVFB_SCREEN="${VIBE_RDESK_XVFB_SCREEN:-1280x720x24}"
 WINDOW_MANAGER_DELAY_SECONDS=2
 XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
 XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
-HEADLESS_LAUNCHER="${VIBE_RDESK_HEADLESS_LAUNCHER:-jwm}"
+HEADLESS_LAUNCHER="${VIBE_RDESK_HEADLESS_LAUNCHER:-${SCRIPT_DIR}/vendor/aurora-wm}"
 HEADLESS_INPUT_BACKEND="${VIBE_RDESK_HEADLESS_INPUT_BACKEND:-x11}"
 FORCE_HEADLESS_DISPLAY="${VIBE_RDESK_FORCE_HEADLESS_DISPLAY:-no}"
+NEW_DISPLAY_NOTICE_SECONDS="${VIBE_RDESK_NEW_DISPLAY_NOTICE_SECONDS:-3}"
+STARTUP_HELP_SECONDS="${VIBE_RDESK_HELP_SECONDS:-3}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
 DEFAULT_HTTPS_PORT=18443
@@ -60,13 +79,51 @@ XVFB_PID=""
 LAUNCHER_PID=""
 PULSE_PID=""
 PIPEWIRE_LOOPBACK_PID=""
+XTERM_PID=""
+DBUS_PID=""
 HTTPS_ENABLED="yes"
 
+if [[ -n "${APPDIR:-}" && -z "${VIBE_RDESK_SSL_DIR:-}" && -d "${APPDIR}/ssl_keys" ]]; then
+    export VIBE_RDESK_SSL_DIR="${APPDIR}/ssl_keys"
+fi
 SSL_DIR="${VIBE_RDESK_SSL_DIR:-ssl_keys}"
 SSL_CERT="${VIBE_RDESK_TLS_CERT:-${SSL_DIR}/server.crt}"
 SSL_KEY="${VIBE_RDESK_TLS_KEY:-${SSL_DIR}/server.key}"
 
 APP_ARGS=()
+
+configure_appimage_desktop_env() {
+    [[ -n "${APPDIR:-}" ]] || return 0
+
+    if [[ -d "${APPDIR}/usr/share/icewm" ]]; then
+        export ICEWM_PRIVCFG="${ICEWM_PRIVCFG:-${APPDIR}/usr/share/icewm}"
+    fi
+    if [[ -d "${APPDIR}/usr/share/icons" ]]; then
+        export XCURSOR_PATH="${XCURSOR_PATH:-${APPDIR}/usr/share/icons:/usr/share/icons}"
+    fi
+    if [[ -d "${APPDIR}/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders" ]]; then
+        export GDK_PIXBUF_MODULEDIR="${GDK_PIXBUF_MODULEDIR:-${APPDIR}/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders}"
+    elif [[ -d "${APPDIR}/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders" ]]; then
+        export GDK_PIXBUF_MODULEDIR="${GDK_PIXBUF_MODULEDIR:-${APPDIR}/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/2.10.0/loaders}"
+    fi
+}
+
+prepare_gdk_pixbuf_cache() {
+    [[ -n "${APPDIR:-}" && -n "${GDK_PIXBUF_MODULEDIR:-}" ]] || return 0
+    local query_loaders=""
+
+    if [[ -x "${APPDIR}/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders" ]]; then
+        query_loaders="${APPDIR}/usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"
+    elif [[ -x "${APPDIR}/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders" ]]; then
+        query_loaders="${APPDIR}/usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"
+    fi
+    [[ -n "${query_loaders}" ]] || return 0
+
+    export GDK_PIXBUF_MODULE_FILE="${GDK_PIXBUF_MODULE_FILE:-${DEV_LOG_DIR}/gdk-pixbuf-loaders.cache}"
+    if [[ ! -s "${GDK_PIXBUF_MODULE_FILE}" ]]; then
+        "${query_loaders}" >"${GDK_PIXBUF_MODULE_FILE}" 2>"${DEV_LOG_DIR}/gdk-pixbuf-query-loaders.log" || true
+    fi
+}
 
 parse_script_args() {
     local args=("$@")
@@ -77,14 +134,19 @@ parse_script_args() {
         case "${args[$i]}" in
             --launcher)
                 if (( i + 1 >= ${#args[@]} )) || [[ -z "${args[$((i + 1))]}" ]]; then
-                    echo "[run] --launcher requires a command. Example: ./run.sh --launcher jwm --passwd <password>" >&2
+                    echo "[run] --launcher requires a command. Example: ./run.sh --launcher xterm --passwd <password>" >&2
                     exit 1
                 fi
                 HEADLESS_LAUNCHER="${args[$((i + 1))]}"
                 ((i += 1))
                 ;;
             --headless|--force-headless)
-                FORCE_HEADLESS_DISPLAY="yes"
+                if (( i + 1 < ${#args[@]} )) && [[ "${args[$((i + 1))]}" =~ ^(yes|no)$ ]]; then
+                    FORCE_HEADLESS_DISPLAY="${args[$((i + 1))]}"
+                    ((i += 1))
+                else
+                    FORCE_HEADLESS_DISPLAY="yes"
+                fi
                 ;;
             *)
                 APP_ARGS+=("${args[$i]}")
@@ -100,7 +162,7 @@ require_passwd_arg() {
         case "${args[$i]}" in
             --passwd)
                 if (( i + 1 >= ${#args[@]} )) || [[ -z "${args[$((i + 1))]}" ]]; then
-                    echo "[run] --passwd requires a non-empty value. Start with: ./run.sh --passwd <password>" >&2
+                    echo "[run] --passwd requires a non-empty value. Start with: bash run.sh --passwd passwd --port 18443 --https yes --headless no" >&2
                     exit 1
                 fi
                 return 0
@@ -108,7 +170,7 @@ require_passwd_arg() {
         esac
     done
 
-    echo "[run] missing required --passwd. Start with: ./run.sh --passwd <password>" >&2
+    echo "[run] missing required --passwd. Start with: bash run.sh --passwd passwd --port 18443 --https yes --headless no" >&2
     exit 1
 }
 
@@ -280,12 +342,45 @@ show_startup_help() {
     fi
 
     cat <<EOF
+[run] Production:  bash run.sh --passwd passwd --port 18443 --https yes --headless no
+[run] Development: bash dev.sh --passwd passwd
 [run] starting vibe_rdesk ${server_label} server
 [run] bind: ${VIBE_RDESK_BIND}
 [run] ${reminder} Default is all IPv4/IPv6 interfaces; use --localhost yes for loopback only.
+[run] Use --https no to disable built-in HTTPS and serve HTTP.
+[run] If you need HTTPS with --https no, put an HTTPS proxy in front of this server.
+[run] starting in ${STARTUP_HELP_SECONDS}s...
 EOF
+}
+
+show_server_access_urls() {
+    local protocol="$1"
+    local port
+    port="$(first_bind_port "${VIBE_RDESK_BIND}")"
+
+    if ! wait_for_server_port "${port}" && [[ -n "${APP_PID}" ]] && ! kill -0 "${APP_PID}" 2>/dev/null; then
+        return 1
+    fi
+    echo "[run] server started on ${VIBE_RDESK_BIND}"
     show_access_urls "[run]" "${protocol}" "${port}"
-    sleep "${VIBE_RDESK_HELP_SECONDS:-3}"
+}
+
+wait_for_server_port() {
+    local port="$1"
+    local attempts="${2:-60}"
+
+    while (( attempts > 0 )); do
+        if bash -c ":</dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ -n "${APP_PID}" ]] && ! kill -0 "${APP_PID}" 2>/dev/null; then
+            return 1
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
 }
 
 ensure_tls_keys() {
@@ -362,11 +457,60 @@ is_display_available() {
     fi
 
     if command -v xdpyinfo >/dev/null 2>&1; then
-        xdpyinfo -display "${display}" >/dev/null 2>&1
-        return $?
+        local info
+        if ! info="$(xdpyinfo -display "${display}" -ext XTEST 2>&1)"; then
+            return 1
+        fi
+        if printf '%s\n' "${info}" | grep -q "XTEST extension not supported"; then
+            return 1
+        fi
+        return 0
     fi
 
     DISPLAY="${display}" xdotool getmouselocation >/dev/null 2>&1
+}
+
+display_number() {
+    local display="${1:-}"
+    local normalized number
+
+    normalized="$(normalize_display "${display}")" || return 1
+    number="${normalized#:}"
+    number="${number%%.*}"
+
+    if [[ ! "${number}" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "${number}"
+}
+
+is_display_reserved() {
+    local display="${1:-}"
+    local number
+
+    number="$(display_number "${display}")" || return 0
+
+    [[ -e "/tmp/.X11-unix/X${number}" || -e "/tmp/.X${number}-lock" ]]
+}
+
+find_free_headless_display() {
+    local start_display="${1:-11}"
+    local start_number candidate attempts=100
+
+    start_number="$(display_number "${start_display}")" || start_number="11"
+
+    while (( attempts > 0 )); do
+        candidate=":${start_number}"
+        if ! is_display_reserved "${candidate}" && ! is_display_available "${candidate}"; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+        ((start_number++))
+        ((attempts--))
+    done
+
+    return 1
 }
 
 wait_for_display() {
@@ -537,6 +681,9 @@ run_as_audio_user() {
     if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
         env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
     fi
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        env_args+=("LD_LIBRARY_PATH=${LD_LIBRARY_PATH}")
+    fi
 
     if using_sudo_audio_user && command -v runuser >/dev/null 2>&1; then
         runuser -u "${SUDO_AUDIO_USER}" -- env "${env_args[@]}" "$@"
@@ -544,6 +691,51 @@ run_as_audio_user() {
     fi
 
     env "${env_args[@]}" "$@"
+}
+
+session_bus_available() {
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || return 1
+    timeout 1s dbus-send \
+        --session \
+        --type=method_call \
+        --dest=org.freedesktop.DBus \
+        / \
+        org.freedesktop.DBus.ListNames >/dev/null 2>&1
+}
+
+start_private_session_bus() {
+    if session_bus_available; then
+        return 0
+    fi
+    command -v dbus-daemon >/dev/null 2>&1 || return 0
+
+    local dbus_dir="${DEV_LOG_DIR}/dbus-$$"
+    local dbus_socket="${dbus_dir}/session-bus"
+    local dbus_output=""
+    local dbus_address=""
+    local dbus_pid=""
+
+    mkdir -p "${dbus_dir}"
+    chmod 700 "${dbus_dir}" 2>/dev/null || true
+
+    if ! dbus_output="$(dbus-daemon \
+        --session \
+        --fork \
+        --nopidfile \
+        --address="unix:path=${dbus_socket}" \
+        --print-address=1 \
+        --print-pid=1 2>"${DEV_LOG_DIR}/dbus.log")"; then
+        echo "[run] private D-Bus session bus did not start; see ${DEV_LOG_DIR}/dbus.log" >&2
+        return 0
+    fi
+
+    dbus_address="$(printf '%s\n' "${dbus_output}" | sed -n '1p')"
+    dbus_pid="$(printf '%s\n' "${dbus_output}" | sed -n '2p')"
+    if [[ -n "${dbus_address}" && "${dbus_pid}" =~ ^[0-9]+$ ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="${dbus_address}"
+        DBUS_PID="${dbus_pid}"
+        echo "[run] started private D-Bus session bus"
+    fi
 }
 
 ensure_dev_log_dir() {
@@ -569,7 +761,7 @@ source_exists() {
         return 1
     fi
 
-    pactl list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "${source_name}"
+    run_as_audio_user timeout 1s pactl list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "${source_name}"
 }
 
 sink_exists() {
@@ -578,7 +770,7 @@ sink_exists() {
         return 1
     fi
 
-    pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "${sink_name}"
+    run_as_audio_user timeout 1s pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "${sink_name}"
 }
 
 wait_for_pipewire_server() {
@@ -705,23 +897,92 @@ wait_for_source() {
 }
 
 wait_for_pulse_server() {
-    local attempts=20
+    local attempts="${1:-10}"
 
     while (( attempts > 0 )); do
-        if pactl info >/dev/null 2>&1; then
+        if run_as_audio_user timeout 0.5s pactl info >/dev/null 2>&1; then
             return 0
         fi
-        sleep 0.25
+        sleep 0.2
         ((attempts--))
     done
 
     return 1
 }
 
+start_private_pulse_server() {
+    local pulse_dir="${DEV_LOG_DIR}/pulse-$$"
+    local pulse_socket="${pulse_dir}/native"
+    local log_file="${DEV_LOG_DIR}/pulseaudio-private.log"
+    local pulse_module_dir=""
+    local pulse_module_args=()
+
+    prepare_dev_log_file "${log_file}"
+    mkdir -p "${pulse_dir}"
+    chmod 700 "${pulse_dir}" 2>/dev/null || true
+    if using_sudo_audio_user; then
+        chown -R "${SUDO_AUDIO_USER}:" "${pulse_dir}" 2>/dev/null || true
+    fi
+
+    export PULSE_SERVER="unix:${pulse_socket}"
+    if [[ -n "${APPDIR:-}" ]]; then
+        for dir in "${APPDIR}"/usr/lib/pulse-*/modules "${APPDIR}"/usr/lib/*/pulse-*/modules; do
+            if [[ -d "${dir}" ]]; then
+                pulse_module_dir="${dir}"
+                break
+            fi
+        done
+    fi
+    if [[ -n "${pulse_module_dir}" ]]; then
+        pulse_module_args=(--dl-search-path="${pulse_module_dir}")
+    fi
+    echo "[dev] starting private PulseAudio server at ${pulse_socket}"
+    local saved_dbus_session_bus_address="${DBUS_SESSION_BUS_ADDRESS-}"
+    local saved_ld_library_path="${LD_LIBRARY_PATH-}"
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=${pulse_dir}/dbus-disabled"
+    if [[ -n "${pulse_module_dir}" ]]; then
+        export LD_LIBRARY_PATH="${pulse_module_dir}:${LD_LIBRARY_PATH:-}"
+    fi
+    run_as_audio_user pulseaudio \
+        "${pulse_module_args[@]}" \
+        -n \
+        --daemonize=no \
+        --exit-idle-time=-1 \
+        --disallow-exit=yes \
+        --use-pid-file=no \
+        --log-target=stderr \
+        --load="module-native-protocol-unix socket=${pulse_socket} auth-anonymous=1" \
+        --load="module-null-sink sink_name=${VIRTUAL_MIC_SINK_NAME} sink_properties=device.description=VibeRDeskVirtualMicSink" \
+        >"${log_file}" 2>&1 &
+    PULSE_PID=$!
+    if [[ -n "${saved_dbus_session_bus_address}" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="${saved_dbus_session_bus_address}"
+    else
+        unset DBUS_SESSION_BUS_ADDRESS
+    fi
+    if [[ -n "${saved_ld_library_path}" ]]; then
+        export LD_LIBRARY_PATH="${saved_ld_library_path}"
+    else
+        unset LD_LIBRARY_PATH
+    fi
+
+    if wait_for_pulse_server; then
+        return 0
+    fi
+
+    echo "[dev] private PulseAudio did not become ready; see ${log_file}" >&2
+    return 1
+}
+
 start_pulse_server() {
-    if pactl info >/dev/null 2>&1; then
+    if run_as_audio_user timeout 1s pactl info >/dev/null 2>&1; then
         echo "[dev] using existing PulseAudio server"
         return 0
+    fi
+
+    if [[ -n "${APPDIR:-}" ]]; then
+        start_private_pulse_server
+        return $?
     fi
 
     if command -v dbus-launch >/dev/null 2>&1; then
@@ -737,7 +998,8 @@ start_pulse_server() {
 
     if ! wait_for_pulse_server; then
         echo "[dev] PulseAudio did not become ready" >&2
-        return 1
+        start_private_pulse_server
+        return $?
     fi
 }
 
@@ -758,7 +1020,7 @@ start_pipewire_server() {
 }
 
 pipewire_uses_pulse_server() {
-    pactl info 2>/dev/null | grep -Fq 'Server Name: PulseAudio (on PipeWire'
+    run_as_audio_user timeout 1s pactl info 2>/dev/null | grep -Fq 'Server Name: PulseAudio (on PipeWire'
 }
 
 start_audio_server() {
@@ -835,7 +1097,7 @@ ensure_pulse_virtual_mic() {
 
     if ! sink_exists "${VIRTUAL_MIC_SINK_NAME}"; then
         echo "[dev] creating virtual mic sink ${VIRTUAL_MIC_SINK_NAME}"
-        pactl load-module \
+        run_as_audio_user pactl load-module \
             module-null-sink \
             "sink_name=${VIRTUAL_MIC_SINK_NAME}" \
             "sink_properties=device.description=VibeRDeskVirtualMicSink" \
@@ -843,7 +1105,7 @@ ensure_pulse_virtual_mic() {
     fi
 
     echo "[dev] creating virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
-    pactl load-module \
+    run_as_audio_user pactl load-module \
         module-remap-source \
         "source_name=${VIRTUAL_MIC_SOURCE_NAME}" \
         "master=${VIRTUAL_MIC_SINK_NAME}.monitor" \
@@ -867,42 +1129,62 @@ ensure_virtual_mic() {
 
 start_headless_display() {
     export DISPLAY
-    DISPLAY="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
+    if ! DISPLAY="$(find_free_headless_display "${HEADLESS_DISPLAY_RAW}")"; then
+        echo "[run] could not find a free X11 display starting at $(normalize_display "${HEADLESS_DISPLAY_RAW}")" >&2
+        exit 1
+    fi
     export VIBE_RDESK_INPUT_BACKEND="${VIBE_RDESK_INPUT_BACKEND:-${HEADLESS_INPUT_BACKEND}}"
 
-    if is_display_available "${DISPLAY}"; then
-        echo "[dev] using existing X server on ${DISPLAY}"
-        return 0
-    fi
-
     if ! command -v Xvfb >/dev/null 2>&1; then
-        echo "[dev] Xvfb is required for headless startup. Install it first." >&2
+        echo "[run] Xvfb is required for headless startup. Install it first." >&2
         exit 1
     fi
 
     local launcher_program="${HEADLESS_LAUNCHER%%[[:space:]]*}"
     if [[ -z "${launcher_program}" ]] || ! command -v "${launcher_program}" >/dev/null 2>&1; then
-        echo "[dev] launcher '${HEADLESS_LAUNCHER}' is not available. Install it first or use --launcher <command>." >&2
+        echo "[run] launcher '${HEADLESS_LAUNCHER}' is not available. Install it first or use --launcher <command>." >&2
         exit 1
     fi
 
     local xvfb_log="${DEV_LOG_DIR}/xvfb.log"
     local launcher_log="${DEV_LOG_DIR}/launcher.log"
+    local xkb_args=()
 
-    echo "[dev] starting Xvfb on ${DISPLAY}"
+    if [[ -n "${XKB_CONFIG_ROOT:-}" && -d "${XKB_CONFIG_ROOT}" ]]; then
+        xkb_args=(-xkbdir "${XKB_CONFIG_ROOT}")
+    elif [[ -n "${APPDIR:-}" && -d "${APPDIR}/usr/share/X11/xkb" ]]; then
+        xkb_args=(-xkbdir "${APPDIR}/usr/share/X11/xkb")
+    fi
+
+    echo "[run] starting Xvfb on ${DISPLAY}"
     prepare_dev_log_file "${xvfb_log}"
-    Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp >"${xvfb_log}" 2>&1 &
+    {
+        echo "[run] PATH=${PATH}"
+        echo "[run] XKB_CONFIG_ROOT=${XKB_CONFIG_ROOT:-}"
+        echo "[run] bundled keycodes evdev: ${XKB_CONFIG_ROOT:-}/keycodes/evdev"
+        echo "[run] xkbcomp: $(command -v xkbcomp 2>/dev/null || true)"
+        echo "[run] ICEWM_PRIVCFG=${ICEWM_PRIVCFG:-}"
+        echo "[run] XCURSOR_PATH=${XCURSOR_PATH:-}"
+        echo "[run] GDK_PIXBUF_MODULEDIR=${GDK_PIXBUF_MODULEDIR:-}"
+        echo "[run] GDK_PIXBUF_MODULE_FILE=${GDK_PIXBUF_MODULE_FILE:-}"
+        echo "[run] Xvfb args: ${DISPLAY} -screen 0 ${XVFB_SCREEN} -ac -nolisten tcp ${xkb_args[*]}"
+    } >>"${xvfb_log}"
+    Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp "${xkb_args[@]}" >>"${xvfb_log}" 2>&1 &
     XVFB_PID=$!
 
     if ! wait_for_display "${DISPLAY}"; then
-        echo "[dev] Xvfb on ${DISPLAY} did not become ready; see ${xvfb_log}" >&2
+        echo "[run] Xvfb on ${DISPLAY} did not become ready; see ${xvfb_log}" >&2
         exit 1
     fi
 
+    echo "[run] created headless X11 display ${DISPLAY}"
+    sleep "${NEW_DISPLAY_NOTICE_SECONDS}"
+
     sleep "${WINDOW_MANAGER_DELAY_SECONDS}"
 
-    echo "[dev] starting launcher '${HEADLESS_LAUNCHER}' on ${DISPLAY}"
+    echo "[run] starting launcher '${HEADLESS_LAUNCHER}' on ${DISPLAY}"
     prepare_dev_log_file "${launcher_log}"
+    export VIBE_RDESK_HEADLESS_DISPLAY_ACTIVE=1
     if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]]; then
         DISPLAY="${DISPLAY}" xterm \
             -display "${DISPLAY}" \
@@ -917,30 +1199,57 @@ start_headless_display() {
     LAUNCHER_PID=$!
 
     if ! wait_for_process "${LAUNCHER_PID}" 4; then
-        echo "[dev] launcher '${HEADLESS_LAUNCHER}' exited during startup; see ${launcher_log}" >&2
-        exit 1
+        echo "[run] launcher '${HEADLESS_LAUNCHER}' exited during startup; see ${launcher_log}" >&2
+        if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]] || ! command -v xterm >/dev/null 2>&1; then
+            exit 1
+        fi
+        echo "[run] falling back to xterm as the headless launcher"
+        DISPLAY="${DISPLAY}" xterm \
+            -display "${DISPLAY}" \
+            -title "vibe_rdesk" \
+            -fa "${XTERM_FONT_FAMILY}" \
+            -fs "${XTERM_FONT_SIZE}" \
+            -geometry 120x30+40+40 \
+            >>"${launcher_log}" 2>&1 &
+        LAUNCHER_PID=$!
+        wait_for_process "${LAUNCHER_PID}" 4 || {
+            echo "[run] fallback xterm exited during startup; see ${launcher_log}" >&2
+            exit 1
+        }
+    fi
+
+    if [[ "${HEADLESS_LAUNCHER}" != "xterm" && "${VIBE_RDESK_START_XTERM:-1}" != "0" ]] && command -v xterm >/dev/null 2>&1; then
+        DISPLAY="${DISPLAY}" xterm \
+            -display "${DISPLAY}" \
+            -title "vibe_rdesk" \
+            -fa "${XTERM_FONT_FAMILY}" \
+            -fs "${XTERM_FONT_SIZE}" \
+            -geometry 120x30+40+40 \
+            >>"${launcher_log}" 2>&1 &
+        XTERM_PID=$!
+        wait_for_process "${XTERM_PID}" 4 || true
     fi
 }
 
 ensure_display() {
-    local fallback_display
-    fallback_display="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
+    local start_display
+    start_display="$(normalize_display "${HEADLESS_DISPLAY_RAW}")"
 
     if [[ "${FORCE_HEADLESS_DISPLAY}" == "yes" ]]; then
-        echo "[dev] force-starting headless X11 on ${fallback_display}"
+        echo "[run] force-starting headless X11 at first free display from ${start_display}"
         start_headless_display
         return 0
     fi
 
     if [[ -n "${DISPLAY:-}" ]]; then
         if is_display_available "${DISPLAY}"; then
-            echo "[dev] using existing X server on ${DISPLAY}"
+            echo "[run] using existing X server on ${DISPLAY}"
             return 0
         fi
 
-        echo "[dev] DISPLAY=${DISPLAY} is set but unavailable; falling back to ${fallback_display}"
+        echo "[run] DISPLAY=${DISPLAY} is set but unavailable or missing XTEST; starting headless X11 at first free display from ${start_display}"
     else
-        echo "[dev] DISPLAY is not set; starting headless X11 on ${fallback_display}"
+        echo "[run] DISPLAY is not set; starting headless X11 at first free display from ${start_display}"
     fi
 
     start_headless_display
@@ -957,6 +1266,11 @@ cleanup() {
         wait "${LAUNCHER_PID}" 2>/dev/null || true
     fi
 
+    if [[ -n "${XTERM_PID}" ]] && kill -0 "${XTERM_PID}" 2>/dev/null; then
+        kill "${XTERM_PID}" 2>/dev/null || true
+        wait "${XTERM_PID}" 2>/dev/null || true
+    fi
+
     if [[ -n "${XVFB_PID}" ]] && kill -0 "${XVFB_PID}" 2>/dev/null; then
         kill "${XVFB_PID}" 2>/dev/null || true
         wait "${XVFB_PID}" 2>/dev/null || true
@@ -971,22 +1285,23 @@ cleanup() {
         kill "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null || true
         wait "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null || true
     fi
+
+    if [[ -n "${DBUS_PID}" ]] && kill -0 "${DBUS_PID}" 2>/dev/null; then
+        kill "${DBUS_PID}" 2>/dev/null || true
+        wait "${DBUS_PID}" 2>/dev/null || true
+    fi
 }
 
-build_and_run() {
-    echo "[run] building optimized release binary..."
-    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-1}"
-    export CARGO_PROFILE_RELEASE_INCREMENTAL="${CARGO_PROFILE_RELEASE_INCREMENTAL:-false}"
-    export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-thin}"
-    export CARGO_PROFILE_RELEASE_PANIC="${CARGO_PROFILE_RELEASE_PANIC:-abort}"
-    if [[ "${VIBE_RDESK_TARGET_CPU_NATIVE:-1}" == "1" ]]; then
-        export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=native"
+run_server() {
+    if [[ ! -x "${APP_BINARY}" ]]; then
+        echo "[run] ${APP_BINARY} is missing or not executable. Build it first with ./build.sh." >&2
+        exit 1
     fi
-    cargo build --release
 
-    echo "[run] starting HTTPS app on ${VIBE_RDESK_BIND}"
-    target/release/vibe_rdesk "$@" &
+    echo "[run] starting app..."
+    "${APP_BINARY}" "$@" &
     APP_PID=$!
+    show_server_access_urls "${SERVER_PROTOCOL}"
     wait "${APP_PID}"
 }
 
@@ -1011,20 +1326,27 @@ parse_script_args "$@"
 require_passwd_arg "${APP_ARGS[@]}"
 configure_bind_args "${APP_ARGS[@]}"
 if [[ "${HTTPS_ENABLED}" == "yes" ]]; then
-    show_startup_help "https"
-    ensure_tls_keys
-    export VIBE_RDESK_TLS_CERT="${SSL_CERT}"
-    export VIBE_RDESK_TLS_KEY="${SSL_KEY}"
+    SERVER_PROTOCOL="https"
 else
-    show_startup_help "http"
+    SERVER_PROTOCOL="http"
     unset VIBE_RDESK_TLS_CERT
     unset VIBE_RDESK_TLS_KEY
 fi
+show_startup_help "${SERVER_PROTOCOL}"
+sleep "${STARTUP_HELP_SECONDS}"
+if [[ "${HTTPS_ENABLED}" == "yes" ]]; then
+    ensure_tls_keys
+    export VIBE_RDESK_TLS_CERT="${SSL_CERT}"
+    export VIBE_RDESK_TLS_KEY="${SSL_KEY}"
+fi
 configure_sudo_audio_env
 ensure_dev_log_dir
+configure_appimage_desktop_env
+prepare_gdk_pixbuf_cache
+start_private_session_bus
 ensure_uinput_access
 ensure_display
 start_audio_server
 ensure_virtual_mic
 
-build_and_run "${APP_ARGS[@]}"
+run_server "${APP_ARGS[@]}"

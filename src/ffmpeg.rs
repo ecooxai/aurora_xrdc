@@ -13,6 +13,7 @@ use crate::settings::{
     AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, EncoderQualityMode,
     ServerConfig, StreamConfig, VideoScale,
 };
+use crate::x11_input::screen_size;
 
 #[derive(Debug, Clone)]
 pub struct EncoderChoice {
@@ -457,11 +458,16 @@ pub fn spawn_capture(
         "low_delay",
     ]);
     append_hw_device_args(&mut cmd, backend)?;
+    let capture_size = screen_size(&server.display)
+        .map(|(width, height)| format!("{width}x{height}"))
+        .with_context(|| format!("failed to query X11 screen size for {}", server.display))?;
     cmd.args([
         "-f",
         "x11grab",
         "-framerate",
         &fps,
+        "-video_size",
+        &capture_size,
         "-i",
         &server.display,
         "-an",
@@ -1176,50 +1182,54 @@ where
 
 async fn wake_display_once(display: &str, errors: &mut Vec<String>) -> bool {
     let mut woke = false;
+    let headless_display = std::env::var_os("VIBE_RDESK_HEADLESS_DISPLAY_ACTIVE").is_some();
+
     record_wake_result(
         "xset s reset",
         run_xset(display, ["s", "reset"]).await,
         &mut woke,
         errors,
     );
-    record_wake_result(
-        "xset dpms force on",
-        run_xset(display, ["dpms", "force", "on"]).await,
-        &mut woke,
-        errors,
-    );
-    record_wake_result(
-        "dbus-send org.freedesktop.ScreenSaver.SimulateUserActivity",
-        run_dbus_send(
-            display,
-            [
-                "--session",
-                "--type=method_call",
-                "--dest=org.freedesktop.ScreenSaver",
-                "/ScreenSaver",
-                "org.freedesktop.ScreenSaver.SimulateUserActivity",
-            ],
-        )
-        .await,
-        &mut woke,
-        errors,
-    );
-    record_wake_result(
-        "dbus-send org.gnome.ScreenSaver.SimulateUserActivity",
-        run_dbus_send(
-            display,
-            [
-                "--session",
-                "--type=method_call",
-                "--dest=org.gnome.ScreenSaver",
-                "/org/gnome/ScreenSaver",
-                "org.gnome.ScreenSaver.SimulateUserActivity",
-            ],
-        )
-        .await,
-        &mut woke,
-        errors,
-    );
+    if !headless_display {
+        record_wake_result(
+            "xset dpms force on",
+            run_xset(display, ["dpms", "force", "on"]).await,
+            &mut woke,
+            errors,
+        );
+        record_wake_result(
+            "dbus-send org.freedesktop.ScreenSaver.SimulateUserActivity",
+            run_dbus_send(
+                display,
+                [
+                    "--session",
+                    "--type=method_call",
+                    "--dest=org.freedesktop.ScreenSaver",
+                    "/ScreenSaver",
+                    "org.freedesktop.ScreenSaver.SimulateUserActivity",
+                ],
+            )
+            .await,
+            &mut woke,
+            errors,
+        );
+        record_wake_result(
+            "dbus-send org.gnome.ScreenSaver.SimulateUserActivity",
+            run_dbus_send(
+                display,
+                [
+                    "--session",
+                    "--type=method_call",
+                    "--dest=org.gnome.ScreenSaver",
+                    "/org/gnome/ScreenSaver",
+                    "org.gnome.ScreenSaver.SimulateUserActivity",
+                ],
+            )
+            .await,
+            &mut woke,
+            errors,
+        );
+    }
     record_wake_result(
         "xdotool pointer wiggle",
         wiggle_pointer(display).await,

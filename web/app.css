@@ -1,6 +1,6 @@
 :root {
   color-scheme: dark;
-  --bg: #050607;
+  --bg: #242424;
   --panel: rgba(13, 18, 20, 0.94);
   --panel-border: rgba(190, 221, 234, 0.12);
   --text: #eef5f8;
@@ -170,7 +170,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   border: none;
   border-radius: 0;
   box-shadow: none;
-  background: #000;
+  background: #202020;
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
@@ -191,7 +191,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   margin: 0 auto;
   border: none;
   border-radius: 0;
-  background: #000;
+  background: #202020;
   touch-action: none;
   outline: none;
   user-select: none;
