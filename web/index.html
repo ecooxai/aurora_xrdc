@@ -188,6 +188,11 @@
                   </article>
                 </div>
                 <div class="menu-grid">
+                  <label class="toggle-label">
+                    <span>Enable remote audio</span>
+                    <input id="audio-real-output" type="checkbox" />
+                  </label>
+                  <span id="audio-output-status" class="field-help">Virtual output</span>
                   <label>Audio playback bitrate
                     <select id="audio-bitrate">
                       <option value="16">16 kbps</option>
@@ -221,6 +226,10 @@
                   <label>Audio latency
                     <input id="audio-latency" type="range" min="0" max="2000" step="10" value="400" />
                     <span id="audio-latency-value">400 ms</span>
+                  </label>
+                  <label>Audio volume
+                    <input id="audio-volume" type="range" min="0" max="100" step="1" value="100" />
+                    <span id="audio-volume-value">100%</span>
                   </label>
                   <label>Audio clock speed
                     <input id="audio-clock-rate" type="range" min="0.9100" max="1.1" step="0.0005" value="1.0000" />

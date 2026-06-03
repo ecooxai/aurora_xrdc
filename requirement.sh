@@ -43,6 +43,7 @@ install_pacman() {
     xorg-server-xvfb \
     xorg-xauth \
     xorg-xdpyinfo \
+    xorg-xprop \
     xterm
 }
 

@@ -36,6 +36,14 @@ pub struct AvailableCodecOption {
     pub label: &'static str,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioOutputDevice {
+    pub name: String,
+    pub description: String,
+    pub is_virtual: bool,
+    pub is_default: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncoderBackend {
     Cpu,
@@ -872,8 +880,9 @@ pub async fn spawn_audio_capture(
     cmd.spawn().context("failed to spawn ffmpeg audio capture")
 }
 
-pub async fn warm_audio_stack() -> Result<()> {
+pub async fn warm_audio_stack(server: &ServerConfig) -> Result<()> {
     ensure_pulse_server().await?;
+    ensure_virtual_sink(server).await?;
     ensure_virtual_mic_source().await?;
     Ok(())
 }
@@ -1295,6 +1304,73 @@ async fn ensure_pulse_monitor_source(server: &ServerConfig) -> Result<String> {
     ensure_virtual_sink(server).await
 }
 
+pub fn project_virtual_audio_sink_name(server: &ServerConfig) -> String {
+    std::env::var("VIBE_RDESK_AUDIO_SINK")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("vibe_rdesk_{}", server.display.replace([':', '.'], "_")))
+}
+
+pub async fn list_audio_output_devices(server: &ServerConfig) -> Result<Vec<AudioOutputDevice>> {
+    ensure_pulse_server().await?;
+    ensure_virtual_sink_exists(server).await?;
+    let virtual_sink = project_virtual_audio_sink_name(server);
+    let default_sink = pactl(["get-default-sink"])
+        .await
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let sinks = pactl(["list", "short", "sinks"]).await?;
+    Ok(sinks
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let _index = parts.next()?;
+            let name = parts.next()?.to_string();
+            let is_virtual = is_project_virtual_sink(&name, &virtual_sink);
+            Some(AudioOutputDevice {
+                description: name.clone(),
+                is_default: name == default_sink,
+                is_virtual,
+                name,
+            })
+        })
+        .collect())
+}
+
+pub async fn set_audio_output_device(
+    server: &ServerConfig,
+    use_real_device: bool,
+    requested_sink: Option<&str>,
+) -> Result<AudioOutputDevice> {
+    ensure_pulse_server().await?;
+    ensure_virtual_sink_exists(server).await?;
+    let virtual_sink = project_virtual_audio_sink_name(server);
+    let devices = list_audio_output_devices(server).await?;
+    let target = if use_real_device {
+        let requested = requested_sink
+            .map(str::trim)
+            .filter(|sink| !sink.is_empty());
+        devices
+            .iter()
+            .find(|device| !device.is_virtual && requested.is_some_and(|sink| sink == device.name))
+            .or_else(|| devices.iter().find(|device| !device.is_virtual))
+            .ok_or_else(|| anyhow!("no real audio output devices are available"))?
+            .name
+            .clone()
+    } else {
+        virtual_sink
+    };
+    pactl(["set-default-sink", &target]).await?;
+    move_sink_inputs(&target).await?;
+    let devices = list_audio_output_devices(server).await?;
+    devices
+        .into_iter()
+        .find(|device| device.name == target)
+        .ok_or_else(|| anyhow!("audio output sink {target} disappeared after switching"))
+}
+
 fn find_virtual_camera_device() -> Result<Option<String>> {
     let dir = match std::fs::read_dir("/sys/class/video4linux") {
         Ok(dir) => dir,
@@ -1344,12 +1420,19 @@ async fn default_monitor_source() -> Result<Option<String>> {
 }
 
 async fn ensure_virtual_sink(server: &ServerConfig) -> Result<String> {
+    let (sink_name, monitor_source) = ensure_virtual_sink_exists(server).await?;
+    pactl(["set-default-sink", &sink_name]).await?;
+    move_sink_inputs(&sink_name).await?;
+    Ok(monitor_source)
+}
+
+async fn ensure_virtual_sink_exists(server: &ServerConfig) -> Result<(String, String)> {
     let _ = ensure_pulse_server().await;
-    let sink_name = std::env::var("VIBE_RDESK_AUDIO_SINK")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| format!("vibe_rdesk_{}", server.display.replace([':', '.'], "_")));
+    let mut sink_name = project_virtual_audio_sink_name(server);
     if !sink_exists(&sink_name).await? {
+        if let Some(existing_sink) = pulse_device_by_description("sinks", "VibeRDesk").await? {
+            sink_name = existing_sink;
+        } else {
         let _module_id = pactl([
             "load-module",
             "module-null-sink",
@@ -1358,10 +1441,15 @@ async fn ensure_virtual_sink(server: &ServerConfig) -> Result<String> {
         ])
         .await?;
         wait_for_sink(&sink_name).await?;
+        }
     }
-    pactl(["set-default-sink", &sink_name]).await?;
-    move_sink_inputs(&sink_name).await?;
-    Ok(format!("{sink_name}.monitor"))
+    Ok((sink_name.clone(), format!("{sink_name}.monitor")))
+}
+
+fn is_project_virtual_sink(sink_name: &str, virtual_sink: &str) -> bool {
+    sink_name == virtual_sink
+        || sink_name == VIRTUAL_MIC_SINK_NAME
+        || sink_name.starts_with("vibe_rdesk_")
 }
 
 async fn ensure_virtual_mic_source() -> Result<String> {
@@ -1369,7 +1457,18 @@ async fn ensure_virtual_mic_source() -> Result<String> {
     if source_exists(VIRTUAL_MIC_SOURCE_NAME).await? {
         return Ok(VIRTUAL_MIC_SOURCE_NAME.into());
     }
-    if !sink_exists(VIRTUAL_MIC_SINK_NAME).await? {
+
+    if let Some(existing_source) = pulse_device_by_description("sources", VIRTUAL_MIC_SOURCE_NAME).await? {
+        return Ok(existing_source);
+    }
+
+    let mut mic_sink_name = VIRTUAL_MIC_SINK_NAME.to_string();
+    if !sink_exists(&mic_sink_name).await? {
+        if let Some(existing_sink) =
+            pulse_device_by_description("sinks", "VibeRDeskVirtualMicSink").await?
+        {
+            mic_sink_name = existing_sink;
+        } else {
         pactl([
             "load-module",
             "module-null-sink",
@@ -1378,13 +1477,14 @@ async fn ensure_virtual_mic_source() -> Result<String> {
         ])
         .await?;
         wait_for_sink(VIRTUAL_MIC_SINK_NAME).await?;
+        }
     }
     if !source_exists(VIRTUAL_MIC_SOURCE_NAME).await? {
         pactl([
             "load-module",
             "module-remap-source",
             &format!("source_name={VIRTUAL_MIC_SOURCE_NAME}"),
-            &format!("master={VIRTUAL_MIC_SINK_NAME}.monitor"),
+            &format!("master={mic_sink_name}.monitor"),
             &format!("source_properties=device.description={VIRTUAL_MIC_SOURCE_NAME}"),
         ])
         .await?;
@@ -1453,6 +1553,31 @@ async fn source_exists(source_name: &str) -> Result<bool> {
     Ok(sources
         .lines()
         .any(|line| line.split_whitespace().nth(1) == Some(source_name)))
+}
+
+async fn pulse_device_by_description(kind: &str, description: &str) -> Result<Option<String>> {
+    let output = pactl(["list", kind]).await?;
+    let mut current_name: Option<String> = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix("Name: ") {
+            current_name = Some(name.to_string());
+            continue;
+        }
+
+        let Some(value) = trimmed.strip_prefix("device.description = \"") else {
+            continue;
+        };
+        let Some(value) = value.strip_suffix('"') else {
+            continue;
+        };
+        if value == description {
+            return Ok(current_name);
+        }
+    }
+
+    Ok(None)
 }
 
 async fn wait_for_sink(sink_name: &str) -> Result<()> {

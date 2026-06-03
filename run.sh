@@ -50,15 +50,18 @@ REBUILD_RETRY_SECONDS=10
 HEADLESS_DISPLAY_RAW="${VIBE_RDESK_HEADLESS_DISPLAY:-11}"
 XVFB_SCREEN="${VIBE_RDESK_XVFB_SCREEN:-1280x720x24}"
 WINDOW_MANAGER_DELAY_SECONDS=2
+POST_SERVER_LAUNCHER_DELAY_SECONDS="${VIBE_RDESK_POST_SERVER_LAUNCHER_DELAY_SECONDS:-2}"
 XTERM_FONT_FAMILY="${VIBE_RDESK_XTERM_FONT_FAMILY:-Monospace}"
 XTERM_FONT_SIZE="${VIBE_RDESK_XTERM_FONT_SIZE:-10}"
 HEADLESS_LAUNCHER="${VIBE_RDESK_HEADLESS_LAUNCHER:-${SCRIPT_DIR}/vendor/aurora-wm}"
 HEADLESS_INPUT_BACKEND="${VIBE_RDESK_HEADLESS_INPUT_BACKEND:-x11}"
 FORCE_HEADLESS_DISPLAY="${VIBE_RDESK_FORCE_HEADLESS_DISPLAY:-no}"
+CONTINUE_ON_XVFB_ERROR="${VIBE_RDESK_CONTINUE_ON_XVFB_ERROR:-no}"
 NEW_DISPLAY_NOTICE_SECONDS="${VIBE_RDESK_NEW_DISPLAY_NOTICE_SECONDS:-3}"
 STARTUP_HELP_SECONDS="${VIBE_RDESK_HELP_SECONDS:-3}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
+VIRTUAL_AUDIO_SINK_NAME="${VIBE_RDESK_AUDIO_SINK:-}"
 DEFAULT_HTTPS_PORT=18443
 DEFAULT_HTTP_PORT=18080
 VIBE_RDESK_BIND_WAS_SET=0
@@ -81,6 +84,7 @@ PULSE_PID=""
 PIPEWIRE_LOOPBACK_PID=""
 XTERM_PID=""
 DBUS_PID=""
+HEADLESS_LAUNCHER_PENDING=0
 HTTPS_ENABLED="yes"
 
 if [[ -n "${APPDIR:-}" && -z "${VIBE_RDESK_SSL_DIR:-}" && -d "${APPDIR}/ssl_keys" ]]; then
@@ -450,15 +454,82 @@ normalize_display() {
     fi
 }
 
+appimage_helper_path() {
+    local name="${1:-}"
+    local candidate
+
+    if [[ -n "${APPDIR:-}" && -n "${name}" ]]; then
+        for candidate in "${APPDIR}/usr/bin/${name}" "${APPDIR}/usr/sbin/${name}"; do
+            if [[ -x "${candidate}" ]]; then
+                printf '%s\n' "${candidate}"
+                return 0
+            fi
+        done
+    fi
+
+    command -v "${name}" 2>/dev/null || return 1
+}
+
+appimage_helper_path_env() {
+    local base_path="${PATH}"
+
+    if [[ -n "${APPDIR:-}" ]]; then
+        printf '%s:%s:%s\n' "${APPDIR}/usr/bin" "${APPDIR}/usr/sbin" "${base_path}"
+        return 0
+    fi
+
+    printf '%s\n' "${base_path}"
+}
+
+launcher_path_env() {
+    local base_path="${VIBE_RDESK_HOST_PATH:-${PATH}}"
+
+    if [[ -n "${APPDIR:-}" ]]; then
+        printf '%s:%s:%s\n' "${base_path}" "${APPDIR}/usr/bin" "${APPDIR}/usr/sbin"
+        return 0
+    fi
+
+    printf '%s\n' "${base_path}"
+}
+
+choose_xkb_config_root() {
+    local root
+    local candidates=()
+
+    if [[ -n "${VIBE_RDESK_XKB_CONFIG_ROOT:-}" ]]; then
+        candidates+=("${VIBE_RDESK_XKB_CONFIG_ROOT}")
+    fi
+    candidates+=("/usr/share/X11/xkb")
+    if [[ -n "${XKB_CONFIG_ROOT:-}" ]]; then
+        candidates+=("${XKB_CONFIG_ROOT}")
+    fi
+    if [[ -n "${VIBE_RDESK_BUNDLED_XKB_CONFIG_ROOT:-}" ]]; then
+        candidates+=("${VIBE_RDESK_BUNDLED_XKB_CONFIG_ROOT}")
+    fi
+    if [[ -n "${APPDIR:-}" ]]; then
+        candidates+=("${APPDIR}/usr/share/X11/xkb")
+    fi
+
+    for root in "${candidates[@]}"; do
+        if [[ -d "${root}" ]]; then
+            printf '%s\n' "${root}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 is_display_available() {
     local display="${1:-}"
+    local xdpyinfo_bin xdotool_bin
     if [[ -z "${display}" ]]; then
         return 1
     fi
 
-    if command -v xdpyinfo >/dev/null 2>&1; then
+    if xdpyinfo_bin="$(appimage_helper_path xdpyinfo)"; then
         local info
-        if ! info="$(xdpyinfo -display "${display}" -ext XTEST 2>&1)"; then
+        if ! info="$("${xdpyinfo_bin}" -display "${display}" -ext XTEST 2>&1)"; then
             return 1
         fi
         if printf '%s\n' "${info}" | grep -q "XTEST extension not supported"; then
@@ -467,7 +538,24 @@ is_display_available() {
         return 0
     fi
 
-    DISPLAY="${display}" xdotool getmouselocation >/dev/null 2>&1
+    if xdotool_bin="$(appimage_helper_path xdotool)"; then
+        DISPLAY="${display}" "${xdotool_bin}" getmouselocation >/dev/null 2>&1
+        return $?
+    fi
+
+    return 1
+}
+
+display_has_window_manager() {
+    local display="${1:-}"
+    local xprop_bin
+    local wm_check=""
+    if [[ -z "${display}" ]] || ! xprop_bin="$(appimage_helper_path xprop)"; then
+        return 1
+    fi
+
+    wm_check="$(DISPLAY="${display}" "${xprop_bin}" -root _NET_SUPPORTING_WM_CHECK 2>/dev/null || true)"
+    [[ "${wm_check}" == *"window id #"* && "${wm_check}" != *"not found"* ]]
 }
 
 display_number() {
@@ -666,8 +754,33 @@ using_sudo_audio_user() {
     [[ "$(id -u)" -eq 0 && -n "${SUDO_AUDIO_USER}" && -n "${SUDO_AUDIO_UID}" && "${SUDO_AUDIO_UID}" != "0" ]]
 }
 
+command_needs_appimage_library_path() {
+    [[ -n "${APPDIR:-}" ]] || return 1
+
+    local arg base resolved
+    for arg in "$@"; do
+        [[ -n "${arg}" ]] || continue
+        base="${arg##*/}"
+        case "${base}" in
+            Xvfb|dbus-daemon|dbus-launch|dbus-send|ip|modprobe|openssl|pactl|pipewire|pipewire-pulse|pulseaudio|pw-cli|pw-loopback|timeout|udevadm|wireplumber|wpctl|xclip|xdotool|xdpyinfo|xset|xterm)
+                if [[ "${arg}" == */* ]]; then
+                    resolved="${arg}"
+                else
+                    resolved="$(command -v "${arg}" 2>/dev/null || true)"
+                fi
+                if [[ -n "${resolved}" && "${resolved}" == "${APPDIR}/"* ]]; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+
+    return 1
+}
+
 run_as_audio_user() {
     local -a env_args=()
+    local -a unset_env_args=()
 
     if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
         env_args+=("XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}")
@@ -681,16 +794,22 @@ run_as_audio_user() {
     if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
         env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
     fi
-    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    if [[ -n "${APPDIR:-}" ]] && ! command_needs_appimage_library_path "$@"; then
+        if [[ -n "${VIBE_RDESK_HOST_LD_LIBRARY_PATH+x}" ]]; then
+            env_args+=("LD_LIBRARY_PATH=${VIBE_RDESK_HOST_LD_LIBRARY_PATH}")
+        else
+            unset_env_args+=("-u" "LD_LIBRARY_PATH")
+        fi
+    elif [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
         env_args+=("LD_LIBRARY_PATH=${LD_LIBRARY_PATH}")
     fi
 
     if using_sudo_audio_user && command -v runuser >/dev/null 2>&1; then
-        runuser -u "${SUDO_AUDIO_USER}" -- env "${env_args[@]}" "$@"
+        runuser -u "${SUDO_AUDIO_USER}" -- env "${unset_env_args[@]}" "${env_args[@]}" "$@"
         return $?
     fi
 
-    env "${env_args[@]}" "$@"
+    env "${unset_env_args[@]}" "${env_args[@]}" "$@"
 }
 
 session_bus_available() {
@@ -755,6 +874,66 @@ prepare_dev_log_file() {
     fi
 }
 
+log_to_file_and_terminal() {
+    local log_file="$1"
+
+    tee -a "${log_file}"
+}
+
+print_log_tail_to_console() {
+    local prefix="$1"
+    local log_file="$2"
+    local lines="${3:-${VIBE_RDESK_XVFB_LOG_TAIL_LINES:-120}}"
+
+    if [[ -s "${log_file}" ]]; then
+        echo "${prefix} last ${lines} lines from ${log_file}:" >&2
+        tail -n "${lines}" "${log_file}" >&2 || true
+    else
+        echo "${prefix} ${log_file} is empty; Xvfb did not write stdout/stderr" >&2
+    fi
+}
+
+continue_after_xvfb_error() {
+    case "${CONTINUE_ON_XVFB_ERROR,,}" in
+        1|yes|true|on)
+            echo "[run] continuing server startup despite Xvfb startup error because VIBE_RDESK_CONTINUE_ON_XVFB_ERROR=${CONTINUE_ON_XVFB_ERROR}" >&2
+            export VIBE_RDESK_HEADLESS_DISPLAY_ACTIVE=1
+            HEADLESS_LAUNCHER_PENDING=1
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+mark_headless_launcher_pending() {
+    HEADLESS_LAUNCHER_PENDING=1
+}
+
+start_pending_launcher_after_server() {
+    if [[ "${HEADLESS_LAUNCHER_PENDING}" != "1" ]]; then
+        return 0
+    fi
+
+    if [[ -n "${LAUNCHER_PID}" ]] && kill -0 "${LAUNCHER_PID}" 2>/dev/null; then
+        return 0
+    fi
+
+    echo "[run] starting launcher ${POST_SERVER_LAUNCHER_DELAY_SECONDS}s after server start"
+    HEADLESS_LAUNCHER_PENDING=0
+    sleep "${POST_SERVER_LAUNCHER_DELAY_SECONDS}"
+
+    if [[ -n "${APP_PID}" ]] && ! kill -0 "${APP_PID}" 2>/dev/null; then
+        echo "[run] server exited before launcher startup; skipping launcher" >&2
+        return 0
+    fi
+
+    if ! start_launcher; then
+        echo "[run] launcher failed after server startup; continuing server process" >&2
+        return 0
+    fi
+}
+
 source_exists() {
     local source_name="${1:-}"
     if [[ -z "${source_name}" ]]; then
@@ -771,6 +950,99 @@ sink_exists() {
     fi
 
     run_as_audio_user timeout 1s pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "${sink_name}"
+}
+
+pulse_device_by_description() {
+    local kind="$1"
+    local description="$2"
+    local command_kind name=""
+
+    case "${kind}" in
+        sinks|sources) command_kind="${kind}" ;;
+        *) return 1 ;;
+    esac
+
+    name="$(run_as_audio_user timeout 1s pactl list "${command_kind}" 2>/dev/null | awk -v description="${description}" '
+        /^[[:space:]]*Name:/ {
+            current_name = $2
+            next
+        }
+        /^[[:space:]]*device\.description = "/ {
+            line = $0
+            sub(/^[^\"]*"/, "", line)
+            sub(/"$/, "", line)
+            if (line == description && current_name != "") {
+                print current_name
+                exit
+            }
+        }
+    ')"
+
+    [[ -n "${name}" ]] || return 1
+    printf '%s\n' "${name}"
+}
+
+project_virtual_audio_sink_name() {
+    local sink_name="${VIBE_RDESK_AUDIO_SINK:-}"
+    local display_name normalized
+    if [[ -n "${sink_name//[[:space:]]/}" ]]; then
+        printf '%s\n' "${sink_name}"
+        return 0
+    fi
+
+    display_name="${DISPLAY:-$(normalize_display "${HEADLESS_DISPLAY_RAW}")}"
+    normalized="${display_name//[:.]/_}"
+    printf 'vibe_rdesk_%s\n' "${normalized}"
+}
+
+configure_virtual_audio_sink_env() {
+    VIRTUAL_AUDIO_SINK_NAME="$(project_virtual_audio_sink_name)"
+    export VIBE_RDESK_AUDIO_SINK="${VIRTUAL_AUDIO_SINK_NAME}"
+}
+
+wait_for_sink() {
+    local sink_name="$1"
+    local attempts=10
+
+    while (( attempts > 0 )); do
+        if [[ "${AUDIO_BACKEND}" == "pipewire" ]]; then
+            if pipewire_sink_exists "${sink_name}"; then
+                return 0
+            fi
+        else
+            if sink_exists "${sink_name}"; then
+                return 0
+            fi
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
+}
+
+set_default_audio_sink() {
+    local sink_name="$1"
+    local node_id=""
+    if command -v pactl >/dev/null 2>&1 && run_as_audio_user pactl set-default-sink "${sink_name}" >/dev/null 2>&1; then
+        local sink_inputs input_id
+        sink_inputs="$(run_as_audio_user pactl list short sink-inputs 2>/dev/null || true)"
+        while read -r input_id _; do
+            [[ -n "${input_id}" ]] || continue
+            run_as_audio_user pactl move-sink-input "${input_id}" "${sink_name}" >/dev/null 2>&1 || true
+        done <<<"${sink_inputs}"
+        return 0
+    fi
+
+    if command -v wpctl >/dev/null 2>&1; then
+        node_id="$(pipewire_node_id "${sink_name}" "Audio/Sink" 2>/dev/null || true)"
+        if [[ -n "${node_id}" ]]; then
+            run_as_audio_user wpctl set-default "${node_id}" >/dev/null 2>&1
+            return $?
+        fi
+    fi
+
+    return 1
 }
 
 wait_for_pipewire_server() {
@@ -833,6 +1105,55 @@ pipewire_node_id() {
     fi
 
     printf '%s\n' "${node_id}"
+}
+
+pipewire_node_name_by_description() {
+    local description="${1:-}"
+    local media_class="${2:-}"
+    local node_name=""
+    if [[ -z "${description}" || -z "${media_class}" ]]; then
+        return 1
+    fi
+
+    node_name="$(run_as_audio_user pw-cli ls Node 2>/dev/null | awk -v description="${description}" -v media_class="${media_class}" '
+        function flush_block() {
+            if (current_name != "" && current_desc == description && current_class == media_class) {
+                print current_name
+                found = 1
+                exit
+            }
+        }
+        /^[[:space:]]*id / {
+            flush_block()
+            current_name = ""
+            current_desc = ""
+            current_class = ""
+            next
+        }
+        /node\.name = "/ {
+            split($0, parts, "\"")
+            current_name = parts[2]
+            next
+        }
+        /node\.description = "/ {
+            split($0, parts, "\"")
+            current_desc = parts[2]
+            next
+        }
+        /media\.class = "/ {
+            split($0, parts, "\"")
+            current_class = parts[2]
+            next
+        }
+        END {
+            if (!found && current_name != "" && current_desc == description && current_class == media_class) {
+                print current_name
+            }
+        }
+    ')"
+
+    [[ -n "${node_name}" ]] || return 1
+    printf '%s\n' "${node_name}"
 }
 
 pipewire_source_exists() {
@@ -952,8 +1273,9 @@ start_private_pulse_server() {
         --use-pid-file=no \
         --log-target=stderr \
         --load="module-native-protocol-unix socket=${pulse_socket} auth-anonymous=1" \
+        --load="module-null-sink sink_name=${VIRTUAL_AUDIO_SINK_NAME} sink_properties=device.description=VibeRDesk" \
         --load="module-null-sink sink_name=${VIRTUAL_MIC_SINK_NAME} sink_properties=device.description=VibeRDeskVirtualMicSink" \
-        >"${log_file}" 2>&1 &
+        > >(log_to_file_and_terminal "${log_file}") 2>&1 &
     PULSE_PID=$!
     if [[ -n "${saved_dbus_session_bus_address}" ]]; then
         export DBUS_SESSION_BUS_ADDRESS="${saved_dbus_session_bus_address}"
@@ -989,7 +1311,7 @@ start_pulse_server() {
         local log_file="${DEV_LOG_DIR}/pulseaudio.log"
         prepare_dev_log_file "${log_file}"
         echo "[dev] starting PulseAudio with dbus-launch"
-        run_as_audio_user dbus-launch pulseaudio >"${log_file}" 2>&1 &
+        run_as_audio_user dbus-launch pulseaudio > >(log_to_file_and_terminal "${log_file}") 2>&1 &
         PULSE_PID=$!
     else
         echo "[dev] starting PulseAudio"
@@ -1047,12 +1369,28 @@ start_audio_server() {
 }
 
 ensure_pipewire_virtual_mic() {
+    local existing_source existing_sink
+
     if pipewire_source_exists "${VIRTUAL_MIC_SOURCE_NAME}"; then
         echo "[dev] using existing PipeWire virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
         return 0
     fi
 
+    existing_source="$(pipewire_node_name_by_description "${VIRTUAL_MIC_SOURCE_NAME}" "Audio/Source" 2>/dev/null || true)"
+    if [[ -n "${existing_source}" ]]; then
+        VIRTUAL_MIC_SOURCE_NAME="${existing_source}"
+        export VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME="${VIRTUAL_MIC_SOURCE_NAME}"
+        echo "[dev] using existing PipeWire virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
+        return 0
+    fi
+
     if ! pipewire_sink_exists "${VIRTUAL_MIC_SINK_NAME}"; then
+        existing_sink="$(pipewire_node_name_by_description "VibeRDeskVirtualMicSink" "Audio/Sink" 2>/dev/null || true)"
+        if [[ -n "${existing_sink}" ]]; then
+            VIRTUAL_MIC_SINK_NAME="${existing_sink}"
+            export VIBE_RDESK_VIRTUAL_MIC_SINK_NAME="${VIRTUAL_MIC_SINK_NAME}"
+            echo "[dev] using existing PipeWire virtual mic sink ${VIRTUAL_MIC_SINK_NAME}"
+        else
         echo "[dev] creating PipeWire virtual sink ${VIRTUAL_MIC_SINK_NAME}"
         run_as_audio_user pw-cli create-node adapter \
             "{ factory.name = support.null-audio-sink node.name = \"${VIRTUAL_MIC_SINK_NAME}\" node.description = \"VibeRDeskVirtualMicSink\" media.class = \"Audio/Sink\" object.linger = true audio.position = [ FL FR ] }" \
@@ -1060,6 +1398,7 @@ ensure_pipewire_virtual_mic() {
         if ! wait_for_pipewire_sink "${VIRTUAL_MIC_SINK_NAME}"; then
             echo "[dev] PipeWire virtual sink ${VIRTUAL_MIC_SINK_NAME} did not appear" >&2
             return 1
+        fi
         fi
     fi
 
@@ -1070,7 +1409,7 @@ ensure_pipewire_virtual_mic() {
         --name "${VIRTUAL_MIC_SOURCE_NAME}_loopback" \
         --capture-props "{ stream.capture.sink = true target.object = \"${VIRTUAL_MIC_SINK_NAME}\" node.passive = true node.dont-reconnect = true }" \
         --playback-props "{ node.name = \"${VIRTUAL_MIC_SOURCE_NAME}\" node.description = \"${VIRTUAL_MIC_SOURCE_NAME}\" media.class = \"Audio/Source\" audio.position = [ FL FR ] }" \
-        >"${log_file}" 2>&1 &
+        > >(log_to_file_and_terminal "${log_file}") 2>&1 &
     PIPEWIRE_LOOPBACK_PID=$!
 
     if ! wait_for_pipewire_source "${VIRTUAL_MIC_SOURCE_NAME}"; then
@@ -1084,7 +1423,90 @@ ensure_pipewire_virtual_mic() {
     fi
 }
 
+ensure_pipewire_virtual_audio_sink() {
+    local existing_sink
+
+    if ! pipewire_sink_exists "${VIRTUAL_AUDIO_SINK_NAME}"; then
+        existing_sink="$(pipewire_node_name_by_description "VibeRDesk" "Audio/Sink" 2>/dev/null || true)"
+        if [[ -n "${existing_sink}" ]]; then
+            VIRTUAL_AUDIO_SINK_NAME="${existing_sink}"
+            export VIBE_RDESK_AUDIO_SINK="${VIRTUAL_AUDIO_SINK_NAME}"
+            echo "[dev] using existing PipeWire virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+        else
+        echo "[dev] creating PipeWire virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+        run_as_audio_user pw-cli create-node adapter \
+            "{ factory.name = support.null-audio-sink node.name = \"${VIRTUAL_AUDIO_SINK_NAME}\" node.description = \"VibeRDesk\" media.class = \"Audio/Sink\" object.linger = true audio.position = [ FL FR ] }" \
+            >/dev/null
+        if ! wait_for_pipewire_sink "${VIRTUAL_AUDIO_SINK_NAME}"; then
+            echo "[dev] PipeWire virtual audio output ${VIRTUAL_AUDIO_SINK_NAME} did not appear" >&2
+            return 1
+        fi
+        fi
+    else
+        echo "[dev] using existing PipeWire virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+    fi
+
+    if set_default_audio_sink "${VIRTUAL_AUDIO_SINK_NAME}"; then
+        echo "[dev] default audio output: ${VIRTUAL_AUDIO_SINK_NAME}"
+        return 0
+    fi
+    echo "[dev] failed to set default audio output to ${VIRTUAL_AUDIO_SINK_NAME}" >&2
+    return 1
+}
+
+ensure_pulse_virtual_audio_sink() {
+    local existing_sink
+
+    if ! command -v pactl >/dev/null 2>&1; then
+        echo "[dev] pactl is required to provision the virtual audio output" >&2
+        return 1
+    fi
+
+    if ! sink_exists "${VIRTUAL_AUDIO_SINK_NAME}"; then
+        existing_sink="$(pulse_device_by_description sinks "VibeRDesk" 2>/dev/null || true)"
+        if [[ -n "${existing_sink}" ]]; then
+            VIRTUAL_AUDIO_SINK_NAME="${existing_sink}"
+            export VIBE_RDESK_AUDIO_SINK="${VIRTUAL_AUDIO_SINK_NAME}"
+            echo "[dev] using existing virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+        else
+        echo "[dev] creating virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+        run_as_audio_user pactl load-module \
+            module-null-sink \
+            "sink_name=${VIRTUAL_AUDIO_SINK_NAME}" \
+            "sink_properties=device.description=VibeRDesk" \
+            >/dev/null
+        if ! wait_for_sink "${VIRTUAL_AUDIO_SINK_NAME}"; then
+            echo "[dev] virtual audio output ${VIRTUAL_AUDIO_SINK_NAME} did not appear" >&2
+            return 1
+        fi
+        fi
+    else
+        echo "[dev] using existing virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+    fi
+
+    if set_default_audio_sink "${VIRTUAL_AUDIO_SINK_NAME}"; then
+        echo "[dev] default audio output: ${VIRTUAL_AUDIO_SINK_NAME}"
+        return 0
+    fi
+    echo "[dev] failed to set default audio output to ${VIRTUAL_AUDIO_SINK_NAME}" >&2
+    return 1
+}
+
+ensure_virtual_audio_sink() {
+    if [[ -z "${VIRTUAL_AUDIO_SINK_NAME}" ]]; then
+        configure_virtual_audio_sink_env
+    fi
+    if [[ "${AUDIO_BACKEND}" == "pipewire" ]]; then
+        ensure_pipewire_virtual_audio_sink
+        return $?
+    fi
+
+    ensure_pulse_virtual_audio_sink
+}
+
 ensure_pulse_virtual_mic() {
+    local existing_source existing_sink
+
     if ! command -v pactl >/dev/null 2>&1; then
         echo "[dev] pactl is required to provision the virtual microphone" >&2
         return 1
@@ -1095,13 +1517,28 @@ ensure_pulse_virtual_mic() {
         return 0
     fi
 
+    existing_source="$(pulse_device_by_description sources "${VIRTUAL_MIC_SOURCE_NAME}" 2>/dev/null || true)"
+    if [[ -n "${existing_source}" ]]; then
+        VIRTUAL_MIC_SOURCE_NAME="${existing_source}"
+        export VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME="${VIRTUAL_MIC_SOURCE_NAME}"
+        echo "[dev] using existing virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
+        return 0
+    fi
+
     if ! sink_exists "${VIRTUAL_MIC_SINK_NAME}"; then
+        existing_sink="$(pulse_device_by_description sinks "VibeRDeskVirtualMicSink" 2>/dev/null || true)"
+        if [[ -n "${existing_sink}" ]]; then
+            VIRTUAL_MIC_SINK_NAME="${existing_sink}"
+            export VIBE_RDESK_VIRTUAL_MIC_SINK_NAME="${VIRTUAL_MIC_SINK_NAME}"
+            echo "[dev] using existing virtual mic sink ${VIRTUAL_MIC_SINK_NAME}"
+        else
         echo "[dev] creating virtual mic sink ${VIRTUAL_MIC_SINK_NAME}"
         run_as_audio_user pactl load-module \
             module-null-sink \
             "sink_name=${VIRTUAL_MIC_SINK_NAME}" \
             "sink_properties=device.description=VibeRDeskVirtualMicSink" \
             >/dev/null
+        fi
     fi
 
     echo "[dev] creating virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
@@ -1127,6 +1564,78 @@ ensure_virtual_mic() {
     ensure_pulse_virtual_mic
 }
 
+start_launcher() {
+    local launcher_program="${HEADLESS_LAUNCHER%%[[:space:]]*}"
+    local launcher_name="${launcher_program##*/}"
+    local launcher_path
+    launcher_path="$(launcher_path_env)"
+    local -a launcher_env_args=("DISPLAY=${DISPLAY}" "PATH=${launcher_path}")
+    local -a launcher_unset_env_args=()
+    if [[ -z "${launcher_program}" ]] || ! PATH="${launcher_path}" command -v "${launcher_program}" >/dev/null 2>&1; then
+        echo "[run] launcher '${HEADLESS_LAUNCHER}' is not available. Install it first or use --launcher <command>." >&2
+        return 1
+    fi
+
+    local launcher_log="${DEV_LOG_DIR}/launcher.log"
+
+    echo "[run] start launcher ${launcher_name}"
+    prepare_dev_log_file "${launcher_log}"
+    if [[ -n "${APPDIR:-}" ]]; then
+        if [[ -n "${VIBE_RDESK_HOST_LD_LIBRARY_PATH+x}" ]]; then
+            launcher_env_args+=("LD_LIBRARY_PATH=${VIBE_RDESK_HOST_LD_LIBRARY_PATH}")
+        else
+            launcher_unset_env_args+=("-u" "LD_LIBRARY_PATH")
+        fi
+    fi
+    if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]]; then
+        env "${launcher_unset_env_args[@]}" "${launcher_env_args[@]}" xterm \
+            -display "${DISPLAY}" \
+            -title "vibe_rdesk" \
+            -fa "${XTERM_FONT_FAMILY}" \
+            -fs "${XTERM_FONT_SIZE}" \
+            -geometry 120x30+40+40 \
+            > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
+    else
+        env "${launcher_unset_env_args[@]}" "${launcher_env_args[@]}" bash -lc "exec ${HEADLESS_LAUNCHER}" > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
+    fi
+    LAUNCHER_PID=$!
+
+    if ! wait_for_process "${LAUNCHER_PID}" 4; then
+        echo "[run] launcher '${HEADLESS_LAUNCHER}' exited during startup; see ${launcher_log}" >&2
+        if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]] || ! PATH="${launcher_path}" command -v xterm >/dev/null 2>&1; then
+            return 1
+        fi
+        echo "[run] falling back to xterm as the headless launcher"
+        env "${launcher_unset_env_args[@]}" "${launcher_env_args[@]}" xterm \
+            -display "${DISPLAY}" \
+            -title "vibe_rdesk" \
+            -fa "${XTERM_FONT_FAMILY}" \
+            -fs "${XTERM_FONT_SIZE}" \
+            -geometry 120x30+40+40 \
+            > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
+        LAUNCHER_PID=$!
+        wait_for_process "${LAUNCHER_PID}" 4 || {
+            echo "[run] fallback xterm exited during startup; see ${launcher_log}" >&2
+            return 1
+        }
+    fi
+
+    if [[ "${HEADLESS_LAUNCHER}" != "xterm" && "${VIBE_RDESK_START_XTERM:-1}" != "0" ]] && PATH="${launcher_path}" command -v xterm >/dev/null 2>&1; then
+        env "${launcher_unset_env_args[@]}" "${launcher_env_args[@]}" xterm \
+            -display "${DISPLAY}" \
+            -title "vibe_rdesk" \
+            -fa "${XTERM_FONT_FAMILY}" \
+            -fs "${XTERM_FONT_SIZE}" \
+            -geometry 120x30+40+40 \
+            > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
+        XTERM_PID=$!
+        wait_for_process "${XTERM_PID}" 4 || true
+    fi
+
+    sleep 2
+    echo "[run] launcher started"
+}
+
 start_headless_display() {
     export DISPLAY
     if ! DISPLAY="$(find_free_headless_display "${HEADLESS_DISPLAY_RAW}")"; then
@@ -1135,100 +1644,60 @@ start_headless_display() {
     fi
     export VIBE_RDESK_INPUT_BACKEND="${VIBE_RDESK_INPUT_BACKEND:-${HEADLESS_INPUT_BACKEND}}"
 
-    if ! command -v Xvfb >/dev/null 2>&1; then
+    local xvfb_bin
+    if ! xvfb_bin="$(appimage_helper_path Xvfb)"; then
         echo "[run] Xvfb is required for headless startup. Install it first." >&2
         exit 1
     fi
 
-    local launcher_program="${HEADLESS_LAUNCHER%%[[:space:]]*}"
-    if [[ -z "${launcher_program}" ]] || ! command -v "${launcher_program}" >/dev/null 2>&1; then
-        echo "[run] launcher '${HEADLESS_LAUNCHER}' is not available. Install it first or use --launcher <command>." >&2
-        exit 1
-    fi
-
     local xvfb_log="${DEV_LOG_DIR}/xvfb.log"
-    local launcher_log="${DEV_LOG_DIR}/launcher.log"
-    local xkb_args=()
+    local helper_path
+    local -a xvfb_env_args=()
 
-    if [[ -n "${XKB_CONFIG_ROOT:-}" && -d "${XKB_CONFIG_ROOT}" ]]; then
-        xkb_args=(-xkbdir "${XKB_CONFIG_ROOT}")
-    elif [[ -n "${APPDIR:-}" && -d "${APPDIR}/usr/share/X11/xkb" ]]; then
-        xkb_args=(-xkbdir "${APPDIR}/usr/share/X11/xkb")
-    fi
+    helper_path="$(appimage_helper_path_env)"
+    xvfb_env_args+=("PATH=${helper_path}")
 
     echo "[run] starting Xvfb on ${DISPLAY}"
     prepare_dev_log_file "${xvfb_log}"
     {
         echo "[run] PATH=${PATH}"
+        echo "[run] Xvfb binary: ${xvfb_bin}"
+        echo "[run] Xvfb helper PATH=${helper_path}"
         echo "[run] XKB_CONFIG_ROOT=${XKB_CONFIG_ROOT:-}"
-        echo "[run] bundled keycodes evdev: ${XKB_CONFIG_ROOT:-}/keycodes/evdev"
-        echo "[run] xkbcomp: $(command -v xkbcomp 2>/dev/null || true)"
+        echo "[run] xkbcomp: $(appimage_helper_path xkbcomp 2>/dev/null || true)"
         echo "[run] ICEWM_PRIVCFG=${ICEWM_PRIVCFG:-}"
         echo "[run] XCURSOR_PATH=${XCURSOR_PATH:-}"
         echo "[run] GDK_PIXBUF_MODULEDIR=${GDK_PIXBUF_MODULEDIR:-}"
         echo "[run] GDK_PIXBUF_MODULE_FILE=${GDK_PIXBUF_MODULE_FILE:-}"
-        echo "[run] Xvfb args: ${DISPLAY} -screen 0 ${XVFB_SCREEN} -ac -nolisten tcp ${xkb_args[*]}"
-    } >>"${xvfb_log}"
-    Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp "${xkb_args[@]}" >>"${xvfb_log}" 2>&1 &
+        echo "[run] Xvfb ${DISPLAY} -screen 0 ${XVFB_SCREEN} -ac -nolisten tcp"
+    } > >(log_to_file_and_terminal "${xvfb_log}") 2>&1
+    env "${xvfb_env_args[@]}" "${xvfb_bin}" "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp > >(log_to_file_and_terminal "${xvfb_log}") 2>&1 &
     XVFB_PID=$!
+
+    sleep 0.5
+    if ! kill -0 "${XVFB_PID}" 2>/dev/null; then
+        echo "[run] Xvfb exited during startup; see ${xvfb_log}" >&2
+        print_log_tail_to_console "[run]" "${xvfb_log}"
+        if continue_after_xvfb_error; then
+            return 0
+        fi
+        exit 1
+    fi
 
     if ! wait_for_display "${DISPLAY}"; then
         echo "[run] Xvfb on ${DISPLAY} did not become ready; see ${xvfb_log}" >&2
+        print_log_tail_to_console "[run]" "${xvfb_log}"
+        if continue_after_xvfb_error; then
+            return 0
+        fi
         exit 1
     fi
 
     echo "[run] created headless X11 display ${DISPLAY}"
     sleep "${NEW_DISPLAY_NOTICE_SECONDS}"
 
-    sleep "${WINDOW_MANAGER_DELAY_SECONDS}"
-
-    echo "[run] starting launcher '${HEADLESS_LAUNCHER}' on ${DISPLAY}"
-    prepare_dev_log_file "${launcher_log}"
     export VIBE_RDESK_HEADLESS_DISPLAY_ACTIVE=1
-    if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]]; then
-        DISPLAY="${DISPLAY}" xterm \
-            -display "${DISPLAY}" \
-            -title "vibe_rdesk" \
-            -fa "${XTERM_FONT_FAMILY}" \
-            -fs "${XTERM_FONT_SIZE}" \
-            -geometry 120x30+40+40 \
-            >"${launcher_log}" 2>&1 &
-    else
-        DISPLAY="${DISPLAY}" bash -lc "exec ${HEADLESS_LAUNCHER}" >"${launcher_log}" 2>&1 &
-    fi
-    LAUNCHER_PID=$!
-
-    if ! wait_for_process "${LAUNCHER_PID}" 4; then
-        echo "[run] launcher '${HEADLESS_LAUNCHER}' exited during startup; see ${launcher_log}" >&2
-        if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]] || ! command -v xterm >/dev/null 2>&1; then
-            exit 1
-        fi
-        echo "[run] falling back to xterm as the headless launcher"
-        DISPLAY="${DISPLAY}" xterm \
-            -display "${DISPLAY}" \
-            -title "vibe_rdesk" \
-            -fa "${XTERM_FONT_FAMILY}" \
-            -fs "${XTERM_FONT_SIZE}" \
-            -geometry 120x30+40+40 \
-            >>"${launcher_log}" 2>&1 &
-        LAUNCHER_PID=$!
-        wait_for_process "${LAUNCHER_PID}" 4 || {
-            echo "[run] fallback xterm exited during startup; see ${launcher_log}" >&2
-            exit 1
-        }
-    fi
-
-    if [[ "${HEADLESS_LAUNCHER}" != "xterm" && "${VIBE_RDESK_START_XTERM:-1}" != "0" ]] && command -v xterm >/dev/null 2>&1; then
-        DISPLAY="${DISPLAY}" xterm \
-            -display "${DISPLAY}" \
-            -title "vibe_rdesk" \
-            -fa "${XTERM_FONT_FAMILY}" \
-            -fs "${XTERM_FONT_SIZE}" \
-            -geometry 120x30+40+40 \
-            >>"${launcher_log}" 2>&1 &
-        XTERM_PID=$!
-        wait_for_process "${XTERM_PID}" 4 || true
-    fi
+    mark_headless_launcher_pending
 }
 
 ensure_display() {
@@ -1244,6 +1713,12 @@ ensure_display() {
     if [[ -n "${DISPLAY:-}" ]]; then
         if is_display_available "${DISPLAY}"; then
             echo "[run] using existing X server on ${DISPLAY}"
+            if display_has_window_manager "${DISPLAY}"; then
+                echo "[run] window manager already running on ${DISPLAY}"
+            else
+                echo "[run] no window manager detected on ${DISPLAY}"
+                mark_headless_launcher_pending
+            fi
             return 0
         fi
 
@@ -1302,6 +1777,7 @@ run_server() {
     "${APP_BINARY}" "$@" &
     APP_PID=$!
     show_server_access_urls "${SERVER_PROTOCOL}"
+    start_pending_launcher_after_server
     wait "${APP_PID}"
 }
 
@@ -1346,7 +1822,9 @@ prepare_gdk_pixbuf_cache
 start_private_session_bus
 ensure_uinput_access
 ensure_display
+configure_virtual_audio_sink_env
 start_audio_server
+ensure_virtual_audio_sink
 ensure_virtual_mic
 
 run_server "${APP_ARGS[@]}"

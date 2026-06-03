@@ -141,6 +141,10 @@ impl MediaHub {
         Ok(())
     }
 
+    pub async fn restart_audio(&self) -> Result<()> {
+        self.audio.restart().await
+    }
+
     pub fn video_state_rx(&self) -> watch::Receiver<Option<ActiveVideoState>> {
         self.video.state.subscribe()
     }
@@ -374,6 +378,15 @@ impl AudioHub {
         let mut runtime = self.runtime.lock().await;
         runtime.desired_config = config;
         runtime.configured = true;
+        self.ensure_active(&mut runtime).await
+    }
+
+    async fn restart(&self) -> Result<()> {
+        let mut runtime = self.runtime.lock().await;
+        if let Some(active) = runtime.active.take() {
+            self.state.send_replace(None);
+            shutdown_audio_child(Arc::clone(&active.child), &active.state.config).await;
+        }
         self.ensure_active(&mut runtime).await
     }
 

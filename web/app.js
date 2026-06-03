@@ -106,6 +106,7 @@ const state = {
   decoder: null,
   audioDecoder: null,
   audioContext: null,
+  audioGainNode: null,
   audioSources: new Set(),
   micRecorder: null,
   micAudioContext: null,
@@ -151,6 +152,7 @@ const state = {
   audioPlaybackBlocked: false,
   audioUserActivated: true,
   audioMuted: false,
+  audioVolumePercent: 100,
   audioLargeBufferSinceAt: 0,
   audioHighLatencySinceAt: 0,
   audioRateIntegral: 0,
@@ -158,6 +160,7 @@ const state = {
   audioClockAutoLastIncreaseAt: 0,
   audioClockAutoLastIncreaseLead: 0,
   audioClockAutoLastSlowTuneAt: 0,
+  audioUseRealOutput: false,
   decoderRecovering: false,
   waitingForKeyframe: true,
   frameCount: 0,
@@ -267,9 +270,13 @@ const scrollSpeedInput = $("scroll-speed");
 const scrollSpeedValue = $("scroll-speed-value");
 const audioLatencyInput = $("audio-latency");
 const audioLatencyValue = $("audio-latency-value");
+const audioVolumeInput = $("audio-volume");
+const audioVolumeValue = $("audio-volume-value");
 const audioClockRateInput = $("audio-clock-rate");
 const audioClockRateValue = $("audio-clock-rate-value");
 const audioClockAutoInput = $("audio-clock-auto");
+const audioRealOutputInput = $("audio-real-output");
+const audioOutputStatus = $("audio-output-status");
 const autoDisconnectMinutesInput = $("auto-disconnect-minutes");
 const encoderLatencySelect = $("encoder-latency");
 const encoderQualitySelect = $("encoder-quality");
@@ -612,6 +619,7 @@ function setActiveTab(tabName) {
   }
   if (tabName === "audio") {
     renderAudioBufferMetric();
+    void refreshAudioOutputStatus({ silent: true });
   }
 }
 
@@ -908,6 +916,70 @@ function webSocketUrl(path) {
   return url;
 }
 
+function audioOutputModeLabel(useRealOutput) {
+  return useRealOutput ? "Real audio devices" : "Virtual output";
+}
+
+function renderAudioOutputStatus(text = audioOutputModeLabel(audioRealOutputInput.checked), warning = false) {
+  if (!audioOutputStatus) return;
+  audioOutputStatus.textContent = text;
+  audioOutputStatus.classList.toggle("is-warning", warning);
+}
+
+async function refreshAudioOutputStatus({ silent = false } = {}) {
+  if (!state.authenticated && !state.sessionPasswd) {
+    renderAudioOutputStatus();
+    return null;
+  }
+  try {
+    const response = await fetch(appendAuthQuery(apiUrl("/api/audio/output")), {
+      cache: "no-store",
+      credentials: "include",
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const body = await response.json();
+    const useRealOutput = body?.mode === "real";
+    state.audioUseRealOutput = useRealOutput;
+    audioRealOutputInput.checked = useRealOutput;
+    renderAudioOutputStatus(audioOutputModeLabel(useRealOutput));
+    return body;
+  } catch (error) {
+    if (!silent) {
+      showToast("audio_output_status_failed", error.message || String(error));
+    }
+    renderAudioOutputStatus("Audio output status unavailable", true);
+    return null;
+  }
+}
+
+async function setAudioOutputMode(useRealOutput, { silent = false } = {}) {
+  if (!state.authenticated && !state.sessionPasswd) {
+    renderAudioOutputStatus(audioOutputModeLabel(useRealOutput));
+    return;
+  }
+  renderAudioOutputStatus("Switching audio output...");
+  try {
+    const response = await fetch(appendAuthQuery(apiUrl("/api/audio/output")), {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ use_real_device: useRealOutput }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    const body = await response.json();
+    const appliedUseRealOutput = body?.mode === "real";
+    state.audioUseRealOutput = appliedUseRealOutput;
+    audioRealOutputInput.checked = appliedUseRealOutput;
+    renderAudioOutputStatus(audioOutputModeLabel(appliedUseRealOutput));
+  } catch (error) {
+    renderAudioOutputStatus("Audio output switch failed", true);
+    await refreshAudioOutputStatus({ silent: true });
+    if (!silent) {
+      showToast("audio_output_switch_failed", error.message || String(error));
+    }
+  }
+}
+
 async function probeAuth() {
   try {
     const response = await fetch(apiUrl("/api/auth"), {
@@ -986,6 +1058,7 @@ function normalizeSettings(settings = {}) {
   const defaultMicBitrate = Number(micBitrateSelect.value);
   const defaultFps = Number(fpsInput.value);
   const defaultScrollSpeed = Number(scrollSpeedInput.value);
+  const defaultAudioVolumePercent = Number(audioVolumeInput.value);
   const defaultAudioClockRate = Number(audioClockRateInput.value);
   const defaultAutoDisconnectMinutes = Number(autoDisconnectMinutesInput.value);
   const codec = allowedCodecs.has(settings.codec) ? settings.codec : defaultCodec;
@@ -1006,6 +1079,8 @@ function normalizeSettings(settings = {}) {
     micEnabled: settings.micEnabled === true,
     micDeviceId: typeof settings.micDeviceId === "string" ? settings.micDeviceId : "",
     audioMuted: settings.audioMuted === true,
+    audioUseRealOutput: settings.audioUseRealOutput === true,
+    audioVolumePercent: clampControlValue(audioVolumeInput, settings.audioVolumePercent, defaultAudioVolumePercent),
     audioLatencyMs: clampControlValue(audioLatencyInput, settings.audioLatencyMs, Number(audioLatencyInput.value)),
     audioClockRate: clampControlValue(audioClockRateInput, settings.audioClockRate, defaultAudioClockRate),
     audioClockAuto: settings.audioClockAuto !== false,
@@ -1126,8 +1201,10 @@ function readSettingsFromControls() {
     fps: fpsInput.value,
     scrollSpeed: scrollSpeedInput.value,
     audioLatencyMs: audioLatencyInput.value,
+    audioVolumePercent: audioVolumeInput.value,
     audioClockRate: audioClockRateInput.value,
     audioClockAuto: audioClockAutoInput.checked,
+    audioUseRealOutput: audioRealOutputInput.checked,
     encoderLatency: encoderLatencySelect.value,
     encoderQuality: encoderQualitySelect.value,
     videoScale: videoScaleSelect.value,
@@ -1178,6 +1255,7 @@ function renderSettingsValues(settings = readSettingsFromControls()) {
   fpsValue.textContent = `${settings.fps} fps`;
   scrollSpeedValue.textContent = `${settings.scrollSpeed} / 10`;
   audioLatencyValue.textContent = `${settings.audioLatencyMs} ms`;
+  audioVolumeValue.textContent = `${settings.audioVolumePercent}%`;
   audioClockRateValue.textContent = `${Number(settings.audioClockRate).toFixed(4)}x`;
   gopMsValue.textContent = `${settings.gopMs} ms`;
   bufferMsValue.textContent = `${settings.bufferMs} ms`;
@@ -1403,8 +1481,10 @@ function applySettings(settings) {
   fpsInput.value = String(normalized.fps);
   scrollSpeedInput.value = String(normalized.scrollSpeed);
   audioLatencyInput.value = String(normalized.audioLatencyMs);
+  audioVolumeInput.value = String(normalized.audioVolumePercent);
   audioClockRateInput.value = String(normalized.audioClockRate);
   audioClockAutoInput.checked = normalized.audioClockAuto;
+  audioRealOutputInput.checked = normalized.audioUseRealOutput;
   encoderLatencySelect.value = normalized.encoderLatency;
   encoderQualitySelect.value = normalized.encoderQuality;
   videoScaleSelect.value = normalized.videoScale;
@@ -1419,6 +1499,8 @@ function applySettings(settings) {
   state.micEnabled = normalized.micEnabled;
   state.micDeviceId = normalized.micDeviceId;
   state.audioMuted = normalized.audioMuted;
+  state.audioVolumePercent = normalized.audioVolumePercent;
+  state.audioUseRealOutput = normalized.audioUseRealOutput;
   state.viewZoomPercent = normalized.viewZoomPercent;
   state.liveMediaMaxAgeMs = normalized.staleDropMs;
   state.mediaStallResetMs = normalized.stallResetMs;
@@ -1427,6 +1509,8 @@ function applySettings(settings) {
   syncTouchModeControls(normalized);
   renderMicToggle();
   renderAudioToggle();
+  renderAudioOutputStatus(audioOutputModeLabel(normalized.audioUseRealOutput));
+  syncAudioGain();
   applyCanvasZoom();
 }
 
@@ -1436,6 +1520,8 @@ function persistResolvedSettings(settings, { scheduleReconnect = true } = {}) {
   state.liveMediaMaxAgeMs = settings.staleDropMs;
   state.mediaStallResetMs = settings.stallResetMs;
   state.maxVideoDecodeQueue = settings.maxDecodeQueue;
+  state.audioVolumePercent = settings.audioVolumePercent;
+  syncAudioGain();
   syncPendingStreamSettings(settings);
   saveSettings(settings);
   syncAutoDisconnectTimer(settings);
@@ -2096,6 +2182,7 @@ async function connect() {
       settingsBeforeConnect.encodePreference,
       { silent: true },
     );
+    await setAudioOutputMode(settingsBeforeConnect.audioUseRealOutput, { silent: true });
     closeConnection({ manual: false, preserveStatus: true });
     state.manualDisconnect = false;
     clearReconnectTimer();
@@ -2907,6 +2994,17 @@ function currentConfiguredAudioClockAutoEnabled() {
   return audioClockAutoInput.checked;
 }
 
+function currentConfiguredAudioVolumeGain() {
+  return clampControlValue(audioVolumeInput, audioVolumeInput.value, 100) / 100;
+}
+
+function syncAudioGain() {
+  state.audioVolumePercent = clampControlValue(audioVolumeInput, audioVolumeInput.value, 100);
+  if (state.audioGainNode) {
+    state.audioGainNode.gain.value = currentConfiguredAudioVolumeGain();
+  }
+}
+
 function currentConfiguredAudioLatencySeconds() {
   return Math.max(AUDIO_MIN_BUFFER_SECONDS, currentConfiguredAudioLatencyMs() / 1000);
 }
@@ -3073,7 +3171,7 @@ function scheduleAudioBuffer(
   const source = audioContext.createBufferSource();
   source.buffer = audioBuffer;
   source.playbackRate.value = playbackRate;
-  source.connect(audioContext.destination);
+  source.connect(state.audioGainNode || audioContext.destination);
   const now = audioContext.currentTime;
   if (!state.audioNextTime || state.audioNextTime < now - profile.resetGraceSeconds) {
     state.audioNextTime = now + currentAudioStartSlack(audioContext);
@@ -3219,6 +3317,13 @@ async function ensureAudioContext() {
   if (!window.AudioContext) return null;
   if (!state.audioContext || state.audioContext.state === "closed") {
     state.audioContext = new AudioContext({ latencyHint: "balanced", sampleRate: 48000 });
+    state.audioGainNode = state.audioContext.createGain();
+    state.audioGainNode.connect(state.audioContext.destination);
+    syncAudioGain();
+  } else if (!state.audioGainNode) {
+    state.audioGainNode = state.audioContext.createGain();
+    state.audioGainNode.connect(state.audioContext.destination);
+    syncAudioGain();
   }
   if (state.audioContext.state === "suspended") {
     await state.audioContext.resume();
@@ -4844,6 +4949,8 @@ function initControls() {
   scrollSpeedInput.addEventListener("change", persistCurrentSettings);
   audioLatencyInput.addEventListener("input", persistCurrentSettings);
   audioLatencyInput.addEventListener("change", persistCurrentSettings);
+  audioVolumeInput.addEventListener("input", persistCurrentSettings);
+  audioVolumeInput.addEventListener("change", persistCurrentSettings);
   audioClockRateInput.addEventListener("input", persistCurrentSettings);
   audioClockRateInput.addEventListener("change", persistCurrentSettings);
   audioClockAutoInput.addEventListener("change", () => {
@@ -4851,6 +4958,10 @@ function initControls() {
     state.audioClockAutoLastIncreaseLead = 0;
     state.audioClockAutoLastSlowTuneAt = 0;
     persistCurrentSettings();
+  });
+  audioRealOutputInput.addEventListener("change", () => {
+    persistCurrentSettings();
+    void setAudioOutputMode(audioRealOutputInput.checked);
   });
   autoDisconnectMinutesInput.addEventListener("input", persistCurrentSettings);
   autoDisconnectMinutesInput.addEventListener("change", persistCurrentSettings);

@@ -181,17 +181,34 @@ download_and_extract_runtime_debs() {
   need_cmd apt-cache
   need_cmd dpkg-deb
 
-  rm -rf "${DEB_CACHE}"
   mkdir -p "${DEB_CACHE}" "${APPDIR}"
   log "resolving runtime package dependencies"
   mapfile -t packages < <(resolve_deb_dependencies "${RUNTIME_PACKAGES[@]}")
   ((${#packages[@]} > 0)) || die "apt dependency resolution returned no packages"
 
-  log "downloading ${#packages[@]} runtime packages"
-  (
-    cd "${DEB_CACHE}"
-    apt-get download "${packages[@]}"
-  )
+  local cached_package_names="${BUILD_DIR}/cached-deb-packages.txt"
+  : >"${cached_package_names}"
+  while IFS= read -r -d '' deb; do
+    dpkg-deb -f "${deb}" Package 2>/dev/null || true
+  done < <(find "${DEB_CACHE}" -maxdepth 1 -name '*.deb' -print0 2>/dev/null) |
+    sort -u >"${cached_package_names}"
+
+  local package missing_packages=()
+  for package in "${packages[@]}"; do
+    if ! grep -Fxq "${package}" "${cached_package_names}"; then
+      missing_packages+=("${package}")
+    fi
+  done
+
+  if ((${#missing_packages[@]} > 0)); then
+    log "downloading ${#missing_packages[@]} missing runtime packages (${#packages[@]} total)"
+    (
+      cd "${DEB_CACHE}"
+      apt-get download "${missing_packages[@]}"
+    )
+  else
+    log "using cached runtime packages (${#packages[@]} total)"
+  fi
 
   log "extracting runtime packages into AppDir"
   find "${DEB_CACHE}" -maxdepth 1 -name '*.deb' -print0 |
@@ -205,14 +222,17 @@ download_and_extract_runtime_pacman() {
   need_cmd bsdtar
 
   local pacman_cache="${BUILD_DIR}/pacman-cache"
+  local pacman_root="${BUILD_DIR}/pacman-root"
+  local pacman_db="${BUILD_DIR}/pacman-db"
   local pacman_config="${BUILD_DIR}/pacman-appimage.conf"
-  rm -rf "${pacman_cache}"
-  mkdir -p "${pacman_cache}" "${APPDIR}"
+  mkdir -p "${pacman_cache}" "${pacman_root}" "${pacman_db}" "${APPDIR}"
   sed '/^[[:space:]]*DownloadUser[[:space:]]*=/d' /etc/pacman.conf >"${pacman_config}"
 
   log "downloading Arch runtime packages"
-  sudo pacman --config "${pacman_config}" -Sw \
+  sudo pacman --config "${pacman_config}" -Syw \
     --noconfirm \
+    --root "${pacman_root}" \
+    --dbpath "${pacman_db}" \
     --cachedir "${pacman_cache}" \
     "${ARCH_RUNTIME_PACKAGES[@]}"
 
@@ -253,7 +273,7 @@ copy_binary_closure() {
     ' |
     while IFS= read -r lib; do
       case "${lib}" in
-        /lib*/ld-linux*.so.*|/lib*/libc.so.*|/lib*/libm.so.*|/lib*/libpthread.so.*|/lib*/librt.so.*|/lib*/libdl.so.*|/lib*/libresolv.so.*|/lib*/libnsl.so.*|/lib*/libnss_*.so.*)
+        /lib*/ld-linux*.so.*|/lib*/libc.so.*|/lib*/libm.so.*|/lib*/libpthread.so.*|/lib*/librt.so.*|/lib*/libdl.so.*|/lib*/libresolv.so.*|/lib*/libnsl.so.*|/lib*/libnss_*.so.*|/lib*/libstdc++.so.*|/usr/lib*/libstdc++.so.*)
           ;;
         *)
           cp -L -n "${lib}" "${libdir}/" 2>/dev/null || true
@@ -272,6 +292,7 @@ copy_important_host_binaries() {
     Xvfb
     xterm
     xdpyinfo
+    xprop
     xset
     ip
     dbus-launch
@@ -322,6 +343,36 @@ EOF
   chmod +x "${wrapper}"
 }
 
+wrap_xset() {
+  local bundled_xset="${APPDIR}/usr/bin/xset.bundled"
+  local wrapper="${APPDIR}/usr/bin/xset"
+
+  [[ -x "${wrapper}" ]] || return 0
+  [[ -e "${bundled_xset}" ]] || mv "${wrapper}" "${bundled_xset}"
+
+  cat >"${wrapper}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF_PATH="${BASH_SOURCE[0]}"
+while [[ -L "${SELF_PATH}" ]]; do
+  SELF_DIR="$(cd -P "$(dirname "${SELF_PATH}")" && pwd)"
+  SELF_PATH="$(readlink "${SELF_PATH}")"
+  [[ "${SELF_PATH}" == /* ]] || SELF_PATH="${SELF_DIR}/${SELF_PATH}"
+done
+WRAPPER_DIR="$(cd -P "$(dirname "${SELF_PATH}")" && pwd)"
+BUNDLED_XSET="${WRAPPER_DIR}/xset.bundled"
+
+if [[ -x "${BUNDLED_XSET}" ]]; then
+  exec "${BUNDLED_XSET}" "$@"
+fi
+
+printf 'vibe_rdesk: bundled xset was not found; rebuild the AppImage with x11-xserver-utils\n' >&2
+exit 127
+EOF
+  chmod +x "${wrapper}"
+}
+
 copy_bundled_aurora_wm() {
   local source="${PROJECT_ROOT}/vendor/aurora-wm"
   local target="${APPDIR}/usr/bin/vendor/aurora-wm"
@@ -331,6 +382,18 @@ copy_bundled_aurora_wm() {
   cp "${source}" "${target}"
   chmod +x "${target}"
   copy_binary_closure "${target}"
+}
+
+verify_packaged_run_sh() {
+  local run_script="${APPDIR}/usr/bin/run.sh"
+
+  [[ -x "${run_script}" ]] || die "packaged run.sh is missing or not executable"
+  grep -q 'start_pending_launcher_after_server' "${run_script}" ||
+    die "packaged run.sh is missing post-server launcher startup"
+  grep -q 'HEADLESS_LAUNCHER_PENDING=1' "${run_script}" ||
+    die "packaged run.sh does not mark the launcher pending after Xvfb startup"
+  grep -q 'DISPLAY=${DISPLAY}' "${run_script}" ||
+    die "packaged run.sh does not pass the Xvfb DISPLAY into the launcher"
 }
 
 wrap_xkbcomp() {
@@ -455,8 +518,8 @@ patch_elf_rpaths() {
 }
 
 remove_nonportable_core_libs() {
-  log "removing host-specific core libraries from AppDir"
-  find "${APPDIR}" -type f \( \
+  log "removing host-specific system libraries from AppDir"
+  find "${APPDIR}" \( \
     -name 'ld-linux*.so*' -o \
     -name 'libanl.so*' -o \
     -name 'libBrokenLocale.so*' -o \
@@ -470,6 +533,7 @@ remove_nonportable_core_libs() {
     -name 'libpthread.so*' -o \
     -name 'libresolv.so*' -o \
     -name 'librt.so*' -o \
+    -name 'libstdc++.so*' -o \
     -name 'libthread_db.so*' -o \
     -name 'libutil.so*' \
   \) -delete 2>/dev/null || true
@@ -525,11 +589,17 @@ if [[ -n "${VIBE_RDESK_HOST_FFMPEG}" ]]; then
   export VIBE_RDESK_HOST_FFMPEG
 fi
 
-export PATH="${APPDIR}/usr/bin:${APPDIR}/usr/sbin:${PATH}"
-export LD_LIBRARY_PATH="${APPDIR}/usr/lib:${APPDIR}/usr/lib/x86_64-linux-gnu:${APPDIR}/usr/lib/aarch64-linux-gnu:${APPDIR}/usr/lib/x86_64-linux-gnu/pulseaudio:${APPDIR}/usr/lib/aarch64-linux-gnu/pulseaudio:${APPDIR}/usr/lib/pulseaudio:${LD_LIBRARY_PATH:-}"
-export XDG_DATA_DIRS="${APPDIR}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export VIBE_RDESK_HOST_PATH="${PATH}"
+export PATH="${PATH}:${APPDIR}/usr/bin:${APPDIR}/usr/sbin"
+export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:${APPDIR}/usr/share"
 export FONTCONFIG_PATH="${APPDIR}/etc/fonts:${FONTCONFIG_PATH:-/etc/fonts}"
-export XKB_CONFIG_ROOT="${XKB_CONFIG_ROOT:-${APPDIR}/usr/share/X11/xkb}"
+export VIBE_RDESK_BUNDLED_XKB_CONFIG_ROOT="${APPDIR}/usr/share/X11/xkb"
+export VIBE_RDESK_CONTINUE_ON_XVFB_ERROR="${VIBE_RDESK_CONTINUE_ON_XVFB_ERROR:-yes}"
+export VIBE_RDESK_POST_SERVER_LAUNCHER_DELAY_SECONDS="${VIBE_RDESK_POST_SERVER_LAUNCHER_DELAY_SECONDS:-2}"
+export VIBE_RDESK_XVFB_LOG_TAIL_LINES="${VIBE_RDESK_XVFB_LOG_TAIL_LINES:-120}"
+if [[ -z "${XKB_CONFIG_ROOT:-}" && ! -d /usr/share/X11/xkb && -d "${VIBE_RDESK_BUNDLED_XKB_CONFIG_ROOT}" ]]; then
+  export XKB_CONFIG_ROOT="${VIBE_RDESK_BUNDLED_XKB_CONFIG_ROOT}"
+fi
 export SSL_CERT_FILE="${SSL_CERT_FILE:-${APPDIR}/etc/ssl/certs/ca-certificates.crt}"
 export APPDIR
 
@@ -588,6 +658,7 @@ assemble_appdir() {
   log "copying run.sh"
   cp "${PROJECT_ROOT}/run.sh" "${APPDIR}/usr/bin/run.sh"
   chmod +x "${APPDIR}/usr/bin/run.sh"
+  verify_packaged_run_sh
   log "copying bundled aurora-wm launcher"
   copy_bundled_aurora_wm
   if [[ -d "${PROJECT_ROOT}/ssl_keys" ]]; then
@@ -601,6 +672,8 @@ assemble_appdir() {
   copy_important_host_binaries
   log "wrapping ffmpeg with host-runtime preference"
   wrap_ffmpeg
+  log "wrapping xset with bundled runtime"
+  wrap_xset
   log "wrapping xkbcomp"
   wrap_xkbcomp
 

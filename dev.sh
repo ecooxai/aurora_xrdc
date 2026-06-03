@@ -44,6 +44,7 @@ NEW_DISPLAY_NOTICE_SECONDS="${VIBE_RDESK_NEW_DISPLAY_NOTICE_SECONDS:-3}"
 STARTUP_HELP_SECONDS="${VIBE_RDESK_HELP_SECONDS:-3}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
+VIRTUAL_AUDIO_SINK_NAME="${VIBE_RDESK_AUDIO_SINK:-}"
 DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:8001,[::]:8001}"
 export VIBE_RDESK_BIND="${DEFAULT_BIND}"
 SSL_DIR="${VIBE_RDESK_SSL_DIR:-ssl_keys}"
@@ -371,6 +372,17 @@ is_display_available() {
     DISPLAY="${display}" xdotool getmouselocation >/dev/null 2>&1
 }
 
+display_has_window_manager() {
+    local display="${1:-}"
+    local wm_check=""
+    if [[ -z "${display}" ]] || ! command -v xprop >/dev/null 2>&1; then
+        return 1
+    fi
+
+    wm_check="$(DISPLAY="${display}" xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null || true)"
+    [[ "${wm_check}" == *"window id #"* && "${wm_check}" != *"not found"* ]]
+}
+
 display_number() {
     local display="${1:-}"
     local normalized number
@@ -608,6 +620,25 @@ prepare_dev_log_file() {
     fi
 }
 
+log_to_file_and_terminal() {
+    local log_file="$1"
+
+    tee -a "${log_file}"
+}
+
+print_log_tail_to_console() {
+    local prefix="$1"
+    local log_file="$2"
+    local lines="${3:-${VIBE_RDESK_XVFB_LOG_TAIL_LINES:-120}}"
+
+    if [[ -s "${log_file}" ]]; then
+        echo "${prefix} last ${lines} lines from ${log_file}:" >&2
+        tail -n "${lines}" "${log_file}" >&2 || true
+    else
+        echo "${prefix} ${log_file} is empty; Xvfb did not write stdout/stderr" >&2
+    fi
+}
+
 source_exists() {
     local source_name="${1:-}"
     if [[ -z "${source_name}" ]]; then
@@ -624,6 +655,99 @@ sink_exists() {
     fi
 
     pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "${sink_name}"
+}
+
+pulse_device_by_description() {
+    local kind="$1"
+    local description="$2"
+    local command_kind name=""
+
+    case "${kind}" in
+        sinks|sources) command_kind="${kind}" ;;
+        *) return 1 ;;
+    esac
+
+    name="$(run_as_audio_user pactl list "${command_kind}" 2>/dev/null | awk -v description="${description}" '
+        /^[[:space:]]*Name:/ {
+            current_name = $2
+            next
+        }
+        /^[[:space:]]*device\.description = "/ {
+            line = $0
+            sub(/^[^\"]*"/, "", line)
+            sub(/"$/, "", line)
+            if (line == description && current_name != "") {
+                print current_name
+                exit
+            }
+        }
+    ')"
+
+    [[ -n "${name}" ]] || return 1
+    printf '%s\n' "${name}"
+}
+
+project_virtual_audio_sink_name() {
+    local sink_name="${VIBE_RDESK_AUDIO_SINK:-}"
+    local display_name normalized
+    if [[ -n "${sink_name//[[:space:]]/}" ]]; then
+        printf '%s\n' "${sink_name}"
+        return 0
+    fi
+
+    display_name="${DISPLAY:-$(normalize_display "${HEADLESS_DISPLAY_RAW}")}"
+    normalized="${display_name//[:.]/_}"
+    printf 'vibe_rdesk_%s\n' "${normalized}"
+}
+
+configure_virtual_audio_sink_env() {
+    VIRTUAL_AUDIO_SINK_NAME="$(project_virtual_audio_sink_name)"
+    export VIBE_RDESK_AUDIO_SINK="${VIRTUAL_AUDIO_SINK_NAME}"
+}
+
+wait_for_sink() {
+    local sink_name="$1"
+    local attempts=10
+
+    while (( attempts > 0 )); do
+        if [[ "${AUDIO_BACKEND}" == "pipewire" ]]; then
+            if pipewire_sink_exists "${sink_name}"; then
+                return 0
+            fi
+        else
+            if sink_exists "${sink_name}"; then
+                return 0
+            fi
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    return 1
+}
+
+set_default_audio_sink() {
+    local sink_name="$1"
+    local node_id=""
+    if command -v pactl >/dev/null 2>&1 && run_as_audio_user pactl set-default-sink "${sink_name}" >/dev/null 2>&1; then
+        local sink_inputs input_id
+        sink_inputs="$(run_as_audio_user pactl list short sink-inputs 2>/dev/null || true)"
+        while read -r input_id _; do
+            [[ -n "${input_id}" ]] || continue
+            run_as_audio_user pactl move-sink-input "${input_id}" "${sink_name}" >/dev/null 2>&1 || true
+        done <<<"${sink_inputs}"
+        return 0
+    fi
+
+    if command -v wpctl >/dev/null 2>&1; then
+        node_id="$(pipewire_node_id "${sink_name}" "Audio/Sink" 2>/dev/null || true)"
+        if [[ -n "${node_id}" ]]; then
+            run_as_audio_user wpctl set-default "${node_id}" >/dev/null 2>&1
+            return $?
+        fi
+    fi
+
+    return 1
 }
 
 wait_for_pipewire_server() {
@@ -686,6 +810,55 @@ pipewire_node_id() {
     fi
 
     printf '%s\n' "${node_id}"
+}
+
+pipewire_node_name_by_description() {
+    local description="${1:-}"
+    local media_class="${2:-}"
+    local node_name=""
+    if [[ -z "${description}" || -z "${media_class}" ]]; then
+        return 1
+    fi
+
+    node_name="$(run_as_audio_user pw-cli ls Node 2>/dev/null | awk -v description="${description}" -v media_class="${media_class}" '
+        function flush_block() {
+            if (current_name != "" && current_desc == description && current_class == media_class) {
+                print current_name
+                found = 1
+                exit
+            }
+        }
+        /^[[:space:]]*id / {
+            flush_block()
+            current_name = ""
+            current_desc = ""
+            current_class = ""
+            next
+        }
+        /node\.name = "/ {
+            split($0, parts, "\"")
+            current_name = parts[2]
+            next
+        }
+        /node\.description = "/ {
+            split($0, parts, "\"")
+            current_desc = parts[2]
+            next
+        }
+        /media\.class = "/ {
+            split($0, parts, "\"")
+            current_class = parts[2]
+            next
+        }
+        END {
+            if (!found && current_name != "" && current_desc == description && current_class == media_class) {
+                print current_name
+            }
+        }
+    ')"
+
+    [[ -n "${node_name}" ]] || return 1
+    printf '%s\n' "${node_name}"
 }
 
 pipewire_source_exists() {
@@ -773,7 +946,7 @@ start_pulse_server() {
         local log_file="${DEV_LOG_DIR}/pulseaudio.log"
         prepare_dev_log_file "${log_file}"
         echo "[dev] starting PulseAudio with dbus-launch"
-        run_as_audio_user dbus-launch pulseaudio >"${log_file}" 2>&1 &
+        run_as_audio_user dbus-launch pulseaudio > >(log_to_file_and_terminal "${log_file}") 2>&1 &
         PULSE_PID=$!
     else
         echo "[dev] starting PulseAudio"
@@ -830,12 +1003,28 @@ start_audio_server() {
 }
 
 ensure_pipewire_virtual_mic() {
+    local existing_source existing_sink
+
     if pipewire_source_exists "${VIRTUAL_MIC_SOURCE_NAME}"; then
         echo "[dev] using existing PipeWire virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
         return 0
     fi
 
+    existing_source="$(pipewire_node_name_by_description "${VIRTUAL_MIC_SOURCE_NAME}" "Audio/Source" 2>/dev/null || true)"
+    if [[ -n "${existing_source}" ]]; then
+        VIRTUAL_MIC_SOURCE_NAME="${existing_source}"
+        export VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME="${VIRTUAL_MIC_SOURCE_NAME}"
+        echo "[dev] using existing PipeWire virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
+        return 0
+    fi
+
     if ! pipewire_sink_exists "${VIRTUAL_MIC_SINK_NAME}"; then
+        existing_sink="$(pipewire_node_name_by_description "VibeRDeskVirtualMicSink" "Audio/Sink" 2>/dev/null || true)"
+        if [[ -n "${existing_sink}" ]]; then
+            VIRTUAL_MIC_SINK_NAME="${existing_sink}"
+            export VIBE_RDESK_VIRTUAL_MIC_SINK_NAME="${VIRTUAL_MIC_SINK_NAME}"
+            echo "[dev] using existing PipeWire virtual mic sink ${VIRTUAL_MIC_SINK_NAME}"
+        else
         echo "[dev] creating PipeWire virtual sink ${VIRTUAL_MIC_SINK_NAME}"
         run_as_audio_user pw-cli create-node adapter \
             "{ factory.name = support.null-audio-sink node.name = \"${VIRTUAL_MIC_SINK_NAME}\" node.description = \"VibeRDeskVirtualMicSink\" media.class = \"Audio/Sink\" object.linger = true audio.position = [ FL FR ] }" \
@@ -843,6 +1032,7 @@ ensure_pipewire_virtual_mic() {
         if ! wait_for_pipewire_sink "${VIRTUAL_MIC_SINK_NAME}"; then
             echo "[dev] PipeWire virtual sink ${VIRTUAL_MIC_SINK_NAME} did not appear" >&2
             return 1
+        fi
         fi
     fi
 
@@ -853,7 +1043,7 @@ ensure_pipewire_virtual_mic() {
         --name "${VIRTUAL_MIC_SOURCE_NAME}_loopback" \
         --capture-props "{ stream.capture.sink = true target.object = \"${VIRTUAL_MIC_SINK_NAME}\" node.passive = true node.dont-reconnect = true }" \
         --playback-props "{ node.name = \"${VIRTUAL_MIC_SOURCE_NAME}\" node.description = \"${VIRTUAL_MIC_SOURCE_NAME}\" media.class = \"Audio/Source\" audio.position = [ FL FR ] }" \
-        >"${log_file}" 2>&1 &
+        > >(log_to_file_and_terminal "${log_file}") 2>&1 &
     PIPEWIRE_LOOPBACK_PID=$!
 
     if ! wait_for_pipewire_source "${VIRTUAL_MIC_SOURCE_NAME}"; then
@@ -867,7 +1057,90 @@ ensure_pipewire_virtual_mic() {
     fi
 }
 
+ensure_pipewire_virtual_audio_sink() {
+    local existing_sink
+
+    if ! pipewire_sink_exists "${VIRTUAL_AUDIO_SINK_NAME}"; then
+        existing_sink="$(pipewire_node_name_by_description "VibeRDesk" "Audio/Sink" 2>/dev/null || true)"
+        if [[ -n "${existing_sink}" ]]; then
+            VIRTUAL_AUDIO_SINK_NAME="${existing_sink}"
+            export VIBE_RDESK_AUDIO_SINK="${VIRTUAL_AUDIO_SINK_NAME}"
+            echo "[dev] using existing PipeWire virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+        else
+        echo "[dev] creating PipeWire virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+        run_as_audio_user pw-cli create-node adapter \
+            "{ factory.name = support.null-audio-sink node.name = \"${VIRTUAL_AUDIO_SINK_NAME}\" node.description = \"VibeRDesk\" media.class = \"Audio/Sink\" object.linger = true audio.position = [ FL FR ] }" \
+            >/dev/null
+        if ! wait_for_pipewire_sink "${VIRTUAL_AUDIO_SINK_NAME}"; then
+            echo "[dev] PipeWire virtual audio output ${VIRTUAL_AUDIO_SINK_NAME} did not appear" >&2
+            return 1
+        fi
+        fi
+    else
+        echo "[dev] using existing PipeWire virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+    fi
+
+    if set_default_audio_sink "${VIRTUAL_AUDIO_SINK_NAME}"; then
+        echo "[dev] default audio output: ${VIRTUAL_AUDIO_SINK_NAME}"
+        return 0
+    fi
+    echo "[dev] failed to set default audio output to ${VIRTUAL_AUDIO_SINK_NAME}" >&2
+    return 1
+}
+
+ensure_pulse_virtual_audio_sink() {
+    local existing_sink
+
+    if ! command -v pactl >/dev/null 2>&1; then
+        echo "[dev] pactl is required to provision the virtual audio output" >&2
+        return 1
+    fi
+
+    if ! sink_exists "${VIRTUAL_AUDIO_SINK_NAME}"; then
+        existing_sink="$(pulse_device_by_description sinks "VibeRDesk" 2>/dev/null || true)"
+        if [[ -n "${existing_sink}" ]]; then
+            VIRTUAL_AUDIO_SINK_NAME="${existing_sink}"
+            export VIBE_RDESK_AUDIO_SINK="${VIRTUAL_AUDIO_SINK_NAME}"
+            echo "[dev] using existing virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+        else
+        echo "[dev] creating virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+        run_as_audio_user pactl load-module \
+            module-null-sink \
+            "sink_name=${VIRTUAL_AUDIO_SINK_NAME}" \
+            "sink_properties=device.description=VibeRDesk" \
+            >/dev/null
+        if ! wait_for_sink "${VIRTUAL_AUDIO_SINK_NAME}"; then
+            echo "[dev] virtual audio output ${VIRTUAL_AUDIO_SINK_NAME} did not appear" >&2
+            return 1
+        fi
+        fi
+    else
+        echo "[dev] using existing virtual audio output ${VIRTUAL_AUDIO_SINK_NAME}"
+    fi
+
+    if set_default_audio_sink "${VIRTUAL_AUDIO_SINK_NAME}"; then
+        echo "[dev] default audio output: ${VIRTUAL_AUDIO_SINK_NAME}"
+        return 0
+    fi
+    echo "[dev] failed to set default audio output to ${VIRTUAL_AUDIO_SINK_NAME}" >&2
+    return 1
+}
+
+ensure_virtual_audio_sink() {
+    if [[ -z "${VIRTUAL_AUDIO_SINK_NAME}" ]]; then
+        configure_virtual_audio_sink_env
+    fi
+    if [[ "${AUDIO_BACKEND}" == "pipewire" ]]; then
+        ensure_pipewire_virtual_audio_sink
+        return $?
+    fi
+
+    ensure_pulse_virtual_audio_sink
+}
+
 ensure_pulse_virtual_mic() {
+    local existing_source existing_sink
+
     if ! command -v pactl >/dev/null 2>&1; then
         echo "[dev] pactl is required to provision the virtual microphone" >&2
         return 1
@@ -878,17 +1151,32 @@ ensure_pulse_virtual_mic() {
         return 0
     fi
 
+    existing_source="$(pulse_device_by_description sources "${VIRTUAL_MIC_SOURCE_NAME}" 2>/dev/null || true)"
+    if [[ -n "${existing_source}" ]]; then
+        VIRTUAL_MIC_SOURCE_NAME="${existing_source}"
+        export VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME="${VIRTUAL_MIC_SOURCE_NAME}"
+        echo "[dev] using existing virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
+        return 0
+    fi
+
     if ! sink_exists "${VIRTUAL_MIC_SINK_NAME}"; then
+        existing_sink="$(pulse_device_by_description sinks "VibeRDeskVirtualMicSink" 2>/dev/null || true)"
+        if [[ -n "${existing_sink}" ]]; then
+            VIRTUAL_MIC_SINK_NAME="${existing_sink}"
+            export VIBE_RDESK_VIRTUAL_MIC_SINK_NAME="${VIRTUAL_MIC_SINK_NAME}"
+            echo "[dev] using existing virtual mic sink ${VIRTUAL_MIC_SINK_NAME}"
+        else
         echo "[dev] creating virtual mic sink ${VIRTUAL_MIC_SINK_NAME}"
-        pactl load-module \
+        run_as_audio_user pactl load-module \
             module-null-sink \
             "sink_name=${VIRTUAL_MIC_SINK_NAME}" \
             "sink_properties=device.description=VibeRDeskVirtualMicSink" \
             >/dev/null
+        fi
     fi
 
     echo "[dev] creating virtual mic source ${VIRTUAL_MIC_SOURCE_NAME}"
-    pactl load-module \
+    run_as_audio_user pactl load-module \
         module-remap-source \
         "source_name=${VIRTUAL_MIC_SOURCE_NAME}" \
         "master=${VIRTUAL_MIC_SINK_NAME}.monitor" \
@@ -910,6 +1198,40 @@ ensure_virtual_mic() {
     ensure_pulse_virtual_mic
 }
 
+start_launcher() {
+    local launcher_program="${HEADLESS_LAUNCHER%%[[:space:]]*}"
+    local launcher_name="${launcher_program##*/}"
+    if [[ -z "${launcher_program}" ]] || ! command -v "${launcher_program}" >/dev/null 2>&1; then
+        echo "[dev] launcher '${HEADLESS_LAUNCHER}' is not available. Install it first or use --launcher <command>." >&2
+        exit 1
+    fi
+
+    local launcher_log="${DEV_LOG_DIR}/launcher.log"
+
+    echo "[dev] start launcher ${launcher_name}"
+    prepare_dev_log_file "${launcher_log}"
+    sleep 1
+    if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]]; then
+        DISPLAY="${DISPLAY}" xterm \
+            -display "${DISPLAY}" \
+            -title "vibe_rdesk" \
+            -fa "${XTERM_FONT_FAMILY}" \
+            -fs "${XTERM_FONT_SIZE}" \
+            -geometry 120x30+40+40 \
+            > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
+    else
+        DISPLAY="${DISPLAY}" bash -lc "exec ${HEADLESS_LAUNCHER}" > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
+    fi
+    LAUNCHER_PID=$!
+
+    if ! wait_for_process "${LAUNCHER_PID}" 4; then
+        echo "[dev] launcher '${HEADLESS_LAUNCHER}' exited during startup; see ${launcher_log}" >&2
+        exit 1
+    fi
+    sleep 2
+    echo "[dev] launcher started"
+}
+
 start_headless_display() {
     export DISPLAY
     if ! DISPLAY="$(find_free_headless_display "${HEADLESS_DISPLAY_RAW}")"; then
@@ -923,22 +1245,24 @@ start_headless_display() {
         exit 1
     fi
 
-    local launcher_program="${HEADLESS_LAUNCHER%%[[:space:]]*}"
-    if [[ -z "${launcher_program}" ]] || ! command -v "${launcher_program}" >/dev/null 2>&1; then
-        echo "[dev] launcher '${HEADLESS_LAUNCHER}' is not available. Install it first or use --launcher <command>." >&2
-        exit 1
-    fi
-
     local xvfb_log="${DEV_LOG_DIR}/xvfb.log"
-    local launcher_log="${DEV_LOG_DIR}/launcher.log"
 
     echo "[dev] starting Xvfb on ${DISPLAY}"
     prepare_dev_log_file "${xvfb_log}"
-    Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp >"${xvfb_log}" 2>&1 &
+    echo "[dev] Xvfb ${DISPLAY} -screen 0 ${XVFB_SCREEN} -ac -nolisten tcp" > >(log_to_file_and_terminal "${xvfb_log}") 2>&1
+    Xvfb "${DISPLAY}" -screen 0 "${XVFB_SCREEN}" -ac -nolisten tcp > >(log_to_file_and_terminal "${xvfb_log}") 2>&1 &
     XVFB_PID=$!
+
+    sleep 0.5
+    if ! kill -0 "${XVFB_PID}" 2>/dev/null; then
+        echo "[dev] Xvfb exited during startup; see ${xvfb_log}" >&2
+        print_log_tail_to_console "[dev]" "${xvfb_log}"
+        exit 1
+    fi
 
     if ! wait_for_display "${DISPLAY}"; then
         echo "[dev] Xvfb on ${DISPLAY} did not become ready; see ${xvfb_log}" >&2
+        print_log_tail_to_console "[dev]" "${xvfb_log}"
         exit 1
     fi
 
@@ -946,26 +1270,7 @@ start_headless_display() {
     sleep "${NEW_DISPLAY_NOTICE_SECONDS}"
 
     sleep "${WINDOW_MANAGER_DELAY_SECONDS}"
-
-    echo "[dev] starting launcher '${HEADLESS_LAUNCHER}' on ${DISPLAY}"
-    prepare_dev_log_file "${launcher_log}"
-    if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]]; then
-        DISPLAY="${DISPLAY}" xterm \
-            -display "${DISPLAY}" \
-            -title "vibe_rdesk" \
-            -fa "${XTERM_FONT_FAMILY}" \
-            -fs "${XTERM_FONT_SIZE}" \
-            -geometry 120x30+40+40 \
-            >"${launcher_log}" 2>&1 &
-    else
-        DISPLAY="${DISPLAY}" bash -lc "exec ${HEADLESS_LAUNCHER}" >"${launcher_log}" 2>&1 &
-    fi
-    LAUNCHER_PID=$!
-
-    if ! wait_for_process "${LAUNCHER_PID}" 4; then
-        echo "[dev] launcher '${HEADLESS_LAUNCHER}' exited during startup; see ${launcher_log}" >&2
-        exit 1
-    fi
+    start_launcher
 }
 
 ensure_display() {
@@ -981,6 +1286,12 @@ ensure_display() {
     if [[ -n "${DISPLAY:-}" ]]; then
         if is_display_available "${DISPLAY}"; then
             echo "[dev] using existing X server on ${DISPLAY}"
+            if display_has_window_manager "${DISPLAY}"; then
+                echo "[dev] window manager already running on ${DISPLAY}"
+            else
+                echo "[dev] no window manager detected on ${DISPLAY}"
+                start_launcher
+            fi
             return 0
         fi
 
@@ -1071,7 +1382,9 @@ configure_sudo_audio_env
 ensure_dev_log_dir
 ensure_uinput_access
 ensure_display
+configure_virtual_audio_sink_env
 start_audio_server
+ensure_virtual_audio_sink
 ensure_virtual_mic
 
 build_and_run "${APP_ARGS[@]}"

@@ -266,6 +266,25 @@ struct WebClientsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct AudioOutputQuery {
+    passwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AudioOutputRequest {
+    use_real_device: bool,
+    sink: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AudioOutputResponse {
+    mode: &'static str,
+    active_sink: Option<String>,
+    virtual_sink: String,
+    devices: Vec<ffmpeg::AudioOutputDevice>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CloseOthersRequest {
     client_id: String,
 }
@@ -292,7 +311,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
     let tls_paths = server.tls_cert.clone().zip(server.tls_key.clone());
     let camera = CameraRelay::new();
     let media = MediaHub::new(server.clone());
-    if let Err(err) = ffmpeg::warm_audio_stack().await {
+    if let Err(err) = ffmpeg::warm_audio_stack(&server).await {
         warn!("audio bootstrap failed during startup: {err}");
     }
     let state = Arc::new(AppState {
@@ -311,6 +330,10 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/api/auth", get(auth_check).post(auth_login))
         .route("/api/codecs", get(codecs))
         .route("/api/encoders", get(encoders))
+        .route(
+            "/api/audio/output",
+            get(audio_output).post(set_audio_output),
+        )
         .route("/api/webclients", get(webclients))
         .route("/api/webclients/close-others", post(close_other_webclients))
         .route("/api/webclients/{client_id}/close", post(close_webclient))
@@ -531,7 +554,10 @@ async fn encoders(
     let codec = query.codec.unwrap_or(CodecKind::H264);
     let options = ffmpeg::available_encoder_options(codec)
         .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        .map_err(|err| {
+            warn!(codec = ?codec, error = %err, "failed to load available encoder options");
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        })?;
     Ok(Json(EncodersResponse { options }))
 }
 
@@ -549,10 +575,74 @@ async fn codecs(
             session_token.as_deref(),
         )
         .await?;
-    let options = ffmpeg::available_codec_options()
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let options = ffmpeg::available_codec_options().await.map_err(|err| {
+        warn!(error = %err, "failed to load available codec options");
+        (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    })?;
     Ok(Json(CodecsResponse { options }))
+}
+
+async fn audio_output(
+    headers: HeaderMap,
+    Query(query): Query<AudioOutputQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<AudioOutputResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
+    state
+        .auth
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
+        .await?;
+    audio_output_response(&state.server).await.map(Json)
+}
+
+async fn set_audio_output(
+    headers: HeaderMap,
+    Query(query): Query<AudioOutputQuery>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AudioOutputRequest>,
+) -> Result<Json<AudioOutputResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
+    state
+        .auth
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
+        .await?;
+    ffmpeg::set_audio_output_device(&state.server, body.use_real_device, body.sink.as_deref())
+        .await
+        .map_err(internal_error)?;
+    state.media.restart_audio().await.map_err(internal_error)?;
+    audio_output_response(&state.server).await.map(Json)
+}
+
+async fn audio_output_response(
+    server: &ServerConfig,
+) -> Result<AudioOutputResponse, (StatusCode, String)> {
+    let devices = ffmpeg::list_audio_output_devices(server)
+        .await
+        .map_err(internal_error)?;
+    let virtual_sink = ffmpeg::project_virtual_audio_sink_name(server);
+    let active_sink = devices
+        .iter()
+        .find(|device| device.is_default)
+        .map(|device| device.name.clone());
+    let mode = if active_sink.as_deref() == Some(virtual_sink.as_str()) {
+        "virtual"
+    } else {
+        "real"
+    };
+    Ok(AudioOutputResponse {
+        mode,
+        active_sink,
+        virtual_sink,
+        devices,
+    })
 }
 
 async fn ws(

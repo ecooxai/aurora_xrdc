@@ -30,6 +30,7 @@ install_pacman() {
     jwm \
     xterm \
     xorg-xdpyinfo \
+    xorg-xprop \
     curl \
     ca-certificates \
     dbus \
