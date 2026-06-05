@@ -4,6 +4,18 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct KeyModifiers {
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub meta: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -79,6 +91,8 @@ pub enum ClientMessage {
     Key {
         key: String,
         down: bool,
+        #[serde(default)]
+        modifiers: Option<KeyModifiers>,
     },
     KeyState {
         pressed_keys: Vec<String>,

@@ -22,6 +22,7 @@ const TWO_FINGER_TAP_MOVE_PX = 24;
 const RECOVERY_TAP_WINDOW_MS = 1600;
 const RECOVERY_TAP_SAME_AREA_PX = 70;
 const KEY_STATE_SYNC_INTERVAL_MS = 500;
+const MOBILE_KEYBOARD_COMPOSITION_IDLE_FLUSH_MS = 700;
 const DEFAULT_MAX_VIDEO_DECODE_QUEUE = 6;
 const MAX_AUDIO_DECODE_QUEUE = 24;
 const AUDIO_MIN_BUFFER_SECONDS = 0.05;
@@ -35,6 +36,7 @@ const AUDIO_TRIM_LATENCY_HOLD_MS = 20000;
 const AUDIO_TRIM_TARGET_EXTRA_SECONDS = 0.2;
 const AUDIO_GOOD_LATENCY_BUFFER_SECONDS = 0.75;
 const AUDIO_UNDERRUN_WARNING = "Audio buffer too small, pausing playback";
+const MESSAGE_LIMIT = 120;
 const AAC_SAMPLES_PER_FRAME = 1024;
 const AUDIO_BASE_PLAYBACK_RATE = 1.0000;
 const DEFAULT_AUDIO_LATENCY_MS = 400;
@@ -186,6 +188,8 @@ const state = {
   inputCaptured: false,
   pressedKeys: new Set(),
   modifierChordKeys: new Set(),
+  mobileKeyboardComposing: false,
+  mobileKeyboardFlushTimer: 0,
   keyStateSyncTimer: 0,
   localClipboard: { text: null, image_png_b64: null },
   remoteClipboard: { text: null, image_png_b64: null },
@@ -194,8 +198,9 @@ const state = {
   localClipboardUpdatedAt: 0,
   remoteClipboardUpdatedAt: 0,
   clipboardHistory: [],
-  errors: [],
+  messages: [],
   encoderOptionsByCodec: {},
+  lastEncoderStatusMessage: "",
   apiOrigin: window.location.origin,
   authenticated: false,
   sessionPasswd: "",
@@ -424,13 +429,21 @@ function setStatus(text, { hideAfterMs = 0 } = {}) {
 }
 
 function setStreamWarning(message = "") {
+  const previous = state.streamWarning;
   state.streamWarning = message;
   streamWarning.classList.toggle("hidden", !message);
   streamWarningText.textContent = message || "Stream delayed";
+  if (message && message !== previous) {
+    pushDebug(message.startsWith("Audio") ? "audio_buffer" : "stream_warning", message, { throttleMs: 2000 });
+  }
 }
 
 function setEncoderStatus(text) {
-  encoderStatus.textContent = text;
+  const statusText = text || "Not connected";
+  encoderStatus.textContent = statusText;
+  if (state.lastEncoderStatusMessage === statusText) return;
+  state.lastEncoderStatusMessage = statusText;
+  pushInfo("video_encode", statusText, { throttleMs: 3000 });
 }
 
 function formatPercent(value) {
@@ -628,6 +641,7 @@ function showToast(code, message) {
     pushError(code, message);
     return;
   }
+  pushInfo(code, message);
   toast.textContent = `${code}: ${message}`;
   toast.dataset.copy = `${code}: ${message}`;
   toast.classList.remove("hidden");
@@ -640,28 +654,62 @@ function isErrorNotice(code = "") {
 }
 
 function pushError(code, message) {
-  state.errors.unshift({
-    code: String(code || "error"),
-    message: String(message || "Unknown error"),
-    at: Date.now(),
+  pushMessage(code || "error", message || "Unknown error", { level: "error" });
+}
+
+function pushInfo(code, message, options = {}) {
+  pushMessage(code || "info", message || "", { level: "info", ...options });
+}
+
+function pushDebug(code, message, options = {}) {
+  pushMessage(code || "debug", message || "", { level: "debug", ...options });
+}
+
+function pushMessage(code, message, { level = "info", throttleMs = 0 } = {}) {
+  const now = Date.now();
+  const entryCode = String(code || level);
+  const entryMessage = String(message || "");
+  if (throttleMs > 0) {
+    const existing = state.messages.find((entry) => (
+      entry.code === entryCode
+      && entry.level === level
+      && now - entry.at < throttleMs
+    ));
+    if (existing) {
+      existing.message = entryMessage;
+      existing.at = now;
+      renderErrors();
+      return;
+    }
+  }
+  state.messages.unshift({
+    code: entryCode,
+    message: entryMessage,
+    level,
+    at: now,
   });
+  if (state.messages.length > MESSAGE_LIMIT) {
+    state.messages.length = MESSAGE_LIMIT;
+  }
   renderErrors();
 }
 
 function clearErrors() {
-  state.errors = [];
+  state.messages = [];
   errorPanel.open = false;
   renderErrors();
 }
 
 function renderErrors() {
-  errorPanel.classList.toggle("hidden", state.errors.length === 0);
-  errorCount.textContent = String(Math.min(state.errors.length, 99));
+  const hasErrors = state.messages.some((entry) => entry.level === "error");
+  errorPanel.classList.toggle("hidden", state.messages.length === 0);
+  errorCount.textContent = String(Math.min(state.messages.length, 99));
+  errorCount.classList.toggle("has-error", hasErrors);
   errorList.replaceChildren();
   const fragment = document.createDocumentFragment();
-  for (const error of state.errors) {
+  for (const error of state.messages) {
     const item = document.createElement("article");
-    item.className = "error-item";
+    item.className = `error-item is-${error.level || "info"}`;
 
     const code = document.createElement("span");
     code.className = "error-item-code";
@@ -683,7 +731,7 @@ function renderErrors() {
 
 function markStaleDrop(message) {
   state.lastStaleDropAt = performance.now();
-  setStreamWarning(message);
+  pushDebug(message.startsWith("Audio") ? "audio_buffer" : "video_decode", message, { throttleMs: 2000 });
 }
 
 function clearReconnectTimer() {
@@ -869,8 +917,6 @@ function monitorConnectionHealth() {
     warning = "Video stalled";
   } else if (socketOpen && state.lastVideoFrameRenderedAt && now - state.lastVideoFrameRenderedAt > state.mediaStallResetMs) {
     warning = "Video render stalled";
-  } else if (socketOpen && state.lastStaleDropAt && now - state.lastStaleDropAt < 3000) {
-    warning = state.streamWarning || "Dropping delayed frames";
   }
 
   if (warning) {
@@ -2376,6 +2422,8 @@ function releaseInput() {
     mobileKeyboardInput.blur();
   }
   window.navigator.virtualKeyboard?.hide?.();
+  state.mobileKeyboardComposing = false;
+  clearMobileKeyboardFlushTimer();
   mobileKeyboardInput.value = "";
   syncMobileKeyboardButton();
   releaseKeyboardLock();
@@ -2964,6 +3012,7 @@ function enterAudioUnderrun(audioContext, bufferedSeconds) {
 }
 
 function clearAudioUnderrun() {
+  const wasUnderrunActive = state.audioUnderrunActive;
   state.audioUnderrunActive = false;
   state.audioResumeBlockedUntil = 0;
   if (
@@ -2971,6 +3020,9 @@ function clearAudioUnderrun() {
     || state.streamWarning.startsWith("Audio rebuffering")
   ) {
     setStreamWarning("");
+  }
+  if (wasUnderrunActive) {
+    pushDebug("audio_buffer", "Audio buffer refilled");
   }
 }
 
@@ -3863,11 +3915,11 @@ function resetKeys() {
   sendPressedKeyState();
 }
 
-function releasePressedKey(key) {
+function releasePressedKey(key, event = null) {
   state.modifierChordKeys.delete(key);
   if (!state.pressedKeys.has(key)) return false;
   state.pressedKeys.delete(key);
-  send({ type: "key", key, down: false });
+  sendKeyEvent(key, false, event);
   sendPressedKeyState();
   return true;
 }
@@ -3881,7 +3933,7 @@ function keyLogicalModifier(key) {
 }
 
 function hasShortcutModifier(event) {
-  return modifierLogicalState(event, "Alt") || modifierLogicalState(event, "Meta");
+  return eventHasShortcutModifier(event);
 }
 
 function trackModifierChordKey(event, key) {
@@ -3902,14 +3954,15 @@ function releaseStaleModifierChordKeys(event, { exceptKey = null } = {}) {
 }
 
 function modifierLogicalState(event, modifier) {
+  let fallback = false;
+  if (modifier === "Control") fallback = !!event.ctrlKey;
+  if (modifier === "Meta") fallback = !!event.metaKey;
+  if (modifier === "Alt") fallback = !!event.altKey;
+  if (modifier === "Shift") fallback = !!event.shiftKey;
   if (typeof event.getModifierState === "function") {
-    return event.getModifierState(modifier);
+    return !!event.getModifierState(modifier) || fallback;
   }
-  if (modifier === "Control") return !!event.ctrlKey;
-  if (modifier === "Meta") return !!event.metaKey;
-  if (modifier === "Alt") return !!event.altKey;
-  if (modifier === "Shift") return !!event.shiftKey;
-  return false;
+  return fallback;
 }
 
 function releaseModifierKeys(keys) {
@@ -3950,7 +4003,7 @@ function synchronizeModifierState(event, { pressMissing = false, skipLogical = n
     if (modifier.logical === skipLogical) continue;
     if (modifier.keys.some((key) => state.pressedKeys.has(key))) continue;
     state.pressedKeys.add(modifier.fallback);
-    send({ type: "key", key: modifier.fallback, down: true });
+    sendKeyEvent(modifier.fallback, true, event);
     sendPressedKeyState();
   }
 }
@@ -4063,13 +4116,89 @@ function syncMobileKeyboardButton() {
 }
 
 function tapRemoteKey(key) {
-  send({ type: "key", key, down: true });
-  send({ type: "key", key, down: false });
+  sendKeyEvent(key, true);
+  sendKeyEvent(key, false);
+}
+
+function keyModifierSnapshot(event) {
+  return {
+    ctrl: modifierLogicalState(event, "Control"),
+    shift: modifierLogicalState(event, "Shift"),
+    alt: modifierLogicalState(event, "Alt"),
+    meta: modifierLogicalState(event, "Meta"),
+  };
+}
+
+function modifierLabels(modifiers) {
+  const labels = [];
+  if (modifiers.ctrl) labels.push("ctrl");
+  if (modifiers.shift) labels.push("shift");
+  if (modifiers.alt) labels.push("alt");
+  if (modifiers.meta) labels.push("meta");
+  return labels;
+}
+
+function formatKeyEventMessage(key, down, modifiers = {}) {
+  const labels = modifierLabels(modifiers);
+  return `${down ? "keydown" : "keyup"}: ${[key, ...labels].filter(Boolean).join(" ")}`;
+}
+
+function sendKeyEvent(key, down, event = null) {
+  const message = { type: "key", key, down };
+  if (event) {
+    message.modifiers = keyModifierSnapshot(event);
+  }
+  pushDebug("key_event", formatKeyEventMessage(key, down, message.modifiers || {}));
+  send(message);
+}
+
+function eventHasActiveModifier(event) {
+  const modifiers = keyModifierSnapshot(event);
+  return modifiers.ctrl || modifiers.shift || modifiers.alt || modifiers.meta;
+}
+
+function eventHasShortcutModifier(event) {
+  const modifiers = keyModifierSnapshot(event);
+  return modifiers.ctrl || modifiers.alt || modifiers.meta;
+}
+
+function tapRemoteKeyFromEvent(key, event) {
+  sendKeyEvent(key, true, event);
+  sendKeyEvent(key, false, event);
 }
 
 function sendRemoteText(text) {
   if (!text) return;
   send({ type: "text_input", text });
+}
+
+function clearMobileKeyboardFlushTimer() {
+  clearTimeout(state.mobileKeyboardFlushTimer);
+  state.mobileKeyboardFlushTimer = 0;
+}
+
+function scheduleMobileKeyboardTextFlush(delayMs = 0, fallbackText = "") {
+  clearMobileKeyboardFlushTimer();
+  state.mobileKeyboardFlushTimer = setTimeout(() => {
+    state.mobileKeyboardComposing = false;
+    flushMobileKeyboardText(fallbackText);
+  }, delayMs);
+}
+
+function flushMobileKeyboardText(fallbackText = "") {
+  clearMobileKeyboardFlushTimer();
+  const text = mobileKeyboardInput.value || fallbackText;
+  if (text) {
+    sendRemoteText(text);
+  }
+  mobileKeyboardInput.value = "";
+  if (document.activeElement === mobileKeyboardInput) {
+    try {
+      mobileKeyboardInput.setSelectionRange(0, 0);
+    } catch {
+      // Some mobile keyboards do not allow selection changes mid-update.
+    }
+  }
 }
 
 function focusMobileKeyboard() {
@@ -4084,10 +4213,19 @@ function handleMobileKeyboardBeforeInput(event) {
   if (!state.inputCaptured || document.activeElement !== mobileKeyboardInput) {
     captureInputTarget(mobileKeyboardInput);
   }
+  if (event.isComposing || event.inputType?.includes("Composition")) {
+    state.mobileKeyboardComposing = true;
+    scheduleMobileKeyboardTextFlush(MOBILE_KEYBOARD_COMPOSITION_IDLE_FLUSH_MS, event.data || "");
+    return;
+  }
+  if (state.mobileKeyboardComposing) {
+    state.mobileKeyboardComposing = false;
+    scheduleMobileKeyboardTextFlush(0, event.data || "");
+    return;
+  }
   let handled = false;
   switch (event.inputType) {
     case "insertText":
-    case "insertCompositionText":
     case "insertFromPaste":
     case "insertReplacementText":
       if (event.data) {
@@ -4123,11 +4261,51 @@ function handleMobileKeyboardKeydown(event) {
     releaseInput();
     return;
   }
-  if (!MOBILE_KEYBOARD_SPECIAL_KEYS.has(event.key)) return;
   const key = normalizeKey(event);
+  if (state.mobileKeyboardComposing || event.isComposing) return;
   if (!key) return;
+  if (!shouldHandleMobileKeyboardKeyEvent(event, key)) return;
   event.preventDefault();
-  tapRemoteKey(key);
+  releaseStaleModifierChordKeys(event, { exceptKey: key });
+  synchronizeModifierState(event, {
+    pressMissing: true,
+    skipLogical: keyLogicalModifier(key),
+  });
+  if (MOBILE_KEYBOARD_SPECIAL_KEYS.has(event.key) && !eventHasShortcutModifier(event) && !keyLogicalModifier(key)) {
+    tapRemoteKeyFromEvent(key, event);
+    return;
+  }
+  if (!event.repeat && state.pressedKeys.has(key)) {
+    return;
+  }
+  if (!event.repeat) {
+    state.pressedKeys.add(key);
+    trackModifierChordKey(event, key);
+  }
+  sendKeyEvent(key, true, event);
+  if (!event.repeat) {
+    sendPressedKeyState();
+  }
+}
+
+function handleMobileKeyboardKeyup(event) {
+  const key = normalizeKey(event);
+  if (!key || !shouldHandleMobileKeyboardKeyEvent(event, key)) return;
+  event.preventDefault();
+  const released = releasePressedKey(key, event);
+  releaseStaleModifierChordKeys(event, { exceptKey: key });
+  synchronizeModifierState(event);
+  if (released) {
+    return;
+  }
+  sendKeyEvent(key, false, event);
+}
+
+function shouldHandleMobileKeyboardKeyEvent(event, key) {
+  if (keyLogicalModifier(key)) return true;
+  if (MOBILE_KEYBOARD_SPECIAL_KEYS.has(event.key)) return true;
+  if (eventHasShortcutModifier(event)) return true;
+  return eventHasActiveModifier(event) && event.key?.length !== 1;
 }
 
 function scrollSpeedScale() {
@@ -5033,14 +5211,26 @@ function initControls() {
   });
   mobileKeyboardInput.addEventListener("beforeinput", handleMobileKeyboardBeforeInput);
   mobileKeyboardInput.addEventListener("input", () => {
-    if (mobileKeyboardInput.value) {
-      sendRemoteText(mobileKeyboardInput.value);
+    if (state.mobileKeyboardComposing) {
+      scheduleMobileKeyboardTextFlush(MOBILE_KEYBOARD_COMPOSITION_IDLE_FLUSH_MS);
+      return;
     }
-    mobileKeyboardInput.value = "";
+    flushMobileKeyboardText();
+  });
+  mobileKeyboardInput.addEventListener("compositionstart", () => {
+    clearMobileKeyboardFlushTimer();
+    state.mobileKeyboardComposing = true;
+  });
+  mobileKeyboardInput.addEventListener("compositionend", (event) => {
+    state.mobileKeyboardComposing = false;
+    scheduleMobileKeyboardTextFlush(0, event.data || "");
   });
   mobileKeyboardInput.addEventListener("keydown", handleMobileKeyboardKeydown);
+  mobileKeyboardInput.addEventListener("keyup", handleMobileKeyboardKeyup);
   mobileKeyboardInput.addEventListener("focus", syncMobileKeyboardButton);
   mobileKeyboardInput.addEventListener("blur", () => {
+    state.mobileKeyboardComposing = false;
+    clearMobileKeyboardFlushTimer();
     mobileKeyboardInput.value = "";
     syncMobileKeyboardButton();
   });
@@ -5152,7 +5342,7 @@ function initControls() {
       trackModifierChordKey(event, key);
     }
     logInputState("keydown", event, { normalizedKey: key });
-    send({ type: "key", key, down: true });
+    sendKeyEvent(key, true, event);
     if (!event.repeat) {
       sendPressedKeyState();
     }
@@ -5161,7 +5351,7 @@ function initControls() {
   window.addEventListener("keyup", (event) => {
     const key = normalizeKey(event);
     if (!key) return;
-    const released = releasePressedKey(key);
+    const released = releasePressedKey(key, event);
     releaseStaleModifierChordKeys(event, { exceptKey: key });
     synchronizeModifierState(event);
     if (released) {
@@ -5169,7 +5359,7 @@ function initControls() {
       return;
     }
     if (!shouldHandleKeyboard(event)) return;
-    send({ type: "key", key, down: false });
+    sendKeyEvent(key, false, event);
     event.preventDefault();
   });
   window.addEventListener("focus", () => {

@@ -358,16 +358,16 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   left: var(--dock-edge);
   bottom: calc(var(--dock-bottom) + var(--fab-size) + 20px);
   width: min(460px, calc(100vw - 16px));
-  max-height: min(420px, calc(100vh - 112px));
+  max-height: min(520px, calc(100vh - 112px));
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 10px;
   padding: 12px;
   border-radius: 18px;
   background:
-    linear-gradient(180deg, rgba(34, 18, 18, 0.98), rgba(13, 8, 8, 0.98)),
+    linear-gradient(180deg, rgba(18, 29, 34, 0.98), rgba(9, 14, 17, 0.98)),
     var(--panel);
-  border: 1px solid rgba(255, 111, 111, 0.32);
+  border: 1px solid rgba(141, 230, 255, 0.22);
   box-shadow: var(--shadow);
   font-size: 12.5px;
 }
@@ -377,7 +377,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  color: var(--danger);
+  color: var(--accent);
   font-weight: 600;
 }
 
@@ -395,14 +395,28 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   gap: 4px;
   padding: 8px 10px;
   border-radius: 12px;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.error-item.is-error {
   background: rgba(30, 10, 10, 0.72);
-  border: 1px solid rgba(255, 111, 111, 0.22);
+  border-color: rgba(255, 111, 111, 0.22);
+}
+
+.error-item.is-debug {
+  background: rgba(141, 230, 255, 0.07);
+  border-color: rgba(141, 230, 255, 0.16);
 }
 
 .error-item-code {
-  color: var(--danger);
+  color: var(--accent);
   font-size: 0.72rem;
   font-weight: 700;
+}
+
+.error-item.is-error .error-item-code {
+  color: var(--danger);
 }
 
 .error-item-message {
@@ -410,6 +424,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   font-size: 0.78rem;
   line-height: 1.35;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .error-item-time {
@@ -1048,11 +1063,16 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   place-items: center;
   padding: 0 5px;
   border-radius: 999px;
-  background: var(--danger);
-  color: #fff;
+  background: var(--accent);
+  color: #062027;
   font-size: 0.66rem;
   line-height: 1;
   font-weight: 700;
+}
+
+.error-count.has-error {
+  background: var(--danger);
+  color: #fff;
 }
 
 .mobile-keyboard-trigger {

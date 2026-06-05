@@ -21,7 +21,7 @@ use crate::{
     clipboard::{read_remote_clipboard, write_remote_clipboard},
     ffmpeg::{MicInputHandle, read_stderr, run_xdotool, spawn_mic_input_injector, wake_display},
     media::{ActiveAudioState, ActiveVideoState, MediaHub},
-    messages::{ClientMessage, ServerMessage},
+    messages::{ClientMessage, KeyModifiers, ServerMessage},
     settings::{AudioStreamConfig, ServerConfig, StreamConfig},
     streamer::StreamFrame,
     system_stats::StatsSampler,
@@ -1350,7 +1350,28 @@ async fn apply_client_message(
                 run_xdotool(display, ["click", "1"]).await?;
             }
         }
-        ClientMessage::Key { key, down } => {
+        ClientMessage::Key {
+            key,
+            down,
+            modifiers,
+        } => {
+            let was_pressed = pressed_keys.contains(&key);
+            if let Some(modifiers) = modifiers {
+                if !down
+                    && !was_pressed
+                    && key_logical_modifier(&key).is_none()
+                    && key_modifiers_active(modifiers)
+                {
+                    tap_key_with_modifiers(display, pressed_keys, &key, modifiers).await?;
+                    *last_key_state_at = if pressed_keys.is_empty() {
+                        None
+                    } else {
+                        Some(Instant::now())
+                    };
+                    return Ok(());
+                }
+                sync_event_modifier_keys(display, pressed_keys, modifiers, &key).await?;
+            }
             if down {
                 pressed_keys.insert(key.clone());
             } else {
@@ -1608,6 +1629,110 @@ async fn sync_pressed_keys(
     Ok(())
 }
 
+fn key_logical_modifier(key: &str) -> Option<&'static str> {
+    match key {
+        "Control_L" | "Control_R" => Some("Control"),
+        "Shift_L" | "Shift_R" => Some("Shift"),
+        "Alt_L" | "Alt_R" => Some("Alt"),
+        "Super_L" | "Super_R" => Some("Meta"),
+        _ => None,
+    }
+}
+
+fn key_modifiers_active(modifiers: KeyModifiers) -> bool {
+    modifiers.ctrl || modifiers.shift || modifiers.alt || modifiers.meta
+}
+
+fn modifier_fallback_keys(modifiers: KeyModifiers) -> Vec<(&'static str, [&'static str; 2])> {
+    let mut keys = Vec::new();
+    if modifiers.ctrl {
+        keys.push(("Control_L", ["Control_L", "Control_R"]));
+    }
+    if modifiers.shift {
+        keys.push(("Shift_L", ["Shift_L", "Shift_R"]));
+    }
+    if modifiers.alt {
+        keys.push(("Alt_L", ["Alt_L", "Alt_R"]));
+    }
+    if modifiers.meta {
+        keys.push(("Super_L", ["Super_L", "Super_R"]));
+    }
+    keys
+}
+
+async fn tap_key_with_modifiers(
+    display: &str,
+    pressed_keys: &HashSet<String>,
+    key: &str,
+    modifiers: KeyModifiers,
+) -> Result<()> {
+    let modifier_keys = modifier_fallback_keys(modifiers);
+    let temporary_modifiers = modifier_keys
+        .iter()
+        .filter_map(|(fallback, keys)| {
+            if keys.iter().any(|key| pressed_keys.contains(*key)) {
+                None
+            } else {
+                Some(*fallback)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut args = Vec::with_capacity(temporary_modifiers.len() * 4 + 4);
+    for modifier in &temporary_modifiers {
+        args.push("keydown".to_string());
+        args.push((*modifier).to_string());
+    }
+    args.push("keydown".to_string());
+    args.push(key.to_string());
+    args.push("keyup".to_string());
+    args.push(key.to_string());
+    for modifier in temporary_modifiers.iter().rev() {
+        args.push("keyup".to_string());
+        args.push((*modifier).to_string());
+    }
+    run_xdotool(display, &args).await
+}
+
+async fn sync_event_modifier_keys(
+    display: &str,
+    pressed_keys: &mut HashSet<String>,
+    modifiers: KeyModifiers,
+    event_key: &str,
+) -> Result<()> {
+    let skip_logical = key_logical_modifier(event_key);
+    let modifier_states = [
+        (
+            "Control",
+            modifiers.ctrl,
+            ["Control_L", "Control_R"],
+            "Control_L",
+        ),
+        ("Shift", modifiers.shift, ["Shift_L", "Shift_R"], "Shift_L"),
+        ("Alt", modifiers.alt, ["Alt_L", "Alt_R"], "Alt_L"),
+        ("Meta", modifiers.meta, ["Super_L", "Super_R"], "Super_L"),
+    ];
+
+    for (logical, pressed, keys, fallback) in modifier_states {
+        if skip_logical == Some(logical) {
+            continue;
+        }
+        if pressed {
+            if keys.iter().any(|key| pressed_keys.contains(*key)) {
+                continue;
+            }
+            run_xdotool(display, ["keydown", fallback]).await?;
+            pressed_keys.insert(fallback.to_string());
+            continue;
+        }
+        for key in keys {
+            if pressed_keys.remove(key) {
+                run_xdotool(display, ["keyup", key]).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn release_pressed_keys(display: &str, pressed_keys: &mut HashSet<String>) -> Result<()> {
     let mut keys = pressed_keys.drain().collect::<Vec<_>>();
     keys.sort_by(|left, right| {
@@ -1693,6 +1818,7 @@ mod tests {
         assert!(!should_wake_display_for_message(&ClientMessage::Key {
             key: "a".to_string(),
             down: true,
+            modifiers: None,
         }));
         assert!(!should_wake_display_for_message(&ClientMessage::KeyState {
             pressed_keys: vec!["Shift_L".to_string()],
