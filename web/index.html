@@ -37,14 +37,86 @@
             </button>
             <div id="mic-device-menu" class="device-menu hidden" role="menu" aria-label="Microphone devices"></div>
           </div>
-          <button id="audio-toggle" class="tool-toggle is-active" type="button" aria-label="Mute server audio" aria-pressed="true">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4 9.5h3.5L12.5 5v14l-5-4.5H4z" />
-              <path d="M16 9a4.5 4.5 0 0 1 0 6" />
-              <path d="M18.5 6.5a8.5 8.5 0 0 1 0 11" />
-              <path class="sound-off-slash" d="M5 5l14 14" />
-            </svg>
-          </button>
+          <details id="audio-panel" class="audio-panel">
+            <summary id="audio-toggle" class="tool-toggle is-active" aria-label="Audio settings" aria-pressed="true">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 9.5h3.5L12.5 5v14l-5-4.5H4z" />
+                <path d="M16 9a4.5 4.5 0 0 1 0 6" />
+                <path d="M18.5 6.5a8.5 8.5 0 0 1 0 11" />
+                <path class="sound-off-slash" d="M5 5l14 14" />
+              </svg>
+            </summary>
+            <div class="audio-card">
+              <section id="audio-content" class="audio-content" aria-label="Audio settings">
+                <div class="audio-status-grid">
+                  <article class="metric-card">
+                    <span class="metric-label">Audio Buffer</span>
+                    <strong id="status-audio-buffer" class="metric-value">--</strong>
+                  </article>
+                  <article class="metric-card">
+                    <span class="metric-label">Audio Clock Speed</span>
+                    <strong id="audio-clock-rate-value" class="metric-value range-value">0.9650x</strong>
+                  </article>
+                </div>
+                <div class="menu-grid">
+                  <label class="toggle-label">
+                    <span>Mute server audio</span>
+                    <input id="audio-muted" type="checkbox" />
+                  </label>
+                  <label class="toggle-label">
+                    <span>Enable remote audio</span>
+                    <input id="audio-real-output" type="checkbox" />
+                  </label>
+                  <span id="audio-output-status" class="field-help">Virtual output</span>
+                  <label>Audio playback bitrate
+                    <select id="audio-bitrate">
+                      <option value="16">16 kbps</option>
+                      <option value="24">24 kbps</option>
+                      <option value="32">32 kbps</option>
+                      <option value="48">48 kbps</option>
+                      <option value="64">64 kbps</option>
+                      <option value="96">96 kbps</option>
+                      <option value="128" selected>128 kbps</option>
+                      <option value="160">160 kbps</option>
+                      <option value="192">192 kbps</option>
+                      <option value="256">256 kbps</option>
+                      <option value="320">320 kbps</option>
+                    </select>
+                  </label>
+                  <label>Mic bitrate
+                    <select id="mic-bitrate">
+                      <option value="16">16 kbps</option>
+                      <option value="24">24 kbps</option>
+                      <option value="32">32 kbps</option>
+                      <option value="48">48 kbps</option>
+                      <option value="64">64 kbps</option>
+                      <option value="96">96 kbps</option>
+                      <option value="128">128 kbps</option>
+                      <option value="160">160 kbps</option>
+                      <option value="192">192 kbps</option>
+                      <option value="256">256 kbps</option>
+                      <option value="320" selected>320 kbps</option>
+                    </select>
+                  </label>
+                  <label>Audio latency
+                    <input id="audio-latency" type="range" min="0" max="2000" step="10" value="400" />
+                    <span id="audio-latency-value">400 ms</span>
+                  </label>
+                  <label>Audio volume
+                    <input id="audio-volume" type="range" min="0" max="100" step="1" value="100" />
+                    <span id="audio-volume-value">100%</span>
+                  </label>
+                  <label>Audio clock speed
+                    <input id="audio-clock-rate" type="range" min="0.9100" max="1.1" step="0.0005" value="1.0000" />
+                    <span class="toggle-label inline-toggle">
+                      <span>Auto</span>
+                      <input id="audio-clock-auto" type="checkbox" checked />
+                    </span>
+                  </label>
+                </div>
+              </section>
+            </div>
+          </details>
           <button id="camera-toggle" class="tool-toggle" type="button" aria-label="Enable camera uplink" aria-pressed="false">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path class="camera-off-slash" d="M5 5l14 14" />
@@ -90,7 +162,6 @@
               <div class="tab-row" role="tablist" aria-label="Control sections">
                 <button id="tab-button-status" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-status" data-tab-target="status">Status</button>
                 <button id="tab-button-view" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-view" data-tab-target="view">View</button>
-                <button id="tab-button-audio" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-audio" data-tab-target="audio">Audio</button>
                 <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Settings</button>
                 <button id="tab-button-performance" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-performance" data-tab-target="performance">Performance</button>
               </div>
@@ -158,86 +229,32 @@
                     </div>
                     <span class="metric-meta">10% step</span>
                   </article>
-                  <article class="metric-card">
-                    <span class="metric-label">Current Video</span>
-                    <strong id="view-video-size" class="metric-value">--</strong>
-                  </article>
-                  <article class="metric-card">
-                    <span class="metric-label">Viewport</span>
-                    <strong id="view-viewport-size" class="metric-value">--</strong>
-                  </article>
-                  <article class="metric-card">
-                    <span class="metric-label">Window</span>
-                    <strong id="view-window-size" class="metric-value">--</strong>
-                  </article>
-                  <article class="metric-card">
-                    <span class="metric-label">Remote Screen</span>
-                    <strong id="view-remote-screen-size" class="metric-value">--</strong>
-                  </article>
-                </div>
-              </section>
-              <section id="tab-panel-audio" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-audio" hidden>
-                <div class="audio-status-grid">
-                  <article class="metric-card">
-                    <span class="metric-label">Audio Buffer</span>
-                    <strong id="status-audio-buffer" class="metric-value">--</strong>
-                  </article>
-                  <article class="metric-card">
-                    <span class="metric-label">Audio Clock Speed</span>
-                    <strong id="audio-clock-rate-value" class="metric-value range-value">0.9650x</strong>
-                  </article>
-                </div>
-                <div class="menu-grid">
-                  <label class="toggle-label">
-                    <span>Enable remote audio</span>
-                    <input id="audio-real-output" type="checkbox" />
-                  </label>
-                  <span id="audio-output-status" class="field-help">Virtual output</span>
-                  <label>Audio playback bitrate
-                    <select id="audio-bitrate">
-                      <option value="16">16 kbps</option>
-                      <option value="24">24 kbps</option>
-                      <option value="32">32 kbps</option>
-                      <option value="48">48 kbps</option>
-                      <option value="64">64 kbps</option>
-                      <option value="96">96 kbps</option>
-                      <option value="128" selected>128 kbps</option>
-                      <option value="160">160 kbps</option>
-                      <option value="192">192 kbps</option>
-                      <option value="256">256 kbps</option>
-                      <option value="320">320 kbps</option>
-                    </select>
-                  </label>
-                  <label>Mic bitrate
-                    <select id="mic-bitrate">
-                      <option value="16">16 kbps</option>
-                      <option value="24">24 kbps</option>
-                      <option value="32">32 kbps</option>
-                      <option value="48">48 kbps</option>
-                      <option value="64">64 kbps</option>
-                      <option value="96">96 kbps</option>
-                      <option value="128">128 kbps</option>
-                      <option value="160">160 kbps</option>
-                      <option value="192">192 kbps</option>
-                      <option value="256">256 kbps</option>
-                      <option value="320" selected>320 kbps</option>
-                    </select>
-                  </label>
-                  <label>Audio latency
-                    <input id="audio-latency" type="range" min="0" max="2000" step="10" value="400" />
-                    <span id="audio-latency-value">400 ms</span>
-                  </label>
-                  <label>Audio volume
-                    <input id="audio-volume" type="range" min="0" max="100" step="1" value="100" />
-                    <span id="audio-volume-value">100%</span>
-                  </label>
-                  <label>Audio clock speed
-                    <input id="audio-clock-rate" type="range" min="0.9100" max="1.1" step="0.0005" value="1.0000" />
-                    <span class="toggle-label inline-toggle">
-                      <span>Auto</span>
-                      <input id="audio-clock-auto" type="checkbox" checked />
-                    </span>
-                  </label>
+                  <div class="view-size-strip" aria-label="View sizes">
+                    <button id="view-canvas-render-action" class="view-size-chip" type="button">
+                      <span class="metric-label">Canvas Render</span>
+                      <strong id="view-canvas-render-size" class="metric-value">--</strong>
+                    </button>
+                    <div class="view-size-chip">
+                      <span class="metric-label">Canvas CSS</span>
+                      <strong id="view-canvas-css-size" class="metric-value">--</strong>
+                    </div>
+                    <div class="view-size-chip">
+                      <span class="metric-label">Remote Screen</span>
+                      <strong id="view-remote-screen-size" class="metric-value">--</strong>
+                    </div>
+                    <div class="view-size-chip">
+                      <span class="metric-label">Stream</span>
+                      <strong id="view-stream-size" class="metric-value">--</strong>
+                    </div>
+                    <button id="view-viewport-action" class="view-size-chip" type="button">
+                      <span class="metric-label">Viewport</span>
+                      <strong id="view-viewport-size" class="metric-value">--</strong>
+                    </button>
+                    <div class="view-size-chip">
+                      <span class="metric-label">Window</span>
+                      <strong id="view-window-size" class="metric-value">--</strong>
+                    </div>
+                  </div>
                 </div>
               </section>
               <section id="tab-panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-settings" hidden>

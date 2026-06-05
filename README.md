@@ -47,7 +47,7 @@ Open the HTTPS URL printed at startup. Replace `passwd` with your server passwor
 - `-p, --port <port>`: override the listening port.
 - `--https yes|no`: enable or disable built-in HTTPS in `run.sh`; HTTPS is enabled by default.
 - `--headless yes|no`: force Xvfb or use an available host display; bare `--headless` means `yes`.
-- `--launcher <command>`: override the bundled `vendor/aurora-wm` headless launcher.
+- `--launcher <command>`: override the bundled `vendor/$(uname -m)/aurora-wm` headless launcher.
 
 ### Environment variables
 
@@ -77,7 +77,7 @@ Open the server URL in a browser after starting the app. The client supports:
 
 ## Launcher
 
-`run.sh` and `dev.sh` start a headless X11 display when requested or when `DISPLAY` is unavailable. They default to the bundled lightweight `vendor/aurora-wm`, and you can choose another desktop/session or a terminal with `--launcher`:
+`run.sh` and `dev.sh` start a headless X11 display when requested or when `DISPLAY` is unavailable. They default to the bundled lightweight `vendor/$(uname -m)/aurora-wm`, and you can choose another desktop/session or a terminal with `--launcher`:
 
 ```bash
 bash dev.sh --passwd passwd --launcher xfce4-session

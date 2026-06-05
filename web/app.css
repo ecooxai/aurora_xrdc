@@ -339,6 +339,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .error-panel,
+.audio-panel,
 .control-panel,
 .transfer-panel {
   position: relative;
@@ -348,6 +349,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .error-card,
+.audio-card,
 .control-card,
 .transfer-card {
   display: none;
@@ -452,6 +454,23 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   font-size: 12.5px;
 }
 
+.audio-panel[open] .audio-card {
+  position: fixed;
+  left: var(--dock-edge);
+  bottom: calc(var(--dock-bottom) + var(--fab-size) + 20px);
+  width: min(420px, calc(100vw - 16px));
+  max-height: min(560px, calc(100vh - 112px));
+  display: grid;
+  padding: 14px;
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(18, 29, 34, 0.98), rgba(9, 14, 17, 0.98)),
+    var(--panel);
+  border: 1px solid var(--panel-border);
+  box-shadow: var(--shadow);
+  font-size: 12.5px;
+}
+
 .transfer-panel[open] .transfer-card {
   position: fixed;
   left: var(--dock-edge);
@@ -479,10 +498,20 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   scrollbar-gutter: stable;
 }
 
+.audio-content {
+  display: grid;
+  min-height: 0;
+  gap: 10px;
+  overflow: auto;
+  align-content: start;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+
 .tab-row {
   grid-row: 2;
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   padding: 4px;
   margin: 0;
@@ -543,8 +572,42 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 
 .view-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
+}
+
+.view-size-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.view-size-chip {
+  flex: 1 1 132px;
+  min-width: 0;
+  display: grid;
+  gap: 5px;
+  align-content: start;
+  padding: 10px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  text-align: left;
+  box-shadow: none;
+}
+
+button.view-size-chip {
+  cursor: pointer;
+}
+
+button.view-size-chip:hover,
+button.view-size-chip:active {
+  transform: none;
+  filter: none;
+  border-color: rgba(141, 230, 255, 0.26);
+  background: rgba(141, 230, 255, 0.08);
 }
 
 .audio-status-grid {
@@ -890,12 +953,16 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .control-card label,
+.audio-card label,
 .control-card .field-group {
   gap: 5px;
   font-size: 0.76rem;
 }
 
 .error-card button,
+.audio-card select,
+.audio-card input,
+.audio-card button,
 .control-card select,
 .control-card input,
 .control-card button,
@@ -905,12 +972,14 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .error-card button:not(.tool-toggle),
+.audio-card button:not(.tool-toggle),
 .control-card button:not(.tool-toggle),
 .transfer-card button:not(.tool-toggle) {
   padding: 8px 10px;
 }
 
 .error-card button:disabled,
+.audio-card button:disabled,
 .control-card button:disabled,
 .transfer-card button:disabled {
   cursor: not-allowed;
@@ -997,17 +1066,15 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   cursor: pointer;
   border-radius: 999px;
   background: rgba(13, 18, 20, 0.94);
-  border: 1px solid var(--panel-border);
+  border: none;
   box-shadow: var(--shadow);
 }
 
 .tool-toggle.is-active {
   background: rgba(18, 31, 35, 0.96);
-  border-color: rgba(141, 230, 255, 0.32);
 }
 
 .tool-toggle.is-pending {
-  border-color: rgba(245, 194, 107, 0.38);
   box-shadow: 0 0 0 1px rgba(245, 194, 107, 0.18), var(--shadow);
 }
 
@@ -1039,13 +1106,13 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .error-panel[open] .tool-toggle,
+.audio-panel[open] .tool-toggle,
 .control-panel[open] .tool-toggle,
 .transfer-panel[open] .tool-toggle {
   background: rgba(18, 31, 35, 0.96);
 }
 
 .error-toggle {
-  border-color: rgba(255, 111, 111, 0.32);
   position: relative;
 }
 
@@ -1081,7 +1148,6 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 
 .mobile-keyboard-trigger.is-active {
   background: rgba(18, 31, 35, 0.96);
-  border-color: rgba(141, 230, 255, 0.32);
 }
 
 .mobile-keyboard-input {
@@ -1113,6 +1179,14 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 @media (max-width: 900px) {
   .control-panel[open] .control-card {
     width: min(480px, calc(100vw - 16px));
+  }
+
+  .audio-panel[open] .audio-card {
+    left: 6px;
+    bottom: calc(var(--dock-bottom) + var(--fab-size) + 16px);
+    width: calc(100vw - 12px);
+    max-height: calc(100vh - 96px);
+    border-radius: 16px;
   }
 }
 
@@ -1155,7 +1229,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   }
 
   .tab-row {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .tab-button {
@@ -1189,10 +1263,6 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   .metric-value-network {
     font-size: 0.68rem;
     gap: 6px;
-  }
-
-  .view-grid {
-    grid-template-columns: 1fr;
   }
 
 }

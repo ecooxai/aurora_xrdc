@@ -1396,7 +1396,12 @@ async fn apply_client_message(
             };
         }
         ClientMessage::TextInput { text } => {
-            type_remote_text(display, &text).await?;
+            type_remote_text(display, &text, input_injector, pressed_keys).await?;
+            *last_key_state_at = if pressed_keys.is_empty() {
+                None
+            } else {
+                Some(Instant::now())
+            };
         }
         ClientMessage::Paste => {
             reset_input_state(display, input_injector, pressed_keys).await?;
@@ -1961,11 +1966,20 @@ mod tests {
     }
 }
 
-async fn type_remote_text(display: &str, text: &str) -> Result<()> {
+async fn type_remote_text(
+    display: &str,
+    text: &str,
+    input_injector: Option<&X11InputInjector>,
+    pressed_keys: &mut HashSet<String>,
+) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if should_paste_text(&normalized) {
+        paste_remote_text(display, &normalized, input_injector, pressed_keys).await?;
+        return Ok(());
+    }
     let segments: Vec<&str> = normalized.split('\n').collect();
     for (index, segment) in segments.iter().enumerate() {
         if !segment.is_empty() {
@@ -1978,6 +1992,32 @@ async fn type_remote_text(display: &str, text: &str) -> Result<()> {
         if index + 1 < segments.len() {
             run_xdotool(display, ["key", "Return"]).await?;
         }
+    }
+    Ok(())
+}
+
+fn should_paste_text(text: &str) -> bool {
+    !text.is_ascii()
+}
+
+async fn paste_remote_text(
+    display: &str,
+    text: &str,
+    input_injector: Option<&X11InputInjector>,
+    pressed_keys: &mut HashSet<String>,
+) -> Result<()> {
+    let previous_clipboard = read_remote_clipboard(display).await.ok();
+    let payload = crate::clipboard::ClipboardPayload {
+        text: Some(text.to_owned()),
+        image_png_b64: None,
+    };
+    write_remote_clipboard(display, &payload).await?;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    reset_input_state(display, input_injector, pressed_keys).await?;
+    run_xdotool(display, ["key", "ctrl+v"]).await?;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    if let Some(previous_clipboard) = previous_clipboard {
+        write_remote_clipboard(display, &previous_clipboard).await?;
     }
     Ok(())
 }

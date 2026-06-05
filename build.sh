@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ARCH="$(uname -m)"
+
 # Prefer a rustup-managed toolchain when available. Under sudo, use the
 # invoking user's rustup path because root often does not have cargo installed.
 CARGO_ENV_HOME="${HOME}"
@@ -27,7 +29,7 @@ if [[ -f "${CARGO_ENV_HOME}/.cargo/env" ]]; then
     export HOME="${SAVED_HOME_FOR_CARGO}"
 fi
 
-echo "[build] building optimized release binary..."
+echo "[build] building optimized release binary for ${ARCH}..."
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-1}"
 export CARGO_PROFILE_RELEASE_INCREMENTAL="${CARGO_PROFILE_RELEASE_INCREMENTAL:-false}"
 export CARGO_PROFILE_RELEASE_LTO="${CARGO_PROFILE_RELEASE_LTO:-thin}"

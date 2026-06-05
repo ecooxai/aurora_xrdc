@@ -210,6 +210,7 @@ const state = {
   videoFrameWidth: null,
   videoFrameHeight: null,
   viewZoomPercent: 100,
+  viewCssWidthMode: "render",
   wsLatencyMs: null,
   latencyProbeSeq: 0,
   latencyProbeSentAt: new Map(),
@@ -249,6 +250,7 @@ const authInput = $("auth-passwd");
 const authError = $("auth-error");
 const controlPanel = $("control-panel");
 const transferPanel = $("transfer-panel");
+const audioPanel = $("audio-panel");
 const errorPanel = $("error-panel");
 const errorCount = $("error-count");
 const errorList = $("error-list");
@@ -277,6 +279,7 @@ const audioLatencyInput = $("audio-latency");
 const audioLatencyValue = $("audio-latency-value");
 const audioVolumeInput = $("audio-volume");
 const audioVolumeValue = $("audio-volume-value");
+const audioMuteInput = $("audio-muted");
 const audioClockRateInput = $("audio-clock-rate");
 const audioClockRateValue = $("audio-clock-rate-value");
 const audioClockAutoInput = $("audio-clock-auto");
@@ -322,11 +325,15 @@ const localClipboardSyncBtn = $("local-clipboard-sync-btn");
 const remoteClipboardSyncBtn = $("remote-clipboard-sync-btn");
 const clipboardHistoryList = $("clipboard-history-list");
 const clipboardHistoryEmpty = $("clipboard-history-empty");
-const viewVideoSize = $("view-video-size");
+const viewCanvasRenderSize = $("view-canvas-render-size");
+const viewCanvasCssSize = $("view-canvas-css-size");
+const viewStreamSize = $("view-stream-size");
 const viewViewportSize = $("view-viewport-size");
 const viewWindowSize = $("view-window-size");
 const viewRemoteScreenSize = $("view-remote-screen-size");
 const viewZoomValue = $("view-zoom-value");
+const viewCanvasRenderAction = $("view-canvas-render-action");
+const viewViewportAction = $("view-viewport-action");
 const zoomOutButton = $("zoom-out");
 const zoomInButton = $("zoom-in");
 const AAC_SAMPLE_RATES = [
@@ -428,13 +435,22 @@ function setStatus(text, { hideAfterMs = 0 } = {}) {
   }
 }
 
+function streamMessageCode(message = "") {
+  if (message.startsWith("Audio")) return "audio_buffer";
+  if (message.startsWith("Video render") || message.startsWith("Video worker")) return "video_render";
+  if (message.startsWith("Video decoder") || message.startsWith("Video frame")) return "video_decode";
+  if (message.startsWith("Video")) return "video_stream";
+  if (/latency/i.test(message)) return "stream_latency";
+  return "stream_warning";
+}
+
 function setStreamWarning(message = "") {
   const previous = state.streamWarning;
   state.streamWarning = message;
-  streamWarning.classList.toggle("hidden", !message);
-  streamWarningText.textContent = message || "Stream delayed";
+  streamWarning.classList.add("hidden");
+  streamWarningText.textContent = "Stream delayed";
   if (message && message !== previous) {
-    pushDebug(message.startsWith("Audio") ? "audio_buffer" : "stream_warning", message, { throttleMs: 2000 });
+    pushDebug(streamMessageCode(message), message, { throttleMs: 2000 });
   }
 }
 
@@ -511,7 +527,7 @@ function currentBufferedAudioSeconds() {
 }
 
 function renderAudioBufferMetric() {
-  if (!controlPanel.open || !document.getElementById("tab-panel-audio")?.classList.contains("is-active")) {
+  if (!audioPanel.open) {
     return;
   }
   if (state.audioMuted) {
@@ -570,42 +586,53 @@ function syncZoomButtons() {
   zoomInButton.disabled = state.viewZoomPercent >= VIEW_ZOOM_MAX_PERCENT;
 }
 
+function currentVideoRenderWidth() {
+  return state.videoFrameWidth ?? canvas.width;
+}
+
+function currentVideoRenderHeight() {
+  return state.videoFrameHeight ?? canvas.height;
+}
+
 function renderViewMetrics() {
   const rect = canvas.getBoundingClientRect();
-  viewVideoSize.textContent = formatDimensions(rect.width, rect.height);
+  const renderWidth = currentVideoRenderWidth();
+  const renderHeight = currentVideoRenderHeight();
+  viewCanvasRenderSize.textContent = formatDimensions(renderWidth, renderHeight);
+  viewCanvasCssSize.textContent = formatDimensions(rect.width, rect.height);
+  viewStreamSize.textContent = formatDimensions(state.videoFrameWidth, state.videoFrameHeight);
   viewViewportSize.textContent = formatDimensions(viewportCard.clientWidth, viewportCard.clientHeight);
   viewWindowSize.textContent = formatDimensions(window.innerWidth, window.innerHeight);
   viewRemoteScreenSize.textContent = formatDimensions(state.remoteScreenWidth, state.remoteScreenHeight);
-  viewZoomValue.textContent = `${state.viewZoomPercent}%`;
+  viewZoomValue.textContent = state.viewCssWidthMode === "viewport"
+    ? "Viewport"
+    : `${Math.round(state.viewZoomPercent)}%`;
   syncZoomButtons();
 }
 
 function applyCanvasZoom() {
-  const surfaceWidth = state.videoFrameWidth ?? state.remoteScreenWidth ?? canvas.width;
-  const surfaceHeight = state.videoFrameHeight ?? state.remoteScreenHeight ?? canvas.height;
+  const surfaceWidth = currentVideoRenderWidth();
+  const surfaceHeight = currentVideoRenderHeight();
   if (!Number.isFinite(surfaceWidth) || !Number.isFinite(surfaceHeight) || surfaceWidth <= 0 || surfaceHeight <= 0) {
     renderViewMetrics();
     return;
   }
 
-  const viewportWidth = Math.max(viewportCard.clientWidth, 1);
-  const viewportHeight = Math.max(viewportCard.clientHeight, 1);
-  const fitScale = Math.min(viewportWidth / surfaceWidth, viewportHeight / surfaceHeight);
-  const zoomScale = state.viewZoomPercent / 100;
-  const displayWidth = Math.max(1, Math.round(surfaceWidth * fitScale * zoomScale));
-  const displayHeight = Math.max(1, Math.round(surfaceHeight * fitScale * zoomScale));
+  const displayWidth = state.viewCssWidthMode === "viewport"
+    ? Math.max(1, Math.round(viewportCard.clientWidth))
+    : Math.max(1, Math.round(surfaceWidth * (state.viewZoomPercent / 100)));
 
   canvas.style.width = `${displayWidth}px`;
-  canvas.style.height = `${displayHeight}px`;
+  canvas.style.height = "auto";
   renderViewMetrics();
 }
 
 function videoSurfaceWidth() {
-  return state.remoteScreenWidth ?? state.videoFrameWidth ?? canvas.width;
+  return state.remoteScreenWidth ?? currentVideoRenderWidth();
 }
 
 function videoSurfaceHeight() {
-  return state.remoteScreenHeight ?? state.videoFrameHeight ?? canvas.height;
+  return state.remoteScreenHeight ?? currentVideoRenderHeight();
 }
 
 function adjustZoom(deltaPercent) {
@@ -615,6 +642,25 @@ function adjustZoom(deltaPercent) {
     return;
   }
   state.viewZoomPercent = nextZoom;
+  state.viewCssWidthMode = "zoom";
+  applyCanvasZoom();
+  saveSettings();
+}
+
+function setCanvasDisplayRenderWidth() {
+  state.viewCssWidthMode = "render";
+  state.viewZoomPercent = 100;
+  applyCanvasZoom();
+  saveSettings();
+}
+
+function setCanvasDisplayViewportWidth() {
+  const renderWidth = currentVideoRenderWidth();
+  const viewportWidth = viewportCard.clientWidth;
+  if (Number.isFinite(renderWidth) && renderWidth > 0 && Number.isFinite(viewportWidth) && viewportWidth > 0) {
+    state.viewZoomPercent = (viewportWidth / renderWidth) * 100;
+  }
+  state.viewCssWidthMode = "viewport";
   applyCanvasZoom();
   saveSettings();
 }
@@ -630,10 +676,7 @@ function setActiveTab(tabName) {
     panel.classList.toggle("is-active", active);
     panel.hidden = !active;
   }
-  if (tabName === "audio") {
-    renderAudioBufferMetric();
-    void refreshAudioOutputStatus({ silent: true });
-  }
+  renderViewMetrics();
 }
 
 function showToast(code, message) {
@@ -746,7 +789,6 @@ function forceReconnect(reason) {
   state.highLatencySinceAt = 0;
   clearReconnectTimer();
   setStreamWarning(reason);
-  showToast("stream_reconnect", reason);
   closeConnection({ manual: false, preserveStatus: true });
   setStatus("Reconnecting...");
   setTimeout(() => {
@@ -1264,7 +1306,7 @@ function readSettingsFromControls() {
     directTouchScroll: directTouchScrollInput.checked,
     micEnabled: state.micEnabled,
     micDeviceId: state.micDeviceId,
-    audioMuted: state.audioMuted,
+    audioMuted: audioMuteInput?.checked ?? state.audioMuted,
     viewZoomPercent: state.viewZoomPercent,
   });
 }
@@ -1340,7 +1382,11 @@ function renderAudioToggle() {
   const active = !state.audioMuted && state.audioUserActivated && !state.audioPlaybackBlocked;
   audioToggle.classList.toggle("is-active", active);
   audioToggle.setAttribute("aria-pressed", active ? "true" : "false");
-  audioToggle.setAttribute("aria-label", active ? "Mute server audio" : "Play server audio");
+  audioToggle.setAttribute("aria-expanded", audioPanel.open ? "true" : "false");
+  audioToggle.setAttribute("aria-label", active ? "Audio settings" : "Audio settings, muted");
+  if (audioMuteInput) {
+    audioMuteInput.checked = state.audioMuted;
+  }
 }
 
 function micDeviceLabel(device, index = 0) {
@@ -1464,6 +1510,7 @@ async function refreshMicDevices({ silent = false } = {}) {
 async function openMicDeviceMenu() {
   controlPanel.open = false;
   transferPanel.open = false;
+  audioPanel.open = false;
   errorPanel.open = false;
   releaseInput();
   state.micDeviceMenuOpen = true;
@@ -1531,6 +1578,9 @@ function applySettings(settings) {
   audioClockRateInput.value = String(normalized.audioClockRate);
   audioClockAutoInput.checked = normalized.audioClockAuto;
   audioRealOutputInput.checked = normalized.audioUseRealOutput;
+  if (audioMuteInput) {
+    audioMuteInput.checked = normalized.audioMuted;
+  }
   encoderLatencySelect.value = normalized.encoderLatency;
   encoderQualitySelect.value = normalized.encoderQuality;
   videoScaleSelect.value = normalized.videoScale;
@@ -3801,9 +3851,13 @@ function setServerAudioMuted(muted) {
       void primeAudioPlayback();
     }
     renderAudioToggle();
+    renderAudioBufferMetric();
     return;
   }
   state.audioMuted = nextMuted;
+  if (audioMuteInput) {
+    audioMuteInput.checked = nextMuted;
+  }
   resetAudioDecoderForLiveCatchup();
   if (!state.audioMuted) {
     void primeAudioPlayback();
@@ -3811,14 +3865,6 @@ function setServerAudioMuted(muted) {
   renderAudioToggle();
   renderAudioBufferMetric();
   persistCurrentSettings();
-}
-
-function toggleServerAudio() {
-  if (state.audioMuted || !state.audioUserActivated || state.audioPlaybackBlocked) {
-    setServerAudioMuted(false);
-    return;
-  }
-  setServerAudioMuted(true);
 }
 
 function toggleCamera() {
@@ -5141,6 +5187,9 @@ function initControls() {
     persistCurrentSettings();
     void setAudioOutputMode(audioRealOutputInput.checked);
   });
+  audioMuteInput?.addEventListener("change", () => {
+    setServerAudioMuted(audioMuteInput.checked);
+  });
   autoDisconnectMinutesInput.addEventListener("input", persistCurrentSettings);
   autoDisconnectMinutesInput.addEventListener("change", persistCurrentSettings);
   touchModeSelect.addEventListener("change", persistCurrentSettings);
@@ -5154,6 +5203,7 @@ function initControls() {
     if (errorPanel.open) {
       controlPanel.open = false;
       transferPanel.open = false;
+      audioPanel.open = false;
       releaseInput();
     }
   });
@@ -5162,14 +5212,29 @@ function initControls() {
     if (controlPanel.open && transferPanel.open) {
       transferPanel.open = false;
     }
+    if (controlPanel.open && audioPanel.open) {
+      audioPanel.open = false;
+    }
     if (controlPanel.open && errorPanel.open) {
       errorPanel.open = false;
     }
-    renderAudioBufferMetric();
+  });
+  audioPanel.addEventListener("toggle", () => {
+    if (audioPanel.open) {
+      controlPanel.open = false;
+      transferPanel.open = false;
+      errorPanel.open = false;
+      closeMicDeviceMenu();
+      releaseInput();
+      renderAudioBufferMetric();
+      void refreshAudioOutputStatus({ silent: true });
+    }
+    renderAudioToggle();
   });
   transferPanel.addEventListener("toggle", () => {
     if (transferPanel.open) {
       controlPanel.open = false;
+      audioPanel.open = false;
       errorPanel.open = false;
       releaseInput();
     }
@@ -5184,7 +5249,6 @@ function initControls() {
   $("disconnect").addEventListener("click", disconnect);
   micToggle.addEventListener("click", toggleMicDeviceMenu);
   micDeviceMenu.addEventListener("click", (event) => event.stopPropagation());
-  audioToggle.addEventListener("click", toggleServerAudio);
   cameraToggle.addEventListener("click", toggleCamera);
   uploadAction.addEventListener("click", () => uploadInput.click());
   uploadInput.addEventListener("change", () => {
@@ -5202,6 +5266,8 @@ function initControls() {
   zoomInButton.addEventListener("click", () => {
     adjustZoom(VIEW_ZOOM_STEP_PERCENT);
   });
+  viewCanvasRenderAction.addEventListener("click", setCanvasDisplayRenderWidth);
+  viewViewportAction.addEventListener("click", setCanvasDisplayViewportWidth);
   mobileKeyboardTrigger.addEventListener("click", () => {
     if (document.activeElement === mobileKeyboardInput) {
       releaseInput();

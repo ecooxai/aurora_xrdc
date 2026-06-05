@@ -374,8 +374,8 @@ EOF
 }
 
 copy_bundled_aurora_wm() {
-  local source="${PROJECT_ROOT}/vendor/aurora-wm"
-  local target="${APPDIR}/usr/bin/vendor/aurora-wm"
+  local source="${PROJECT_ROOT}/vendor/${ARCH}/aurora-wm"
+  local target="${APPDIR}/usr/bin/vendor/${ARCH}/aurora-wm"
 
   [[ -x "${source}" ]] || die "missing executable bundled launcher: ${source}"
   mkdir -p "$(dirname "${target}")"
