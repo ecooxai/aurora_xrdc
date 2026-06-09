@@ -101,6 +101,49 @@ label,
 .radio-chip:hover .radio-chip-label {
   transform: translateY(-1px);
 }
+.checkbox-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.checkbox-chip {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease, transform 120ms ease;
+}
+.checkbox-chip input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.checkbox-chip-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: inherit;
+}
+.checkbox-chip:has(input:checked) {
+  background: rgba(141, 230, 255, 0.14);
+  border-color: rgba(141, 230, 255, 0.28);
+  color: var(--text);
+}
+.checkbox-chip:has(input:focus-visible) {
+  border-color: rgba(141, 230, 255, 0.48);
+  box-shadow: 0 0 0 3px rgba(141, 230, 255, 0.12);
+}
+.checkbox-chip:hover {
+  transform: translateY(-1px);
+}
 .field-help.is-warning {
   color: var(--accent-2);
 }
@@ -698,6 +741,36 @@ button.view-size-chip:active {
   gap: 8px;
 }
 
+.status-action-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 42px));
+  justify-content: end;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.status-icon-button {
+  width: 42px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: 12px;
+  background: rgba(141, 230, 255, 0.18);
+  border: 1px solid rgba(141, 230, 255, 0.28);
+  color: var(--text);
+}
+
+.status-icon-button span {
+  font-size: 1.08rem;
+  line-height: 1;
+}
+
+.status-icon-button.secondary {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--muted);
+}
+
 .webclients-list {
   display: grid;
   gap: 6px;
@@ -986,10 +1059,6 @@ button.view-size-chip:active {
   opacity: 0.45;
   transform: none;
   filter: none;
-}
-
-.control-card .button-row {
-  gap: 8px;
 }
 
 .auth-modal {

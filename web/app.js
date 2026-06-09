@@ -5,6 +5,9 @@ const PASSWD_STORAGE_KEY = "vibe_rdesk.passwd";
 const TOUCH_LONG_PRESS_MS = 1000;
 const TOUCH_MOVE_CANCEL_PX = 14;
 const DIRECT_TOUCH_SCROLL_MULTIPLIER = 3;
+const SMART_TOUCH_DRAG_HOLD_MS = 900;
+const SMART_TOUCH_RIGHT_CLICK_MS = 5000;
+const SMART_TOUCH_SCROLL_MULTIPLIER = 0.9;
 const CLIPBOARD_HISTORY_LIMIT = 100;
 const VIEW_ZOOM_STEP_PERCENT = 10;
 const VIEW_ZOOM_MIN_PERCENT = 10;
@@ -182,6 +185,11 @@ const state = {
   touchDragPointerId: null,
   touchScrollLastY: null,
   touchTwoFingerTap: null,
+  smartTouchDragTimer: 0,
+  smartTouchRightClickTimer: 0,
+  smartTouchAction: null,
+  smartTouchScrollLastX: null,
+  smartTouchScrollLastY: null,
   recoveryTapCount: 0,
   recoveryTapLastAt: 0,
   recoveryTapCenter: null,
@@ -302,6 +310,7 @@ const decodeQueueValue = $("decode-queue-value");
 const performanceSpeedButton = $("performance-speed");
 const performanceQualityButton = $("performance-quality");
 const touchModeSelect = $("touch-mode");
+const touchModeGroup = $("touch-mode-group");
 const directTouchScrollInput = $("direct-touch-scroll");
 const directTouchScrollLabel = $("direct-touch-scroll-label");
 const uploadAction = $("upload-action");
@@ -1279,6 +1288,40 @@ function renderEncodePreferenceRadioGroup() {
   );
 }
 
+function renderTouchModeCheckboxGroup() {
+  if (!touchModeGroup || !touchModeSelect) return;
+  const fragment = document.createDocumentFragment();
+  Array.from(touchModeSelect.options).forEach((option, index) => {
+    if (typeof option.value !== "string" || option.value.length === 0) return;
+    const chip = document.createElement("label");
+    chip.className = "checkbox-chip";
+
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.name = "touch-mode-choice";
+    input.id = `${touchModeSelect.id}-checkbox-${index}`;
+    input.value = option.value;
+    input.checked = option.value === touchModeSelect.value;
+    input.addEventListener("change", () => {
+      if (!input.checked) {
+        input.checked = true;
+        return;
+      }
+      if (touchModeSelect.value === input.value) return;
+      touchModeSelect.value = input.value;
+      touchModeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    const text = document.createElement("span");
+    text.className = "checkbox-chip-label";
+    text.textContent = option.textContent?.trim() || option.value;
+
+    chip.append(input, text);
+    fragment.appendChild(chip);
+  });
+  touchModeGroup.replaceChildren(fragment);
+}
+
 function readSettingsFromControls() {
   return normalizeSettings({
     codec: codecSelect.value,
@@ -1363,6 +1406,7 @@ function syncPerformancePresetButtons(settings = readSettingsFromControls()) {
 
 function syncTouchModeControls(settings = readSettingsFromControls()) {
   const isDirectTouch = settings.touchMode === "direct_touch";
+  renderTouchModeCheckboxGroup();
   directTouchScrollInput.disabled = !isDirectTouch;
   directTouchScrollLabel.classList.toggle("is-disabled", !isDirectTouch);
 }
@@ -4360,7 +4404,7 @@ function scrollSpeedScale() {
   return Math.min(Math.max(value * 0.25, 0.1), 5);
 }
 
-function sendWheelDelta(deltaX, deltaY, deltaMode = 0) {
+function sendWheelDelta(deltaX, deltaY, deltaMode = 0, scrollSpeed = scrollSpeedScale()) {
   if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) return;
   if (!deltaX && !deltaY) return;
   send({
@@ -4368,7 +4412,7 @@ function sendWheelDelta(deltaX, deltaY, deltaMode = 0) {
     delta_x: deltaX,
     delta_y: deltaY,
     delta_mode: deltaMode,
-    scroll_speed: scrollSpeedScale(),
+    scroll_speed: scrollSpeed,
   });
 }
 
@@ -4444,6 +4488,10 @@ function getTouchMode() {
   return touchModeSelect.value;
 }
 
+function isSmartTouchMode() {
+  return getTouchMode() === "smart_touch";
+}
+
 function isDirectTouchScrollEnabled() {
   return getTouchMode() === "direct_touch" && directTouchScrollInput.checked;
 }
@@ -4458,10 +4506,15 @@ function clearTouchLongPress() {
 
 function resetTouchInteraction() {
   clearTouchLongPress();
+  clearSmartTouchTimers();
+  releaseSmartTouchDrag();
   state.touchPointers.clear();
   state.touchDragPointerId = null;
   state.touchScrollLastY = null;
   state.touchTwoFingerTap = null;
+  state.smartTouchAction = null;
+  state.smartTouchScrollLastX = null;
+  state.smartTouchScrollLastY = null;
 }
 
 function getAverageTouchClientY() {
@@ -4608,7 +4661,11 @@ function resetRemainingTouchStart() {
   touch.startY = touch.clientY;
   state.touchPointers.set(pointerId, touch);
   if (state.touchDragPointerId === pointerId) return;
-  scheduleTouchLongPress(pointerId);
+  if (isSmartTouchMode()) {
+    scheduleSmartTouch(pointerId);
+  } else {
+    scheduleTouchLongPress(pointerId);
+  }
 }
 
 function scheduleTouchLongPress(pointerId) {
@@ -4646,7 +4703,115 @@ function maybeCancelTouchLongPress(pointerId) {
 
 function startTouchScroll() {
   clearTouchLongPress();
+  clearSmartTouchTimers();
   state.touchScrollLastY = getAverageTouchClientY();
+}
+
+function clearSmartTouchTimers() {
+  if (state.smartTouchDragTimer) {
+    clearTimeout(state.smartTouchDragTimer);
+    state.smartTouchDragTimer = 0;
+  }
+  if (state.smartTouchRightClickTimer) {
+    clearTimeout(state.smartTouchRightClickTimer);
+    state.smartTouchRightClickTimer = 0;
+  }
+}
+
+function smartTouchMovedDistance(touch) {
+  if (!touch) return TOUCH_MOVE_CANCEL_PX;
+  return Math.hypot(touch.clientX - touch.startX, touch.clientY - touch.startY);
+}
+
+function smartTouchPoint(touch) {
+  if (!touch) return null;
+  return clientPointToCanvas(touch.clientX, touch.clientY);
+}
+
+function movePointerToTouch(touch) {
+  const point = smartTouchPoint(touch);
+  if (!point) return false;
+  send({ type: "pointer_absolute", x: point.x, y: point.y });
+  return true;
+}
+
+function releaseSmartTouchDrag() {
+  if (state.touchDragPointerId === null || state.smartTouchAction !== "drag") return;
+  send({ type: "pointer_button", button: 1, down: false });
+  state.touchDragPointerId = null;
+}
+
+function startSmartTouchDrag(pointerId) {
+  if (!isSmartTouchMode() || state.touchPointers.size !== 1 || state.smartTouchAction) return;
+  const touch = state.touchPointers.get(pointerId);
+  if (!touch || smartTouchMovedDistance(touch) >= TOUCH_MOVE_CANCEL_PX) return;
+  clearTouchLongPress();
+  movePointerToTouch(touch);
+  send({ type: "pointer_button", button: 1, down: true });
+  state.touchDragPointerId = pointerId;
+  state.smartTouchAction = "drag";
+}
+
+function performSmartTouchRightClick(pointerId) {
+  if (!isSmartTouchMode() || state.touchPointers.size !== 1) return;
+  const touch = state.touchPointers.get(pointerId);
+  if (!touch || smartTouchMovedDistance(touch) >= TOUCH_MOVE_CANCEL_PX) return;
+  if (state.smartTouchAction === "drag") {
+    send({ type: "pointer_button", button: 1, down: false });
+  }
+  clearSmartTouchTimers();
+  state.touchDragPointerId = null;
+  state.smartTouchAction = "right_click";
+  movePointerToTouch(touch);
+  send({ type: "pointer_button", button: 3, down: true });
+  send({ type: "pointer_button", button: 3, down: false });
+}
+
+function scheduleSmartTouch(pointerId) {
+  clearTouchLongPress();
+  clearSmartTouchTimers();
+  state.smartTouchAction = null;
+  state.smartTouchScrollLastX = null;
+  state.smartTouchScrollLastY = null;
+  if (state.touchPointers.size !== 1) return;
+  state.smartTouchDragTimer = window.setTimeout(() => {
+    state.smartTouchDragTimer = 0;
+    startSmartTouchDrag(pointerId);
+  }, SMART_TOUCH_DRAG_HOLD_MS);
+  state.smartTouchRightClickTimer = window.setTimeout(() => {
+    state.smartTouchRightClickTimer = 0;
+    performSmartTouchRightClick(pointerId);
+  }, SMART_TOUCH_RIGHT_CLICK_MS);
+}
+
+function handleSmartTouchMove(event, previous) {
+  const touch = state.touchPointers.get(event.pointerId);
+  if (!touch) return;
+  const movedDistance = smartTouchMovedDistance(touch);
+  if (state.smartTouchAction === "right_click") {
+    return;
+  }
+  if (state.smartTouchAction === "drag") {
+    const point = pointerToCanvas(event);
+    if (point) queuePointerMove(point.x, point.y);
+    return;
+  }
+  if (movedDistance < TOUCH_MOVE_CANCEL_PX) {
+    return;
+  }
+  clearSmartTouchTimers();
+  state.smartTouchAction = "scroll";
+  if (state.smartTouchScrollLastX === null || state.smartTouchScrollLastY === null) {
+    state.smartTouchScrollLastX = previous.clientX;
+    state.smartTouchScrollLastY = previous.clientY;
+  }
+  sendWheelDelta(
+    (state.smartTouchScrollLastX - event.clientX) * SMART_TOUCH_SCROLL_MULTIPLIER,
+    (state.smartTouchScrollLastY - event.clientY) * SMART_TOUCH_SCROLL_MULTIPLIER,
+    0,
+  );
+  state.smartTouchScrollLastX = event.clientX;
+  state.smartTouchScrollLastY = event.clientY;
 }
 
 function handleTouchPointerDown(event) {
@@ -4660,13 +4825,22 @@ function handleTouchPointerDown(event) {
   });
   canvas.setPointerCapture(event.pointerId);
   if (state.touchPointers.size === 1) {
-    if (getTouchMode() === "direct_touch") {
+    if (getTouchMode() === "direct_touch" || isSmartTouchMode()) {
       const point = pointerToCanvas(event);
       if (point) queuePointerMove(point.x, point.y);
     }
-    scheduleTouchLongPress(event.pointerId);
+    if (isSmartTouchMode()) {
+      scheduleSmartTouch(event.pointerId);
+    } else {
+      scheduleTouchLongPress(event.pointerId);
+    }
   } else if (state.touchPointers.size === 2) {
     startTwoFingerTapCandidate();
+    clearSmartTouchTimers();
+    if (state.smartTouchAction === "drag") {
+      releaseSmartTouchDrag();
+    }
+    state.smartTouchAction = null;
     if (state.touchDragPointerId === null) {
       startTouchScroll();
     } else {
@@ -4708,7 +4882,9 @@ function handleTouchPointerMove(event) {
     return;
   }
   maybeCancelTouchLongPress(event.pointerId);
-  if (getTouchMode() === "direct_touch") {
+  if (isSmartTouchMode()) {
+    handleSmartTouchMove(event, previous);
+  } else if (getTouchMode() === "direct_touch") {
     if (isDragging) {
       const point = pointerToCanvas(event);
       if (point) queuePointerMove(point.x, point.y);
@@ -4742,21 +4918,36 @@ function handleTouchPointerEnd(event) {
   const touch = state.touchPointers.get(event.pointerId);
   const wasSingleTouch = state.touchPointers.size === 1;
   const wasDragging = state.touchDragPointerId === event.pointerId;
+  const smartAction = state.smartTouchAction;
   const movedDistance = touch
     ? Math.hypot(touch.clientX - touch.startX, touch.clientY - touch.startY)
     : TOUCH_MOVE_CANCEL_PX;
-  const isTap = wasSingleTouch && !wasDragging && movedDistance < TOUCH_MOVE_CANCEL_PX;
+  const isTap = wasSingleTouch
+    && !wasDragging
+    && !smartAction
+    && movedDistance < TOUCH_MOVE_CANCEL_PX;
   const consumedByTwoFingerTap = consumeTwoFingerTapEnd(event);
   if (state.touchLongPressPointerId === event.pointerId) {
     clearTouchLongPress();
+  }
+  if (isSmartTouchMode()) {
+    clearSmartTouchTimers();
   }
   state.touchPointers.delete(event.pointerId);
   if (wasDragging) {
     send({ type: "pointer_button", button: 1, down: false });
     state.touchDragPointerId = null;
   } else if (!consumedByTwoFingerTap && isTap) {
+    if (touch && isSmartTouchMode()) {
+      movePointerToTouch(touch);
+    }
     send({ type: "pointer_button", button: 1, down: true });
     send({ type: "pointer_button", button: 1, down: false });
+  }
+  if (isSmartTouchMode() && wasSingleTouch) {
+    state.smartTouchAction = null;
+    state.smartTouchScrollLastX = null;
+    state.smartTouchScrollLastY = null;
   }
   if (state.touchPointers.size >= 2) {
     state.touchScrollLastY = getAverageTouchClientY();
@@ -5135,6 +5326,7 @@ function initControls() {
   });
   renderCodecOptions();
   renderEncodePreferenceRadioGroup();
+  renderTouchModeCheckboxGroup();
   codecSelect.addEventListener("change", () => {
     renderCodecOptions();
     void handleCodecSettingChange();
@@ -5192,7 +5384,10 @@ function initControls() {
   });
   autoDisconnectMinutesInput.addEventListener("input", persistCurrentSettings);
   autoDisconnectMinutesInput.addEventListener("change", persistCurrentSettings);
-  touchModeSelect.addEventListener("change", persistCurrentSettings);
+  touchModeSelect.addEventListener("change", () => {
+    renderTouchModeCheckboxGroup();
+    persistCurrentSettings();
+  });
   directTouchScrollInput.addEventListener("change", persistCurrentSettings);
   for (const button of tabButtons) {
     button.addEventListener("click", () => {

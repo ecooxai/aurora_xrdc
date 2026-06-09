@@ -162,7 +162,7 @@
               <div class="tab-row" role="tablist" aria-label="Control sections">
                 <button id="tab-button-status" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-status" data-tab-target="status">Status</button>
                 <button id="tab-button-view" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-view" data-tab-target="view">View</button>
-                <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Settings</button>
+                <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Input</button>
                 <button id="tab-button-performance" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-performance" data-tab-target="performance">Performance</button>
               </div>
               <section id="tab-panel-status" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-button-status">
@@ -207,6 +207,14 @@
                       <div id="webclients-list" class="webclients-list"></div>
                     </div>
                   </article>
+                </div>
+                <div class="status-action-row" aria-label="Connection actions">
+                  <button id="connect" class="status-icon-button" type="button" aria-label="Connect" title="Connect">
+                    <span aria-hidden="true">🔗</span>
+                  </button>
+                  <button id="disconnect" class="status-icon-button secondary" type="button" aria-label="Disconnect" title="Disconnect">
+                    <span aria-hidden="true">🚫</span>
+                  </button>
                 </div>
               </section>
               <section id="tab-panel-view" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-view" hidden>
@@ -259,6 +267,34 @@
               </section>
               <section id="tab-panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-settings" hidden>
                 <div class="menu-grid">
+                  <label>Scroll speed
+                    <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
+                    <span id="scroll-speed-value">3 / 10</span>
+                  </label>
+                  <label>Auto disconnect
+                    <input id="auto-disconnect-minutes" type="number" min="0" max="1440" step="1" value="30" inputmode="numeric" />
+                  </label>
+                  <div class="field-group">
+                    <span class="field-label">Touch mode</span>
+                    <div id="touch-mode-group" class="checkbox-group" role="group" aria-label="Touch mode"></div>
+                    <select id="touch-mode" class="hidden" aria-hidden="true" tabindex="-1">
+                      <option value="direct_touch">Direct touch</option>
+                      <option value="smart_touch">Smart touch</option>
+                      <option value="touchpad">Touchpad</option>
+                    </select>
+                  </div>
+                  <label id="direct-touch-scroll-label" class="toggle-label">
+                    <span>Direct touch one-finger scroll</span>
+                    <input id="direct-touch-scroll" type="checkbox" />
+                  </label>
+                </div>
+              </section>
+              <section id="tab-panel-performance" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-performance" hidden>
+                <div class="performance-preset-row">
+                  <button id="performance-speed" class="is-active" type="button">Speed</button>
+                  <button id="performance-quality" class="secondary" type="button">Quality</button>
+                </div>
+                <div class="menu-grid">
                   <div class="field-group">
                     <span class="field-label">Codec</span>
                     <div id="codec-group" class="radio-group" role="radiogroup" aria-label="Codec"></div>
@@ -285,35 +321,6 @@
                     </select>
                     <span id="encode-preference-help" class="field-help">Loading encoder availability...</span>
                   </div>
-                  <label>Scroll speed
-                    <input id="scroll-speed" type="range" min="1" max="10" step="1" value="3" />
-                    <span id="scroll-speed-value">3 / 10</span>
-                  </label>
-                  <label>Auto disconnect
-                    <input id="auto-disconnect-minutes" type="number" min="0" max="1440" step="1" value="30" inputmode="numeric" />
-                  </label>
-                  <label>Touch mode
-                    <select id="touch-mode">
-                      <option value="direct_touch">Direct touch</option>
-                      <option value="touchpad">Touchpad</option>
-                    </select>
-                  </label>
-                  <label id="direct-touch-scroll-label" class="toggle-label">
-                    <span>Direct touch one-finger scroll</span>
-                    <input id="direct-touch-scroll" type="checkbox" />
-                  </label>
-                </div>
-                <div class="button-row">
-                  <button id="connect">Connect</button>
-                  <button id="disconnect" class="secondary">Disconnect</button>
-                </div>
-              </section>
-              <section id="tab-panel-performance" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-performance" hidden>
-                <div class="performance-preset-row">
-                  <button id="performance-speed" class="is-active" type="button">Speed</button>
-                  <button id="performance-quality" class="secondary" type="button">Quality</button>
-                </div>
-                <div class="menu-grid">
                   <label>Bitrate
                     <input id="bitrate" type="range" min="128" max="25000" step="16" value="3000" />
                     <span id="bitrate-value">3000 kbps</span>
