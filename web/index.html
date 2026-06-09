@@ -2,8 +2,16 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+    <meta name="theme-color" content="#071013" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Vibe RDesk" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Vibe RDesk</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
@@ -117,21 +125,6 @@
               </section>
             </div>
           </details>
-          <button id="camera-toggle" class="tool-toggle" type="button" aria-label="Enable camera uplink" aria-pressed="false">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path class="camera-off-slash" d="M5 5l14 14" />
-              <rect x="3.5" y="6.5" width="13" height="11" rx="2.5" />
-              <path d="M16.5 10l4-2.5v9l-4-2.5" />
-            </svg>
-          </button>
-          <button id="mobile-keyboard-trigger" class="tool-toggle mobile-keyboard-trigger" type="button" aria-label="Show keyboard">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="3.5" y="6.5" width="17" height="11" rx="2.5" />
-              <path d="M6.5 10.5h.01M9.5 10.5h.01M12.5 10.5h.01M15.5 10.5h.01M18 10.5h.01" />
-              <path d="M7.5 13.5h.01M10.5 13.5h.01M13.5 13.5h.01M16.5 13.5h.01" />
-              <path d="M8 16.5h8" />
-            </svg>
-          </button>
           <details id="error-panel" class="error-panel hidden">
             <summary id="error-trigger" class="tool-toggle error-toggle" aria-label="Show messages">
               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -149,21 +142,149 @@
               <div id="error-list" class="error-list"></div>
             </div>
           </details>
-          <details id="control-panel" class="control-panel">
-            <summary id="control-trigger" class="tool-toggle control-toggle" aria-label="Controls">
+          <details id="transfer-panel" class="transfer-panel">
+            <summary id="transfer-trigger" class="tool-toggle transfer-toggle" aria-label="Transfer">
               <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 7h16M4 12h16M4 17h16" />
-                <circle cx="9" cy="7" r="1.8" />
-                <circle cx="15" cy="12" r="1.8" />
-                <circle cx="11" cy="17" r="1.8" />
+                <path d="M12 3v12" />
+                <path d="M8 7l4-4 4 4" />
+                <path d="M4.5 14.5v3.2a2.8 2.8 0 0 0 2.8 2.8h9.4a2.8 2.8 0 0 0 2.8-2.8v-3.2" />
+                <path d="M8 17.5h8" />
               </svg>
             </summary>
+            <div class="transfer-card">
+              <section id="transfer-content" class="transfer-content" aria-label="Transfer">
+                <div class="upload-stack">
+                  <button id="upload-action" type="button">Upload File</button>
+                  <input id="upload-input" type="file" class="hidden" />
+                </div>
+                <div class="clipboard-stack">
+                  <section id="local-clipboard-card" class="clipboard-card secondary">
+                    <div class="clipboard-header">
+                      <div class="clipboard-heading">
+                        <span class="clipboard-title">Local Clipboard</span>
+                        <span id="local-clipboard-meta" class="clipboard-meta">Ready to paste remotely</span>
+                      </div>
+                      <div class="clipboard-actions">
+                        <button id="local-clipboard-sync-btn" class="clipboard-action" type="button">Paste</button>
+                      </div>
+                    </div>
+                    <div class="clipboard-content">
+                      <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
+                      <div id="local-clipboard-text" class="clipboard-text">Empty</div>
+                    </div>
+                  </section>
+                  <section id="remote-clipboard-card" class="clipboard-card secondary">
+                    <div class="clipboard-header">
+                      <div class="clipboard-heading">
+                        <span class="clipboard-title">Remote Clipboard</span>
+                        <span id="remote-clipboard-meta" class="clipboard-meta">Auto-refresh every 3s</span>
+                      </div>
+                      <div class="clipboard-actions">
+                        <button id="remote-clipboard-sync-btn" class="clipboard-action" type="button">Copy</button>
+                      </div>
+                    </div>
+                    <div class="clipboard-content">
+                      <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
+                      <div id="remote-clipboard-text" class="clipboard-text">Empty</div>
+                    </div>
+                  </section>
+                  <section class="clipboard-history-card secondary">
+                    <div class="clipboard-header">
+                      <div class="clipboard-heading">
+                        <span class="clipboard-title">Clipboard History</span>
+                        <span class="clipboard-meta">Latest 100 old entries</span>
+                      </div>
+                    </div>
+                    <div id="clipboard-history-empty" class="clipboard-history-empty">No history yet</div>
+                    <div id="clipboard-history-list" class="clipboard-history-list"></div>
+                  </section>
+                </div>
+              </section>
+            </div>
+          </details>
+          <button id="mobile-keyboard-trigger" class="tool-toggle mobile-keyboard-trigger" type="button" aria-label="Show keyboard">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="3.5" y="6.5" width="17" height="11" rx="2.5" />
+              <path d="M6.5 10.5h.01M9.5 10.5h.01M12.5 10.5h.01M15.5 10.5h.01M18 10.5h.01" />
+              <path d="M7.5 13.5h.01M10.5 13.5h.01M13.5 13.5h.01M16.5 13.5h.01" />
+              <path d="M8 16.5h8" />
+            </svg>
+          </button>
+          <details id="control-panel" class="control-panel">
+            <summary id="control-trigger" class="tool-toggle control-toggle" aria-label="More controls">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 12h.01M12 12h.01M19 12h.01" />
+              </svg>
+            </summary>
+            <div id="control-menu" class="control-menu" role="menu" aria-label="More controls">
+              <button class="control-menu-item" type="button" role="menuitem" data-control-tab="status">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 13h4l2-6 4 12 2-6h4" />
+                </svg>
+                <span>Status</span>
+              </button>
+              <button class="control-menu-item" type="button" role="menuitem" data-control-tab="view">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="4" y="5" width="16" height="11" rx="2" />
+                  <path d="M9 20h6M12 16v4" />
+                </svg>
+                <span>View</span>
+              </button>
+              <button class="control-menu-item" type="button" role="menuitem" data-control-tab="settings">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="6" y="4" width="12" height="16" rx="2" />
+                  <path d="M9 8h6M9 12h6M9 16h3" />
+                </svg>
+                <span>Input</span>
+              </button>
+              <button class="control-menu-item" type="button" role="menuitem" data-control-tab="performance">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M13 3L5 14h7l-1 7 8-11h-7z" />
+                </svg>
+                <span>Performance</span>
+              </button>
+              <button id="camera-toggle" class="control-menu-item camera-menu-item" type="button" role="menuitem" aria-label="Enable camera uplink" aria-pressed="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path class="camera-off-slash" d="M5 5l14 14" />
+                  <rect x="3.5" y="6.5" width="13" height="11" rx="2.5" />
+                  <path d="M16.5 10l4-2.5v9l-4-2.5" />
+                </svg>
+                <span>Camera</span>
+              </button>
+              <button id="fullscreen-toggle" class="control-menu-item fullscreen-menu-item" type="button" role="menuitem" aria-label="Enter fullscreen" aria-pressed="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M8 4H4v4" />
+                  <path d="M16 4h4v4" />
+                  <path d="M20 16v4h-4" />
+                  <path d="M8 20H4v-4" />
+                </svg>
+                <span>Fullscreen</span>
+              </button>
+            </div>
             <div class="control-card">
               <div class="tab-row" role="tablist" aria-label="Control sections">
-                <button id="tab-button-status" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-status" data-tab-target="status">Status</button>
-                <button id="tab-button-view" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-view" data-tab-target="view">View</button>
-                <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">Input</button>
-                <button id="tab-button-performance" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-performance" data-tab-target="performance">Performance</button>
+                <button id="tab-button-status" class="tab-button is-active" type="button" role="tab" aria-label="Status" title="Status" aria-selected="true" aria-controls="tab-panel-status" data-tab-target="status">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 13h4l2-6 4 12 2-6h4" />
+                  </svg>
+                </button>
+                <button id="tab-button-view" class="tab-button" type="button" role="tab" aria-label="View" title="View" aria-selected="false" aria-controls="tab-panel-view" data-tab-target="view">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="4" y="5" width="16" height="11" rx="2" />
+                    <path d="M9 20h6M12 16v4" />
+                  </svg>
+                </button>
+                <button id="tab-button-settings" class="tab-button" type="button" role="tab" aria-label="Input" title="Input" aria-selected="false" aria-controls="tab-panel-settings" data-tab-target="settings">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <rect x="6" y="4" width="12" height="16" rx="2" />
+                    <path d="M9 8h6M9 12h6M9 16h3" />
+                  </svg>
+                </button>
+                <button id="tab-button-performance" class="tab-button" type="button" role="tab" aria-label="Performance" title="Performance" aria-selected="false" aria-controls="tab-panel-performance" data-tab-target="performance">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M13 3L5 14h7l-1 7 8-11h-7z" />
+                  </svg>
+                </button>
               </div>
               <section id="tab-panel-status" class="tab-panel is-active" role="tabpanel" aria-labelledby="tab-button-status">
                 <div class="status-grid">
@@ -375,66 +496,7 @@
               </section>
             </div>
           </details>
-          <details id="transfer-panel" class="transfer-panel">
-            <summary id="transfer-trigger" class="tool-toggle transfer-toggle" aria-label="Transfer">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 3v12" />
-                <path d="M8 7l4-4 4 4" />
-                <path d="M4.5 14.5v3.2a2.8 2.8 0 0 0 2.8 2.8h9.4a2.8 2.8 0 0 0 2.8-2.8v-3.2" />
-                <path d="M8 17.5h8" />
-              </svg>
-            </summary>
-            <div class="transfer-card">
-              <section id="transfer-content" class="transfer-content" aria-label="Transfer">
-                <div class="upload-stack">
-                  <button id="upload-action" type="button">Upload File</button>
-                  <input id="upload-input" type="file" class="hidden" />
-                </div>
-                <div class="clipboard-stack">
-                  <section id="local-clipboard-card" class="clipboard-card secondary">
-                    <div class="clipboard-header">
-                      <div class="clipboard-heading">
-                        <span class="clipboard-title">Local Clipboard</span>
-                        <span id="local-clipboard-meta" class="clipboard-meta">Ready to paste remotely</span>
-                      </div>
-                      <div class="clipboard-actions">
-                        <button id="local-clipboard-sync-btn" class="clipboard-action" type="button">Paste</button>
-                      </div>
-                    </div>
-                    <div class="clipboard-content">
-                      <img id="local-clipboard-image" class="clipboard-image hidden" alt="Local clipboard preview" />
-                      <div id="local-clipboard-text" class="clipboard-text">Empty</div>
-                    </div>
-                  </section>
-                  <section id="remote-clipboard-card" class="clipboard-card secondary">
-                    <div class="clipboard-header">
-                      <div class="clipboard-heading">
-                        <span class="clipboard-title">Remote Clipboard</span>
-                        <span id="remote-clipboard-meta" class="clipboard-meta">Auto-refresh every 3s</span>
-                      </div>
-                      <div class="clipboard-actions">
-                        <button id="remote-clipboard-sync-btn" class="clipboard-action" type="button">Copy</button>
-                      </div>
-                    </div>
-                    <div class="clipboard-content">
-                      <img id="remote-clipboard-image" class="clipboard-image hidden" alt="Remote clipboard preview" />
-                      <div id="remote-clipboard-text" class="clipboard-text">Empty</div>
-                    </div>
-                  </section>
-                  <section class="clipboard-history-card secondary">
-                    <div class="clipboard-header">
-                      <div class="clipboard-heading">
-                        <span class="clipboard-title">Clipboard History</span>
-                        <span class="clipboard-meta">Latest 100 old entries</span>
-                      </div>
-                    </div>
-                    <div id="clipboard-history-empty" class="clipboard-history-empty">No history yet</div>
-                    <div id="clipboard-history-list" class="clipboard-history-list"></div>
-                  </section>
-                </div>
-              </section>
-            </div>
-          </details>
+          <button id="control-quick-tab" class="tool-toggle control-quick-tab" type="button" aria-label="Open Status" title="Status"></button>
         </div>
       </section>
     </main>

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Vibe RDesk">
+  <rect width="512" height="512" rx="96" fill="#071013"/>
+  <rect x="122" y="164" width="268" height="176" rx="26" fill="#102229" stroke="#8de6ff" stroke-width="18"/>
+  <path d="M218 271h91c16 0 29-12 29-27s-13-27-29-27c-5 0-11 1-16 4-10-16-31-22-48-13-12 6-20 16-23 28h-4c-15 0-27 11-27 24s12 24 27 24z" fill="#8de6ff"/>
+</svg>

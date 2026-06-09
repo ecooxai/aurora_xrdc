@@ -477,12 +477,83 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   font-size: 0.68rem;
 }
 
-.control-panel[open] .control-card {
+.control-menu {
+  display: none;
+}
+
+.control-panel[open]:not(.is-card-open) .control-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 12px);
+  width: min(240px, calc(100vw - 16px));
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 16px;
+  background:
+    linear-gradient(180deg, rgba(18, 29, 34, 0.98), rgba(9, 14, 17, 0.98)),
+    var(--panel);
+  border: 1px solid rgba(190, 221, 234, 0.14);
+  box-shadow: var(--shadow);
+  font-size: 12.5px;
+}
+
+.control-menu-item {
+  width: 100%;
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  text-align: left;
+  box-shadow: none;
+}
+
+.control-menu-item:hover,
+.control-menu-item:active {
+  transform: none;
+  border-color: rgba(141, 230, 255, 0.24);
+  background: rgba(141, 230, 255, 0.1);
+}
+
+.control-menu-item.is-active {
+  border-color: rgba(141, 230, 255, 0.32);
+  background: rgba(141, 230, 255, 0.14);
+}
+
+.control-menu-item.is-pending {
+  border-color: rgba(245, 194, 107, 0.26);
+}
+
+.control-menu-item svg {
+  width: 22px;
+  height: 22px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.control-menu-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.control-panel[open].is-card-open .control-card {
   position: fixed;
   left: var(--dock-edge);
   bottom: calc(var(--dock-bottom) + var(--fab-size) + 20px);
   width: min(520px, calc(100vw - 16px));
-  max-height: min(560px, calc(100vh - 112px));
+  height: 600px;
+  max-height: 90vh;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr) auto;
@@ -576,7 +647,10 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
 }
 
 .tab-button {
-  padding: 7px 5px;
+  min-height: 34px;
+  display: grid;
+  place-items: center;
+  padding: 6px;
   border-radius: 10px;
   background: transparent;
   color: var(--muted);
@@ -595,6 +669,7 @@ button.danger { background: rgba(255,111,111,0.12); color: var(--danger); border
   grid-row: 1;
   grid-column: 1;
   display: none;
+  height: 100%;
   min-height: 0;
   gap: 10px;
   overflow: auto;
@@ -1143,6 +1218,10 @@ button.view-size-chip:active {
   background: rgba(18, 31, 35, 0.96);
 }
 
+#audio-toggle.tool-toggle.is-active {
+  background: rgba(13, 18, 20, 0.94);
+}
+
 .tool-toggle.is-pending {
   box-shadow: 0 0 0 1px rgba(245, 194, 107, 0.18), var(--shadow);
 }
@@ -1162,8 +1241,12 @@ button.view-size-chip:active {
 }
 
 .tool-toggle .mic-off-slash,
-.tool-toggle .camera-off-slash,
 .tool-toggle .sound-off-slash {
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.camera-off-slash {
   opacity: 0;
   transition: opacity 120ms ease;
 }
@@ -1219,6 +1302,17 @@ button.view-size-chip:active {
   background: rgba(18, 31, 35, 0.96);
 }
 
+.control-quick-tab svg,
+.tab-button svg {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
 .mobile-keyboard-input {
   position: fixed;
   right: 0;
@@ -1246,7 +1340,7 @@ button.view-size-chip:active {
 .hidden { display: none; }
 
 @media (max-width: 900px) {
-  .control-panel[open] .control-card {
+  .control-panel[open].is-card-open .control-card {
     width: min(480px, calc(100vw - 16px));
   }
 
@@ -1273,11 +1367,11 @@ button.view-size-chip:active {
     padding: 5px;
   }
 
-  .control-panel[open] .control-card {
+  .control-panel[open].is-card-open .control-card {
     left: 6px;
     bottom: calc(var(--dock-bottom) + var(--fab-size) + 16px);
     width: calc(100vw - 12px);
-    max-height: calc(100vh - 96px);
+    max-height: 90vh;
     border-radius: 16px;
   }
 
@@ -1298,7 +1392,7 @@ button.view-size-chip:active {
   }
 
   .tab-row {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .tab-button {

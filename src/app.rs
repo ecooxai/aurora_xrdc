@@ -43,6 +43,11 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = include_str!("../web/app.css");
 const VIDEO_RENDERER_WORKER_JS: &str = include_str!("../web/video_renderer_worker.js");
+const WEB_MANIFEST: &str = include_str!("../web/manifest.webmanifest");
+const SERVICE_WORKER_JS: &str = include_str!("../web/sw.js");
+const ICON_SVG: &str = include_str!("../web/icon.svg");
+const ICON_192_PNG: &[u8] = include_bytes!("../web/icon-192.png");
+const ICON_512_PNG: &[u8] = include_bytes!("../web/icon-512.png");
 
 #[derive(Clone)]
 struct AppState {
@@ -326,6 +331,11 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/app.js", get(js))
         .route("/app.css", get(css))
         .route("/video_renderer_worker.js", get(video_renderer_worker_js))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/sw.js", get(service_worker_js))
+        .route("/icon.svg", get(icon_svg))
+        .route("/icon-192.png", get(icon_192_png))
+        .route("/icon-512.png", get(icon_512_png))
         .route("/healthz", get(healthz))
         .route("/api/auth", get(auth_check).post(auth_login))
         .route("/api/codecs", get(codecs))
@@ -492,6 +502,26 @@ async fn video_renderer_worker_js() -> Response {
         "application/javascript; charset=utf-8",
         VIDEO_RENDERER_WORKER_JS,
     )
+}
+
+async fn manifest() -> Response {
+    asset("application/manifest+json; charset=utf-8", WEB_MANIFEST)
+}
+
+async fn service_worker_js() -> Response {
+    asset("application/javascript; charset=utf-8", SERVICE_WORKER_JS)
+}
+
+async fn icon_svg() -> Response {
+    asset("image/svg+xml; charset=utf-8", ICON_SVG)
+}
+
+async fn icon_192_png() -> Response {
+    binary_asset("image/png", ICON_192_PNG)
+}
+
+async fn icon_512_png() -> Response {
+    binary_asset("image/png", ICON_512_PNG)
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -1015,6 +1045,13 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     (StatusCode::OK, headers, body).into_response()
+}
+
+fn binary_asset(content_type: &'static str, body: &'static [u8]) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    (StatusCode::OK, headers, body.to_vec()).into_response()
 }
 
 async fn cors(req: axum::http::Request<axum::body::Body>, next: Next) -> Response {

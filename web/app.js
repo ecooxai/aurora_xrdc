@@ -190,6 +190,7 @@ const state = {
   smartTouchAction: null,
   smartTouchScrollLastX: null,
   smartTouchScrollLastY: null,
+  lastControlTab: "status",
   recoveryTapCount: 0,
   recoveryTapLastAt: 0,
   recoveryTapCenter: null,
@@ -257,6 +258,8 @@ const authOriginInput = $("auth-origin");
 const authInput = $("auth-passwd");
 const authError = $("auth-error");
 const controlPanel = $("control-panel");
+const controlTrigger = $("control-trigger");
+const controlQuickTab = $("control-quick-tab");
 const transferPanel = $("transfer-panel");
 const audioPanel = $("audio-panel");
 const errorPanel = $("error-panel");
@@ -268,6 +271,7 @@ const micToggle = $("mic-toggle");
 const micDeviceMenu = $("mic-device-menu");
 const audioToggle = $("audio-toggle");
 const cameraToggle = $("camera-toggle");
+const fullscreenToggle = $("fullscreen-toggle");
 const mobileKeyboardInput = $("mobile-keyboard-input");
 const encoderStatus = $("encoder-status");
 const codecSelect = $("codec");
@@ -317,6 +321,7 @@ const uploadAction = $("upload-action");
 const uploadInput = $("upload-input");
 const tabButtons = Array.from(document.querySelectorAll(".tab-button"));
 const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
+const controlMenuTabButtons = Array.from(document.querySelectorAll("[data-control-tab]"));
 const statusCpu = $("status-cpu");
 const statusRam = $("status-ram");
 const statusSwap = $("status-swap");
@@ -674,18 +679,86 @@ function setCanvasDisplayViewportWidth() {
   saveSettings();
 }
 
+function controlTabLabel(tabName) {
+  const button = tabButtons.find((item) => item.dataset.tabTarget === tabName);
+  return button?.getAttribute("aria-label") || button?.title || "Controls";
+}
+
+function syncControlQuickTab(tabName = state.lastControlTab) {
+  if (!controlQuickTab) return;
+  const tabButton = tabButtons.find((button) => button.dataset.tabTarget === tabName) || tabButtons[0];
+  const menuButton = controlMenuTabButtons.find((button) => button.dataset.controlTab === tabName);
+  const iconSource = tabButton?.querySelector("svg") || menuButton?.querySelector("svg");
+  if (!tabButton || !iconSource) return;
+  controlQuickTab.replaceChildren(iconSource.cloneNode(true));
+  const label = controlTabLabel(tabButton.dataset.tabTarget || tabName);
+  controlQuickTab.title = label;
+  controlQuickTab.setAttribute("aria-label", `Open ${label}`);
+}
+
 function setActiveTab(tabName) {
+  state.lastControlTab = tabName;
   for (const button of tabButtons) {
     const active = button.dataset.tabTarget === tabName;
     button.classList.toggle("is-active", active);
     button.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  for (const button of controlMenuTabButtons) {
+    button.classList.toggle("is-active", button.dataset.controlTab === tabName);
   }
   for (const panel of tabPanels) {
     const active = panel.id === `tab-panel-${tabName}`;
     panel.classList.toggle("is-active", active);
     panel.hidden = !active;
   }
+  syncControlQuickTab(tabName);
   renderViewMetrics();
+}
+
+function openControlCard(tabName = state.lastControlTab) {
+  setActiveTab(tabName);
+  controlPanel.classList.add("is-card-open");
+  controlPanel.open = true;
+  transferPanel.open = false;
+  audioPanel.open = false;
+  errorPanel.open = false;
+  closeMicDeviceMenu();
+  releaseInput();
+}
+
+function isFullscreen() {
+  return Boolean(document.fullscreenElement);
+}
+
+function syncFullscreenToggle() {
+  if (!fullscreenToggle) return;
+  const active = isFullscreen();
+  fullscreenToggle.classList.toggle("is-active", active);
+  fullscreenToggle.setAttribute("aria-pressed", active ? "true" : "false");
+  fullscreenToggle.setAttribute("aria-label", active ? "Exit fullscreen" : "Enter fullscreen");
+  const label = fullscreenToggle.querySelector("span");
+  if (label) {
+    label.textContent = active ? "Exit Fullscreen" : "Fullscreen";
+  }
+}
+
+async function toggleFullscreen() {
+  controlPanel.open = false;
+  try {
+    if (isFullscreen()) {
+      await document.exitFullscreen();
+      return;
+    }
+    if (!document.documentElement.requestFullscreen) {
+      showToast("fullscreen_unavailable", "Fullscreen is not available in this browser");
+      return;
+    }
+    await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+  } catch (error) {
+    showToast("fullscreen_failed", error.message || String(error));
+  } finally {
+    syncFullscreenToggle();
+  }
 }
 
 function showToast(code, message) {
@@ -5394,6 +5467,23 @@ function initControls() {
       setActiveTab(button.dataset.tabTarget || "status");
     });
   }
+  for (const button of controlMenuTabButtons) {
+    button.addEventListener("click", () => {
+      openControlCard(button.dataset.controlTab || "status");
+    });
+  }
+  controlTrigger.addEventListener("click", () => {
+    if (!controlPanel.open) {
+      controlPanel.classList.remove("is-card-open");
+    }
+  });
+  controlQuickTab.addEventListener("click", () => {
+    if (controlPanel.open && controlPanel.classList.contains("is-card-open")) {
+      controlPanel.open = false;
+      return;
+    }
+    openControlCard(state.lastControlTab);
+  });
   errorPanel.addEventListener("toggle", () => {
     if (errorPanel.open) {
       controlPanel.open = false;
@@ -5404,6 +5494,10 @@ function initControls() {
   });
   errorClear.addEventListener("click", clearErrors);
   controlPanel.addEventListener("toggle", () => {
+    if (controlPanel.open) {
+      closeMicDeviceMenu();
+      releaseInput();
+    }
     if (controlPanel.open && transferPanel.open) {
       transferPanel.open = false;
     }
@@ -5412,6 +5506,9 @@ function initControls() {
     }
     if (controlPanel.open && errorPanel.open) {
       errorPanel.open = false;
+    }
+    if (!controlPanel.open) {
+      controlPanel.classList.remove("is-card-open");
     }
   });
   audioPanel.addEventListener("toggle", () => {
@@ -5444,7 +5541,14 @@ function initControls() {
   $("disconnect").addEventListener("click", disconnect);
   micToggle.addEventListener("click", toggleMicDeviceMenu);
   micDeviceMenu.addEventListener("click", (event) => event.stopPropagation());
-  cameraToggle.addEventListener("click", toggleCamera);
+  cameraToggle.addEventListener("click", () => {
+    controlPanel.open = false;
+    void toggleCamera();
+  });
+  fullscreenToggle?.addEventListener("click", () => {
+    void toggleFullscreen();
+  });
+  document.addEventListener("fullscreenchange", syncFullscreenToggle);
   uploadAction.addEventListener("click", () => uploadInput.click());
   uploadInput.addEventListener("change", () => {
     void uploadSelectedFile();
@@ -5659,11 +5763,9 @@ function initControls() {
   }
 }
 
-async function removeServiceWorker() {
+async function registerAppServiceWorker() {
   if (!("serviceWorker" in navigator)) return;
   try {
-    const registrations = await navigator.serviceWorker.getRegistrations();
-    await Promise.all(registrations.map((registration) => registration.unregister()));
     if ("caches" in window) {
       const cacheNames = await caches.keys();
       await Promise.all(
@@ -5672,8 +5774,9 @@ async function removeServiceWorker() {
           .map((cacheName) => caches.delete(cacheName)),
       );
     }
+    await navigator.serviceWorker.register("/sw.js", { scope: "/" });
   } catch (error) {
-    showToast("sw_remove_failed", error.message || String(error));
+    showToast("sw_register_failed", error.message || String(error));
   }
 }
 
@@ -5682,12 +5785,13 @@ updateClipboardState("remote", state.remoteClipboard);
 renderClipboardHistory();
 syncMobileKeyboardButton();
 setActiveTab("status");
+syncFullscreenToggle();
 applySettings(loadStoredSettings());
 applyCanvasZoom();
 resetStatusMetrics();
 initVideoRenderer();
 initControls();
-void removeServiceWorker();
+void registerAppServiceWorker();
 renderMicToggle();
 renderAudioToggle();
 renderCameraToggle();
