@@ -38,6 +38,7 @@ pub enum SessionRole {
     Video,
     Audio,
     Mic,
+    Input,
 }
 
 const KEY_STATE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -94,6 +95,7 @@ pub async fn handle_socket(
         SessionRole::Video => handle_video_socket(socket, server, media, config, close_rx).await,
         SessionRole::Audio => handle_audio_socket(socket, media, audio_config, close_rx).await,
         SessionRole::Mic => handle_mic_socket(socket, server, close_rx).await,
+        SessionRole::Input => handle_input_socket(socket, server, media, close_rx).await,
     }
 }
 
@@ -389,6 +391,51 @@ async fn handle_mic_socket(
     let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
     let recv_task = tokio::spawn(handle_mic_client(receiver, out_tx.clone(), server));
     wait_for_mic_tasks(writer_task, recv_task, out_tx, close_rx).await;
+    Ok(())
+}
+
+async fn handle_input_socket(
+    socket: WebSocket,
+    server: ServerConfig,
+    media: MediaHub,
+    mut close_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let (ws_sender, receiver) = socket.split();
+    let (out_tx, out_rx) = mpsc::channel::<Message>(8);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
+    let mut recv_task = tokio::spawn(handle_client(
+        receiver,
+        out_tx.clone(),
+        server,
+        media,
+        shutdown_rx,
+    ));
+    let mut writer_task = writer_task;
+
+    tokio::select! {
+        result = &mut recv_task => {
+            if let Err(err) = result {
+                warn!("input websocket receiver task failed: {err}");
+            }
+        }
+        result = &mut writer_task => {
+            if let Err(err) = result {
+                warn!("input websocket writer task failed: {err}");
+            }
+        }
+        _ = wait_for_client_close(&mut close_rx) => {
+            send_server_close(&out_tx).await;
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    if !recv_task.is_finished() {
+        recv_task.abort();
+    }
+    if !writer_task.is_finished() {
+        writer_task.abort();
+    }
     Ok(())
 }
 
@@ -999,7 +1046,12 @@ async fn handle_client(
             _ = key_watchdog.tick() => {
                 if let Some(last_key_state) = last_key_state_at {
                     if !pressed_keys.is_empty() && last_key_state.elapsed() > KEY_STATE_TIMEOUT {
-                        release_pressed_keys(&server.display, &mut pressed_keys).await?;
+                        release_pressed_keys(
+                            &server.display,
+                            input_injector.as_ref(),
+                            &mut pressed_keys,
+                        )
+                        .await?;
                         last_key_state_at = None;
                     }
                 }
@@ -1362,7 +1414,14 @@ async fn apply_client_message(
                     && key_logical_modifier(&key).is_none()
                     && key_modifiers_active(modifiers)
                 {
-                    tap_key_with_modifiers(display, pressed_keys, &key, modifiers).await?;
+                    tap_key_with_modifiers(
+                        display,
+                        input_injector,
+                        pressed_keys,
+                        &key,
+                        modifiers,
+                    )
+                    .await?;
                     *last_key_state_at = if pressed_keys.is_empty() {
                         None
                     } else {
@@ -1370,15 +1429,15 @@ async fn apply_client_message(
                     };
                     return Ok(());
                 }
-                sync_event_modifier_keys(display, pressed_keys, modifiers, &key).await?;
+                sync_event_modifier_keys(display, input_injector, pressed_keys, modifiers, &key)
+                    .await?;
             }
             if down {
                 pressed_keys.insert(key.clone());
             } else {
                 pressed_keys.remove(&key);
             }
-            let action = if down { "keydown" } else { "keyup" };
-            run_xdotool(display, [action, &key]).await?;
+            apply_key_event(display, input_injector, &key, down).await?;
             *last_key_state_at = if pressed_keys.is_empty() {
                 None
             } else {
@@ -1388,7 +1447,7 @@ async fn apply_client_message(
         ClientMessage::KeyState {
             pressed_keys: desired_keys,
         } => {
-            sync_pressed_keys(display, pressed_keys, desired_keys).await?;
+            sync_pressed_keys(display, input_injector, pressed_keys, desired_keys).await?;
             *last_key_state_at = if pressed_keys.is_empty() {
                 None
             } else {
@@ -1478,15 +1537,7 @@ async fn apply_client_message(
                 .await?;
         }
         ClientMessage::ClipboardGet => {
-            if let Err(err) = send_clipboard_update(display, sender).await {
-                warn!("failed to read remote clipboard: {err}");
-                send_runtime_error(
-                    sender,
-                    "clipboard_read_failed",
-                    format!("Clipboard read failed on the server: {err}"),
-                )
-                .await;
-            }
+            spawn_clipboard_update(display.to_owned(), sender.clone());
         }
     }
     Ok(())
@@ -1621,6 +1672,7 @@ fn key_chord_rank(key: &str) -> usize {
 
 async fn sync_pressed_keys(
     display: &str,
+    input_injector: Option<&X11InputInjector>,
     pressed_keys: &mut HashSet<String>,
     desired_keys: Vec<String>,
 ) -> Result<()> {
@@ -1643,7 +1695,7 @@ async fn sync_pressed_keys(
             .then_with(|| left.cmp(right))
     });
     for key in keys_to_release {
-        run_xdotool(display, ["keyup", &key]).await?;
+        apply_key_event(display, input_injector, &key, false).await?;
         pressed_keys.remove(&key);
     }
 
@@ -1654,7 +1706,7 @@ async fn sync_pressed_keys(
         .collect::<Vec<_>>();
     keys_to_press.sort_by(|left, right| key_chord_rank(left).cmp(&key_chord_rank(right)));
     for key in keys_to_press {
-        run_xdotool(display, ["keydown", &key]).await?;
+        apply_key_event(display, input_injector, &key, true).await?;
         pressed_keys.insert(key);
     }
     Ok(())
@@ -1693,6 +1745,7 @@ fn modifier_fallback_keys(modifiers: KeyModifiers) -> Vec<(&'static str, [&'stat
 
 async fn tap_key_with_modifiers(
     display: &str,
+    input_injector: Option<&X11InputInjector>,
     pressed_keys: &HashSet<String>,
     key: &str,
     modifiers: KeyModifiers,
@@ -1708,6 +1761,29 @@ async fn tap_key_with_modifiers(
             }
         })
         .collect::<Vec<_>>();
+    if let Some(input_injector) = input_injector
+        && temporary_modifiers
+            .iter()
+            .chain(std::iter::once(&key))
+            .all(|key| input_injector.supports_key(key))
+    {
+        let mut fast_path_result = Ok(());
+        for modifier in &temporary_modifiers {
+            fast_path_result =
+                fast_path_result.and_then(|()| input_injector.queue_key_event(modifier, true));
+        }
+        fast_path_result = fast_path_result
+            .and_then(|()| input_injector.queue_key_event(key, true))
+            .and_then(|()| input_injector.queue_key_event(key, false));
+        for modifier in temporary_modifiers.iter().rev() {
+            fast_path_result =
+                fast_path_result.and_then(|()| input_injector.queue_key_event(modifier, false));
+        }
+        match fast_path_result.and_then(|()| input_injector.flush()) {
+            Ok(()) => return Ok(()),
+            Err(err) => warn!("persistent X11 key chord failed, falling back to xdotool: {err}"),
+        }
+    }
     let mut args = Vec::with_capacity(temporary_modifiers.len() * 4 + 4);
     for modifier in &temporary_modifiers {
         args.push("keydown".to_string());
@@ -1726,6 +1802,7 @@ async fn tap_key_with_modifiers(
 
 async fn sync_event_modifier_keys(
     display: &str,
+    input_injector: Option<&X11InputInjector>,
     pressed_keys: &mut HashSet<String>,
     modifiers: KeyModifiers,
     event_key: &str,
@@ -1751,20 +1828,24 @@ async fn sync_event_modifier_keys(
             if keys.iter().any(|key| pressed_keys.contains(*key)) {
                 continue;
             }
-            run_xdotool(display, ["keydown", fallback]).await?;
+            apply_key_event(display, input_injector, fallback, true).await?;
             pressed_keys.insert(fallback.to_string());
             continue;
         }
         for key in keys {
             if pressed_keys.remove(key) {
-                run_xdotool(display, ["keyup", key]).await?;
+                apply_key_event(display, input_injector, key, false).await?;
             }
         }
     }
     Ok(())
 }
 
-async fn release_pressed_keys(display: &str, pressed_keys: &mut HashSet<String>) -> Result<()> {
+async fn release_pressed_keys(
+    display: &str,
+    input_injector: Option<&X11InputInjector>,
+    pressed_keys: &mut HashSet<String>,
+) -> Result<()> {
     let mut keys = pressed_keys.drain().collect::<Vec<_>>();
     keys.sort_by(|left, right| {
         key_chord_rank(right)
@@ -1772,9 +1853,29 @@ async fn release_pressed_keys(display: &str, pressed_keys: &mut HashSet<String>)
             .then_with(|| left.cmp(right))
     });
     for key in keys {
-        run_xdotool(display, ["keyup", &key]).await?;
+        apply_key_event(display, input_injector, &key, false).await?;
     }
     Ok(())
+}
+
+async fn apply_key_event(
+    display: &str,
+    input_injector: Option<&X11InputInjector>,
+    key: &str,
+    down: bool,
+) -> Result<()> {
+    if let Some(input_injector) = input_injector {
+        match input_injector.key_event(key, down) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                warn!(
+                    "persistent X11 key event failed for {key}, falling back to xdotool: {err}"
+                );
+            }
+        }
+    }
+    let action = if down { "keydown" } else { "keyup" };
+    run_xdotool(display, [action, key]).await
 }
 
 async fn reset_input_state(
@@ -1789,7 +1890,7 @@ async fn reset_input_state(
             run_xdotool(display, ["mouseup", button]).await?;
         }
     }
-    release_pressed_keys(display, pressed_keys).await?;
+    release_pressed_keys(display, input_injector, pressed_keys).await?;
     for key in [
         "Shift_L",
         "Shift_R",
@@ -1800,7 +1901,7 @@ async fn reset_input_state(
         "Super_L",
         "Super_R",
     ] {
-        run_xdotool(display, ["keyup", key]).await?;
+        apply_key_event(display, input_injector, key, false).await?;
     }
     Ok(())
 }
@@ -2006,6 +2107,12 @@ async fn type_remote_text(
         paste_remote_text(display, &normalized, input_injector, pressed_keys).await?;
         return Ok(());
     }
+    if pressed_keys.is_empty()
+        && let Some(input_injector) = input_injector
+        && type_ascii_text_fast(input_injector, &normalized)?
+    {
+        return Ok(());
+    }
     let segments: Vec<&str> = normalized.split('\n').collect();
     for (index, segment) in segments.iter().enumerate() {
         if !segment.is_empty() {
@@ -2020,6 +2127,125 @@ async fn type_remote_text(
         }
     }
     Ok(())
+}
+
+fn type_ascii_text_fast(input_injector: &X11InputInjector, text: &str) -> Result<bool> {
+    let mut events = Vec::new();
+    for ch in text.chars() {
+        let Some((key, shifted)) = ascii_text_key(ch) else {
+            return Ok(false);
+        };
+        if shifted && !input_injector.supports_key("Shift_L") {
+            return Ok(false);
+        }
+        if !input_injector.supports_key(key) {
+            return Ok(false);
+        }
+        if shifted {
+            events.push(("Shift_L", true));
+        }
+        events.push((key, true));
+        events.push((key, false));
+        if shifted {
+            events.push(("Shift_L", false));
+        }
+    }
+    for (key, down) in events {
+        input_injector.queue_key_event(key, down)?;
+    }
+    input_injector.flush()?;
+    Ok(true)
+}
+
+fn ascii_text_key(ch: char) -> Option<(&'static str, bool)> {
+    match ch {
+        'a'..='z' => Some((ascii_lower_key(ch), false)),
+        'A'..='Z' => Some((ascii_lower_key(ch.to_ascii_lowercase()), true)),
+        '0'..='9' => Some((ascii_digit_key(ch), false)),
+        '\n' => Some(("Return", false)),
+        ' ' => Some(("space", false)),
+        '`' => Some(("grave", false)),
+        '~' => Some(("grave", true)),
+        '-' => Some(("minus", false)),
+        '_' => Some(("minus", true)),
+        '=' => Some(("equal", false)),
+        '+' => Some(("equal", true)),
+        '[' => Some(("bracketleft", false)),
+        '{' => Some(("bracketleft", true)),
+        ']' => Some(("bracketright", false)),
+        '}' => Some(("bracketright", true)),
+        '\\' => Some(("backslash", false)),
+        '|' => Some(("backslash", true)),
+        ';' => Some(("semicolon", false)),
+        ':' => Some(("semicolon", true)),
+        '\'' => Some(("apostrophe", false)),
+        '"' => Some(("apostrophe", true)),
+        ',' => Some(("comma", false)),
+        '<' => Some(("comma", true)),
+        '.' => Some(("period", false)),
+        '>' => Some(("period", true)),
+        '/' => Some(("slash", false)),
+        '?' => Some(("slash", true)),
+        '!' => Some(("1", true)),
+        '@' => Some(("2", true)),
+        '#' => Some(("3", true)),
+        '$' => Some(("4", true)),
+        '%' => Some(("5", true)),
+        '^' => Some(("6", true)),
+        '&' => Some(("7", true)),
+        '*' => Some(("8", true)),
+        '(' => Some(("9", true)),
+        ')' => Some(("0", true)),
+        _ => None,
+    }
+}
+
+fn ascii_lower_key(ch: char) -> &'static str {
+    match ch {
+        'a' => "a",
+        'b' => "b",
+        'c' => "c",
+        'd' => "d",
+        'e' => "e",
+        'f' => "f",
+        'g' => "g",
+        'h' => "h",
+        'i' => "i",
+        'j' => "j",
+        'k' => "k",
+        'l' => "l",
+        'm' => "m",
+        'n' => "n",
+        'o' => "o",
+        'p' => "p",
+        'q' => "q",
+        'r' => "r",
+        's' => "s",
+        't' => "t",
+        'u' => "u",
+        'v' => "v",
+        'w' => "w",
+        'x' => "x",
+        'y' => "y",
+        'z' => "z",
+        _ => unreachable!("ascii_lower_key called with non-lowercase char"),
+    }
+}
+
+fn ascii_digit_key(ch: char) -> &'static str {
+    match ch {
+        '0' => "0",
+        '1' => "1",
+        '2' => "2",
+        '3' => "3",
+        '4' => "4",
+        '5' => "5",
+        '6' => "6",
+        '7' => "7",
+        '8' => "8",
+        '9' => "9",
+        _ => unreachable!("ascii_digit_key called with non-digit char"),
+    }
 }
 
 fn should_paste_text(text: &str) -> bool {
@@ -2060,6 +2286,20 @@ async fn send_clipboard_update(display: &str, sender: &mpsc::Sender<Message>) ->
         ))
         .await?;
     Ok(())
+}
+
+fn spawn_clipboard_update(display: String, sender: mpsc::Sender<Message>) {
+    tokio::spawn(async move {
+        if let Err(err) = send_clipboard_update(&display, &sender).await {
+            warn!("failed to read remote clipboard: {err}");
+            send_runtime_error(
+                &sender,
+                "clipboard_read_failed",
+                format!("Clipboard read failed on the server: {err}"),
+            )
+            .await;
+        }
+    });
 }
 
 fn binary_audio_frame(frame: &AudioFrame) -> Vec<u8> {

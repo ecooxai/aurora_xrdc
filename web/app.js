@@ -104,8 +104,22 @@ const AUTO_DISCONNECT_ACTIVITY_MESSAGE_TYPES = new Set([
   "pointer_wheel",
   "text_input",
 ]);
+const INPUT_SOCKET_MESSAGE_TYPES = new Set([
+  "key",
+  "key_state",
+  "pointer_absolute",
+  "pointer_button",
+  "pointer_move",
+  "pointer_wheel",
+  "touch_tap",
+  "text_input",
+  "paste",
+  "paste_clipboard",
+  "reset_input",
+]);
 const state = {
   socket: null,
+  inputSocket: null,
   videoSocket: null,
   audioSocket: null,
   micSocket: null,
@@ -197,6 +211,7 @@ const state = {
   recoveryTapCenter: null,
   inputCaptured: false,
   pressedKeys: new Set(),
+  tappedPrintableKeys: new Set(),
   modifierChordKeys: new Set(),
   mobileKeyboardComposing: false,
   mobileKeyboardFlushTimer: 0,
@@ -209,6 +224,7 @@ const state = {
   remoteClipboardUpdatedAt: 0,
   clipboardHistory: [],
   messages: [],
+  activeMessageLevel: "error",
   encoderOptionsByCodec: {},
   lastEncoderStatusMessage: "",
   apiOrigin: window.location.origin,
@@ -221,6 +237,7 @@ const state = {
   videoFrameHeight: null,
   viewZoomPercent: 100,
   viewCssWidthMode: "render",
+  viewCustomCssWidth: null,
   wsLatencyMs: null,
   latencyProbeSeq: 0,
   latencyProbeSentAt: new Map(),
@@ -267,6 +284,9 @@ const errorPanel = $("error-panel");
 const errorCount = $("error-count");
 const errorList = $("error-list");
 const errorClear = $("error-clear");
+const messageTabButtons = Array.from(document.querySelectorAll("[data-message-level]"));
+const messageErrorCount = $("message-error-count");
+const messageInfoCount = $("message-info-count");
 const mobileKeyboardTrigger = $("mobile-keyboard-trigger");
 const micToggle = $("mic-toggle");
 const micDeviceMenu = $("mic-device-menu");
@@ -312,8 +332,7 @@ const stallResetMsInput = $("stall-reset-ms");
 const stallResetMsValue = $("stall-reset-ms-value");
 const decodeQueueInput = $("decode-queue");
 const decodeQueueValue = $("decode-queue-value");
-const performanceSpeedButton = $("performance-speed");
-const performanceQualityButton = $("performance-quality");
+const performancePresetSelect = $("performance-preset");
 const touchModeSelect = $("touch-mode");
 const touchModeGroup = $("touch-mode-group");
 const directTouchScrollInput = $("direct-touch-scroll");
@@ -348,7 +367,11 @@ const viewWindowSize = $("view-window-size");
 const viewRemoteScreenSize = $("view-remote-screen-size");
 const viewZoomValue = $("view-zoom-value");
 const viewCanvasRenderAction = $("view-canvas-render-action");
+const viewCanvasCssAction = $("view-canvas-css-action");
+const viewRemoteScreenAction = $("view-remote-screen-action");
+const viewStreamAction = $("view-stream-action");
 const viewViewportAction = $("view-viewport-action");
+const viewWindowAction = $("view-window-action");
 const zoomOutButton = $("zoom-out");
 const zoomInButton = $("zoom-in");
 const AAC_SAMPLE_RATES = [
@@ -619,7 +642,11 @@ function renderViewMetrics() {
   viewViewportSize.textContent = formatDimensions(viewportCard.clientWidth, viewportCard.clientHeight);
   viewWindowSize.textContent = formatDimensions(window.innerWidth, window.innerHeight);
   viewRemoteScreenSize.textContent = formatDimensions(state.remoteScreenWidth, state.remoteScreenHeight);
-  viewZoomValue.textContent = state.viewCssWidthMode === "viewport"
+  viewZoomValue.textContent = state.viewCssWidthMode === "custom"
+    ? "Custom"
+    : state.viewCssWidthMode === "window"
+    ? "Window"
+    : state.viewCssWidthMode === "viewport"
     ? "Viewport"
     : `${Math.round(state.viewZoomPercent)}%`;
   syncZoomButtons();
@@ -633,12 +660,35 @@ function applyCanvasZoom() {
     return;
   }
 
-  const displayWidth = state.viewCssWidthMode === "viewport"
-    ? Math.max(1, Math.round(viewportCard.clientWidth))
-    : Math.max(1, Math.round(surfaceWidth * (state.viewZoomPercent / 100)));
+  const setCanvasCssWidth = (width) => {
+    const displayWidth = Math.max(1, Math.round(width));
+    const displayHeight = Math.max(1, Math.round(displayWidth * (surfaceHeight / surfaceWidth)));
+    canvas.style.width = `${displayWidth}px`;
+    canvas.style.height = `${displayHeight}px`;
+  };
 
-  canvas.style.width = `${displayWidth}px`;
-  canvas.style.height = "auto";
+  if (state.viewCssWidthMode === "viewport") {
+    setCanvasCssWidth(viewportCard.clientWidth);
+    renderViewMetrics();
+    return;
+  }
+
+  if (state.viewCssWidthMode === "window") {
+    setCanvasCssWidth(window.innerWidth);
+    renderViewMetrics();
+    return;
+  }
+
+  if (state.viewCssWidthMode === "custom") {
+    const customWidth = Number(state.viewCustomCssWidth);
+    if (Number.isFinite(customWidth) && customWidth > 0) {
+      setCanvasCssWidth(customWidth);
+      renderViewMetrics();
+      return;
+    }
+  }
+
+  setCanvasCssWidth(surfaceWidth * (state.viewZoomPercent / 100));
   renderViewMetrics();
 }
 
@@ -658,6 +708,7 @@ function adjustZoom(deltaPercent) {
   }
   state.viewZoomPercent = nextZoom;
   state.viewCssWidthMode = "zoom";
+  state.viewCustomCssWidth = null;
   applyCanvasZoom();
   saveSettings();
 }
@@ -665,19 +716,45 @@ function adjustZoom(deltaPercent) {
 function setCanvasDisplayRenderWidth() {
   state.viewCssWidthMode = "render";
   state.viewZoomPercent = 100;
+  state.viewCustomCssWidth = null;
   applyCanvasZoom();
   saveSettings();
 }
 
 function setCanvasDisplayViewportWidth() {
-  const renderWidth = currentVideoRenderWidth();
-  const viewportWidth = viewportCard.clientWidth;
-  if (Number.isFinite(renderWidth) && renderWidth > 0 && Number.isFinite(viewportWidth) && viewportWidth > 0) {
-    state.viewZoomPercent = (viewportWidth / renderWidth) * 100;
+  setCanvasDisplayWidth(viewportCard.clientWidth, "viewport");
+}
+
+function setCanvasDisplayWidth(width, mode = "custom") {
+  const nextWidth = Number(width);
+  if (!Number.isFinite(nextWidth) || nextWidth <= 0) {
+    return;
   }
-  state.viewCssWidthMode = "viewport";
+  const renderWidth = currentVideoRenderWidth();
+  if (Number.isFinite(renderWidth) && renderWidth > 0) {
+    state.viewZoomPercent = clampZoomPercent((nextWidth / renderWidth) * 100);
+  }
+  state.viewCssWidthMode = mode;
+  state.viewCustomCssWidth = Math.round(nextWidth);
   applyCanvasZoom();
   saveSettings();
+}
+
+function setCanvasDisplayCurrentCssSize() {
+  const rect = canvas.getBoundingClientRect();
+  setCanvasDisplayWidth(rect.width);
+}
+
+function setCanvasDisplayRemoteScreenSize() {
+  setCanvasDisplayWidth(state.remoteScreenWidth);
+}
+
+function setCanvasDisplayStreamSize() {
+  setCanvasDisplayWidth(state.videoFrameWidth);
+}
+
+function setCanvasDisplayWindowSize() {
+  setCanvasDisplayWidth(window.innerWidth, "window");
 }
 
 function controlTabLabel(tabName) {
@@ -821,19 +898,50 @@ function pushMessage(code, message, { level = "info", throttleMs = 0 } = {}) {
 }
 
 function clearErrors() {
-  state.messages = [];
-  errorPanel.open = false;
+  const activeLevel = state.activeMessageLevel || "error";
+  state.messages = state.messages.filter((entry) => messageDisplayLevel(entry) !== activeLevel);
+  errorPanel.open = state.messages.length > 0;
+  renderErrors();
+}
+
+function messageDisplayLevel(entry) {
+  return entry?.level === "error" ? "error" : "info";
+}
+
+function setActiveMessageLevel(level = "error") {
+  state.activeMessageLevel = level === "info" ? "info" : "error";
   renderErrors();
 }
 
 function renderErrors() {
-  const hasErrors = state.messages.some((entry) => entry.level === "error");
+  const errorMessages = state.messages.filter((entry) => messageDisplayLevel(entry) === "error");
+  const infoMessages = state.messages.filter((entry) => messageDisplayLevel(entry) === "info");
+  const activeMessages = state.activeMessageLevel === "info" ? infoMessages : errorMessages;
+  const hasErrors = errorMessages.length > 0;
   errorPanel.classList.toggle("hidden", state.messages.length === 0);
   errorCount.textContent = String(Math.min(state.messages.length, 99));
   errorCount.classList.toggle("has-error", hasErrors);
+  if (messageErrorCount) {
+    messageErrorCount.textContent = String(Math.min(errorMessages.length, 99));
+  }
+  if (messageInfoCount) {
+    messageInfoCount.textContent = String(Math.min(infoMessages.length, 99));
+  }
+  for (const button of messageTabButtons) {
+    const active = button.dataset.messageLevel === state.activeMessageLevel;
+    button.classList.toggle("is-active", active);
+    button.classList.toggle("secondary", !active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  }
   errorList.replaceChildren();
   const fragment = document.createDocumentFragment();
-  for (const error of state.messages) {
+  if (activeMessages.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "error-item";
+    empty.textContent = state.activeMessageLevel === "info" ? "No info messages" : "No error messages";
+    fragment.append(empty);
+  }
+  for (const error of activeMessages) {
     const item = document.createElement("article");
     item.className = `error-item is-${error.level || "info"}`;
 
@@ -1453,15 +1561,16 @@ function renderSettingsValues(settings = readSettingsFromControls()) {
   staleDropMsValue.textContent = `${settings.staleDropMs} ms`;
   stallResetMsValue.textContent = `${settings.stallResetMs} ms`;
   decodeQueueValue.textContent = `${settings.maxDecodeQueue} frame${settings.maxDecodeQueue === 1 ? "" : "s"}`;
-  syncPerformancePresetButtons(settings);
+  syncPerformancePresetSelect(settings);
 }
 
-function syncPerformancePresetButtons(settings = readSettingsFromControls()) {
+function syncPerformancePresetSelect(settings = readSettingsFromControls()) {
   const activePreset = Object.entries(PERFORMANCE_PRESETS)
     .find(([, preset]) => Object.entries(preset)
       .every(([key, value]) => settings[key] === value))?.[0];
-  performanceSpeedButton.classList.toggle("is-active", activePreset === "speed");
-  performanceQualityButton.classList.toggle("is-active", activePreset === "quality");
+  if (performancePresetSelect) {
+    performancePresetSelect.value = activePreset || "custom";
+  }
 }
 
 function syncTouchModeControls(settings = readSettingsFromControls()) {
@@ -2180,8 +2289,13 @@ function isConnected() {
   return isSocketOpen(state.socket);
 }
 
+function isInputConnected() {
+  return isSocketOpen(state.inputSocket);
+}
+
 function isFullyConnected() {
   return isSocketOpen(state.socket)
+    && isSocketOpen(state.inputSocket)
     && isSocketOpen(state.videoSocket)
     && isSocketOpen(state.audioSocket)
     && isSocketOpen(state.micSocket);
@@ -2408,15 +2522,18 @@ async function connect() {
     setEncoderStatus("Connecting...");
     state.sessionId = createClientSessionId();
     const control = openRoleSocket("control", settings, handleControlSocketMessage);
+    const input = openRoleSocket("input", settings, handleControlSocketMessage);
     const video = openRoleSocket("video", settings, handleMediaSocketMessage);
     const audio = openRoleSocket("audio", settings, handleMediaSocketMessage);
     const mic = openRoleSocket("mic", settings, handleMicSocketMessage);
     state.socket = control.socket;
+    state.inputSocket = input.socket;
     state.videoSocket = video.socket;
     state.audioSocket = audio.socket;
     state.micSocket = mic.socket;
     await Promise.all([
       control.openPromise,
+      input.openPromise,
       video.openPromise,
       audio.openPromise,
       mic.openPromise,
@@ -2505,8 +2622,9 @@ function closeConnection({ manual = true, preserveStatus = false, keepCameraEnab
   state.netWindowBytes = 0;
   state.netKbps = 0;
   resetKeys();
-  const sockets = [state.socket, state.videoSocket, state.audioSocket, state.micSocket];
+  const sockets = [state.socket, state.inputSocket, state.videoSocket, state.audioSocket, state.micSocket];
   state.socket = null;
+  state.inputSocket = null;
   state.videoSocket = null;
   state.audioSocket = null;
   state.micSocket = null;
@@ -2535,7 +2653,7 @@ function isConnectionOpen() {
 }
 
 function isConnectionDisconnected() {
-  return [state.socket, state.videoSocket, state.audioSocket, state.micSocket]
+  return [state.socket, state.inputSocket, state.videoSocket, state.audioSocket, state.micSocket]
     .every((socket) => !socket || socket.readyState === WebSocket.CLOSED);
 }
 
@@ -3903,10 +4021,16 @@ async function playAudioData(audioData) {
 }
 
 function sendNow(message) {
-  if (isConnected()) {
-    noteAutoDisconnectActivity(message);
-    state.socket.send(JSON.stringify(message));
-  }
+  const socket = shouldUseInputSocket(message) && isInputConnected()
+    ? state.inputSocket
+    : state.socket;
+  if (!isSocketOpen(socket)) return;
+  noteAutoDisconnectActivity(message);
+  socket.send(JSON.stringify(message));
+}
+
+function shouldUseInputSocket(message) {
+  return INPUT_SOCKET_MESSAGE_TYPES.has(message?.type);
 }
 
 function clearPendingPointerMotion() {
@@ -4061,6 +4185,7 @@ function resetKeys() {
     send({ type: "key", key, down: false });
   }
   state.pressedKeys.clear();
+  state.tappedPrintableKeys.clear();
   state.modifierChordKeys.clear();
   sendPressedKeyState();
 }
@@ -4310,6 +4435,13 @@ function eventHasActiveModifier(event) {
 function eventHasShortcutModifier(event) {
   const modifiers = keyModifierSnapshot(event);
   return modifiers.ctrl || modifiers.alt || modifiers.meta;
+}
+
+function shouldTapPrintableKey(event, key) {
+  return !event.repeat
+    && event.key?.length === 1
+    && !eventHasShortcutModifier(event)
+    && !keyLogicalModifier(key);
 }
 
 function tapRemoteKeyFromEvent(key, event) {
@@ -5423,8 +5555,13 @@ function initControls() {
   stallResetMsInput.addEventListener("change", persistCurrentSettings);
   decodeQueueInput.addEventListener("input", persistCurrentSettings);
   decodeQueueInput.addEventListener("change", persistCurrentSettings);
-  performanceSpeedButton.addEventListener("click", () => applyPerformancePreset("speed"));
-  performanceQualityButton.addEventListener("click", () => applyPerformancePreset("quality"));
+  performancePresetSelect.addEventListener("change", () => {
+    if (performancePresetSelect.value === "custom") {
+      syncPerformancePresetSelect();
+      return;
+    }
+    applyPerformancePreset(performancePresetSelect.value);
+  });
   scrollSpeedInput.addEventListener("input", persistCurrentSettings);
   scrollSpeedInput.addEventListener("change", persistCurrentSettings);
   audioLatencyInput.addEventListener("input", persistCurrentSettings);
@@ -5483,6 +5620,11 @@ function initControls() {
       releaseInput();
     }
   });
+  for (const button of messageTabButtons) {
+    button.addEventListener("click", () => {
+      setActiveMessageLevel(button.dataset.messageLevel || "error");
+    });
+  }
   errorClear.addEventListener("click", clearErrors);
   controlPanel.addEventListener("toggle", () => {
     if (controlPanel.open) {
@@ -5557,7 +5699,11 @@ function initControls() {
     adjustZoom(VIEW_ZOOM_STEP_PERCENT);
   });
   viewCanvasRenderAction.addEventListener("click", setCanvasDisplayRenderWidth);
+  viewCanvasCssAction.addEventListener("click", setCanvasDisplayCurrentCssSize);
+  viewRemoteScreenAction.addEventListener("click", setCanvasDisplayRemoteScreenSize);
+  viewStreamAction.addEventListener("click", setCanvasDisplayStreamSize);
   viewViewportAction.addEventListener("click", setCanvasDisplayViewportWidth);
+  viewWindowAction.addEventListener("click", setCanvasDisplayWindowSize);
   mobileKeyboardTrigger.addEventListener("click", () => {
     if (document.activeElement === mobileKeyboardInput) {
       releaseInput();
@@ -5688,6 +5834,13 @@ function initControls() {
       pressMissing: true,
       skipLogical: keyLogicalModifier(key),
     });
+    if (shouldTapPrintableKey(event, key)) {
+      state.tappedPrintableKeys.add(key);
+      logInputState("keydown-text", event, { normalizedKey: key });
+      sendRemoteText(event.key);
+      event.preventDefault();
+      return;
+    }
     if (!event.repeat && state.pressedKeys.has(key)) {
       logInputState("keydown-duplicate", event, { normalizedKey: key });
       event.preventDefault();
@@ -5707,6 +5860,10 @@ function initControls() {
   window.addEventListener("keyup", (event) => {
     const key = normalizeKey(event);
     if (!key) return;
+    if (state.tappedPrintableKeys.delete(key)) {
+      event.preventDefault();
+      return;
+    }
     const released = releasePressedKey(key, event);
     releaseStaleModifierChordKeys(event, { exceptKey: key });
     synchronizeModifierState(event);

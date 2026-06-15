@@ -7,7 +7,6 @@ install_apt() {
   sudo apt-get install -y \
     ffmpeg \
     xdotool \
-    xclip \
     xvfb \
     jwm \
     xterm \
@@ -25,7 +24,6 @@ install_pacman() {
   sudo pacman -Sy --noconfirm \
     ffmpeg \
     xdotool \
-    xclip \
     xorg-server-xvfb \
     jwm \
     xterm \

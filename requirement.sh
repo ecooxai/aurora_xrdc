@@ -19,7 +19,6 @@ install_apt() {
     pulseaudio-utils \
     x11-utils \
     xauth \
-    xclip \
     xdotool \
     xterm \
     xvfb
@@ -38,7 +37,6 @@ install_pacman() {
     kmod \
     libpulse \
     pulseaudio \
-    xclip \
     xdotool \
     xorg-server-xvfb \
     xorg-xauth \

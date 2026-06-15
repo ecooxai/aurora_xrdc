@@ -62,7 +62,6 @@ RUNTIME_PACKAGES=(
   x11-utils
   x11-xkb-utils
   xauth
-  xclip
   xdotool
   xkb-data
   xterm
@@ -104,7 +103,6 @@ ARCH_RUNTIME_PACKAGES=(
   pulseaudio
   vdpauinfo
   wireplumber
-  xclip
   xdotool
   xorg-server-xvfb
   xorg-xauth
@@ -288,7 +286,6 @@ copy_important_host_binaries() {
   local names=(
     ffmpeg
     xdotool
-    xclip
     Xvfb
     xterm
     xdpyinfo

@@ -59,6 +59,9 @@ SUDO_AUDIO_USER=""
 SUDO_AUDIO_UID=""
 SUDO_AUDIO_HOME=""
 SUDO_AUDIO_RUNTIME_DIR=""
+SESSION_RUNTIME_USER=""
+SESSION_RUNTIME_UID=""
+SESSION_RUNTIME_DIR=""
 APP_PID=""
 XVFB_PID=""
 LAUNCHER_PID=""
@@ -531,51 +534,74 @@ ensure_uinput_access() {
     echo "[dev] uinput: unable to grant access; pointer motion and smooth wheel will fall back"
 }
 
-configure_sudo_audio_env() {
-    if [[ "$(id -u)" -ne 0 || -z "${SUDO_UID:-}" || "${SUDO_UID}" == "0" ]]; then
-        return 0
-    fi
-
+configure_session_runtime_env() {
+    local runtime_uid=""
+    local runtime_user=""
+    local runtime_home=""
     local passwd_entry=""
-    local passwd_user=""
-    local passwd_home=""
 
-    passwd_entry="$(getent passwd "${SUDO_UID}" 2>/dev/null || true)"
-    if [[ -n "${passwd_entry}" ]]; then
-        IFS=: read -r passwd_user _ _ _ _ passwd_home _ <<<"${passwd_entry}"
+    if [[ "$(id -u)" -eq 0 && -n "${SUDO_UID:-}" && "${SUDO_UID}" != "0" ]]; then
+        runtime_uid="${SUDO_UID}"
+        passwd_entry="$(getent passwd "${runtime_uid}" 2>/dev/null || true)"
+        if [[ -n "${passwd_entry}" ]]; then
+            IFS=: read -r runtime_user _ _ _ _ runtime_home _ <<<"${passwd_entry}"
+        fi
+        runtime_user="${SUDO_USER:-${runtime_user}}"
+
+        SUDO_AUDIO_UID="${runtime_uid}"
+        SUDO_AUDIO_USER="${runtime_user}"
+        SUDO_AUDIO_HOME="${runtime_home}"
+        SUDO_AUDIO_RUNTIME_DIR="/run/user/${runtime_uid}"
+    else
+        runtime_uid="$(id -u)"
+        runtime_user="$(id -un)"
+        runtime_home="${HOME}"
     fi
 
-    SUDO_AUDIO_UID="${SUDO_UID}"
-    SUDO_AUDIO_USER="${SUDO_USER:-${passwd_user}}"
-    SUDO_AUDIO_HOME="${passwd_home}"
-    SUDO_AUDIO_RUNTIME_DIR="/run/user/${SUDO_AUDIO_UID}"
-
-    if [[ -z "${SUDO_AUDIO_USER}" ]]; then
-        echo "[dev] sudo audio: unable to resolve user for uid ${SUDO_AUDIO_UID}" >&2
+    if [[ -z "${runtime_uid}" || -z "${runtime_user}" ]]; then
+        echo "[dev] runtime: unable to resolve session user" >&2
         return 0
     fi
 
-    if [[ ! -d "${SUDO_AUDIO_RUNTIME_DIR}" ]]; then
-        echo "[dev] sudo audio: ${SUDO_AUDIO_RUNTIME_DIR} does not exist; the normal user's audio session may not be running" >&2
-        return 0
-    fi
+    SESSION_RUNTIME_UID="${runtime_uid}"
+    SESSION_RUNTIME_USER="${runtime_user}"
+    SESSION_RUNTIME_DIR="/run/user/${SESSION_RUNTIME_UID}"
 
-    export XDG_RUNTIME_DIR="${SUDO_AUDIO_RUNTIME_DIR}"
-    export PULSE_SERVER="unix:${SUDO_AUDIO_RUNTIME_DIR}/pulse/native"
-
-    if [[ -z "${PULSE_COOKIE:-}" && -n "${SUDO_AUDIO_HOME}" ]]; then
-        if [[ -r "${SUDO_AUDIO_HOME}/.config/pulse/cookie" ]]; then
-            export PULSE_COOKIE="${SUDO_AUDIO_HOME}/.config/pulse/cookie"
-        elif [[ -r "${SUDO_AUDIO_HOME}/.pulse-cookie" ]]; then
-            export PULSE_COOKIE="${SUDO_AUDIO_HOME}/.pulse-cookie"
+    if [[ ! -d "${SESSION_RUNTIME_DIR}" ]]; then
+        echo "[dev] runtime: creating ${SESSION_RUNTIME_DIR}"
+        if [[ "$(id -u)" -eq 0 ]]; then
+            mkdir -p "${SESSION_RUNTIME_DIR}" || true
+        elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+            sudo mkdir -p "${SESSION_RUNTIME_DIR}" || true
+        else
+            mkdir -p "${SESSION_RUNTIME_DIR}" 2>/dev/null || true
         fi
     fi
 
-    if [[ -S "${SUDO_AUDIO_RUNTIME_DIR}/bus" ]]; then
-        export DBUS_SESSION_BUS_ADDRESS="unix:path=${SUDO_AUDIO_RUNTIME_DIR}/bus"
+    if [[ ! -d "${SESSION_RUNTIME_DIR}" ]]; then
+        echo "[dev] runtime: ${SESSION_RUNTIME_DIR} is unavailable" >&2
+        return 0
     fi
 
-    echo "[dev] sudo audio: using ${SUDO_AUDIO_USER}'s audio session at ${SUDO_AUDIO_RUNTIME_DIR}"
+    if [[ "$(id -u)" -eq 0 ]]; then
+        chown "${SESSION_RUNTIME_USER}:" "${SESSION_RUNTIME_DIR}" 2>/dev/null || true
+        chmod 700 "${SESSION_RUNTIME_DIR}" 2>/dev/null || true
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo chown "${SESSION_RUNTIME_USER}:" "${SESSION_RUNTIME_DIR}" 2>/dev/null || true
+        sudo chmod 700 "${SESSION_RUNTIME_DIR}" 2>/dev/null || true
+    else
+        chmod 700 "${SESSION_RUNTIME_DIR}" 2>/dev/null || true
+    fi
+
+    export XDG_RUNTIME_DIR="${SESSION_RUNTIME_DIR}"
+    unset PULSE_SERVER
+    unset PULSE_COOKIE
+
+    if [[ -S "${SESSION_RUNTIME_DIR}/bus" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=${SESSION_RUNTIME_DIR}/bus"
+    fi
+
+    echo "[dev] runtime: XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
 }
 
 using_sudo_audio_user() {
@@ -590,7 +616,7 @@ command_needs_appimage_library_path() {
         [[ -n "${arg}" ]] || continue
         base="${arg##*/}"
         case "${base}" in
-            Xvfb|dbus-daemon|dbus-launch|dbus-send|ip|modprobe|openssl|pactl|pipewire|pipewire-pulse|pulseaudio|pw-cli|pw-loopback|timeout|udevadm|wireplumber|wpctl|xclip|xdotool|xdpyinfo|xset|xterm)
+            Xvfb|dbus-daemon|dbus-launch|dbus-send|ip|modprobe|openssl|pactl|pipewire|pipewire-pulse|pulseaudio|pw-cli|pw-loopback|timeout|udevadm|wireplumber|wpctl|xdotool|xdpyinfo|xset|xterm)
                 if [[ "${arg}" == */* ]]; then
                     resolved="${arg}"
                 else
@@ -608,16 +634,10 @@ command_needs_appimage_library_path() {
 
 run_as_audio_user() {
     local -a env_args=()
-    local -a unset_env_args=()
+    local -a unset_env_args=("-u" "PULSE_SERVER" "-u" "PULSE_COOKIE")
 
     if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
         env_args+=("XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}")
-    fi
-    if [[ -n "${PULSE_SERVER:-}" ]]; then
-        env_args+=("PULSE_SERVER=${PULSE_SERVER}")
-    fi
-    if [[ -n "${PULSE_COOKIE:-}" ]]; then
-        env_args+=("PULSE_COOKIE=${PULSE_COOKIE}")
     fi
     if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
         env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
@@ -656,7 +676,7 @@ start_private_session_bus() {
     fi
     command -v dbus-daemon >/dev/null 2>&1 || return 0
 
-    local dbus_dir="${DEV_LOG_DIR}/dbus-$$"
+    local dbus_dir="${XDG_RUNTIME_DIR:-${DEV_LOG_DIR}}/vibe-rdesk-dbus-$$"
     local dbus_socket="${dbus_dir}/session-bus"
     local dbus_output=""
     local dbus_address=""
@@ -1019,7 +1039,7 @@ wait_for_pulse_server() {
 }
 
 start_private_pulse_server() {
-    local pulse_dir="${DEV_LOG_DIR}/pulse-$$"
+    local pulse_dir="${XDG_RUNTIME_DIR:-${DEV_LOG_DIR}}/pulse"
     local pulse_socket="${pulse_dir}/native"
     local log_file="${DEV_LOG_DIR}/pulseaudio-private.log"
     local pulse_module_dir=""
@@ -1032,7 +1052,6 @@ start_private_pulse_server() {
         chown -R "${SUDO_AUDIO_USER}:" "${pulse_dir}" 2>/dev/null || true
     fi
 
-    export PULSE_SERVER="unix:${pulse_socket}"
     if [[ -n "${APPDIR:-}" ]]; then
         for dir in "${APPDIR}"/usr/lib/pulse-*/modules "${APPDIR}"/usr/lib/*/pulse-*/modules; do
             if [[ -d "${dir}" ]]; then
@@ -1044,10 +1063,8 @@ start_private_pulse_server() {
     if [[ -n "${pulse_module_dir}" ]]; then
         pulse_module_args=(--dl-search-path="${pulse_module_dir}")
     fi
-    echo "[dev] starting private PulseAudio server at ${pulse_socket}"
-    local saved_dbus_session_bus_address="${DBUS_SESSION_BUS_ADDRESS-}"
+    echo "[dev] starting private PulseAudio server with XDG runtime ${XDG_RUNTIME_DIR:-unset}"
     local saved_ld_library_path="${LD_LIBRARY_PATH-}"
-    export DBUS_SESSION_BUS_ADDRESS="unix:path=${pulse_dir}/dbus-disabled"
     if [[ -n "${pulse_module_dir}" ]]; then
         export LD_LIBRARY_PATH="${pulse_module_dir}:${LD_LIBRARY_PATH:-}"
     fi
@@ -1064,11 +1081,6 @@ start_private_pulse_server() {
         --load="module-null-sink sink_name=${VIRTUAL_MIC_SINK_NAME} sink_properties=device.description=VibeRDeskVirtualMicSink" \
         > >(log_to_file_and_terminal "${log_file}") 2>&1 &
     PULSE_PID=$!
-    if [[ -n "${saved_dbus_session_bus_address}" ]]; then
-        export DBUS_SESSION_BUS_ADDRESS="${saved_dbus_session_bus_address}"
-    else
-        unset DBUS_SESSION_BUS_ADDRESS
-    fi
     if [[ -n "${saved_ld_library_path}" ]]; then
         export LD_LIBRARY_PATH="${saved_ld_library_path}"
     else
@@ -1094,16 +1106,10 @@ start_pulse_server() {
         return $?
     fi
 
-    if command -v dbus-launch >/dev/null 2>&1; then
-        local log_file="${DEV_LOG_DIR}/pulseaudio.log"
-        prepare_dev_log_file "${log_file}"
-        echo "[dev] starting PulseAudio with dbus-launch"
-        run_as_audio_user dbus-launch pulseaudio > >(log_to_file_and_terminal "${log_file}") 2>&1 &
-        PULSE_PID=$!
-    else
-        echo "[dev] starting PulseAudio"
-        run_as_audio_user pulseaudio --start >/dev/null 2>&1 || true
-    fi
+    local log_file="${DEV_LOG_DIR}/pulseaudio.log"
+    prepare_dev_log_file "${log_file}"
+    echo "[dev] starting PulseAudio"
+    run_as_audio_user pulseaudio --start --daemonize=yes --exit-idle-time=-1 > >(log_to_file_and_terminal "${log_file}") 2>&1 || true
 
     if ! wait_for_pulse_server; then
         echo "[dev] PulseAudio did not become ready" >&2
@@ -1365,7 +1371,7 @@ start_launcher() {
     prepare_dev_log_file "${launcher_log}"
     sleep 1
     if [[ "${HEADLESS_LAUNCHER}" == "xterm" ]]; then
-        DISPLAY="${DISPLAY}" xterm \
+        DISPLAY="${DISPLAY}" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" xterm \
             -display "${DISPLAY}" \
             -title "vibe_rdesk" \
             -fa "${XTERM_FONT_FAMILY}" \
@@ -1373,7 +1379,7 @@ start_launcher() {
             -geometry 120x30+40+40 \
             > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
     else
-        DISPLAY="${DISPLAY}" bash -lc "exec ${HEADLESS_LAUNCHER}" > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
+        DISPLAY="${DISPLAY}" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" bash -lc "exec ${HEADLESS_LAUNCHER}" > >(log_to_file_and_terminal "${launcher_log}") 2>&1 &
     fi
     LAUNCHER_PID=$!
 
@@ -1536,7 +1542,7 @@ sleep "${STARTUP_HELP_SECONDS}"
 ensure_tls_keys
 export VIBE_RDESK_TLS_CERT="${SSL_CERT}"
 export VIBE_RDESK_TLS_KEY="${SSL_KEY}"
-configure_sudo_audio_env
+configure_session_runtime_env
 ensure_dev_log_dir
 start_private_session_bus
 ensure_uinput_access

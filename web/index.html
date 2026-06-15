@@ -139,6 +139,14 @@
                 <span>Messages</span>
                 <button id="error-clear" class="secondary" type="button">Clear</button>
               </div>
+              <div class="message-tab-row" role="tablist" aria-label="Message type">
+                <button id="message-tab-error" class="message-tab-button is-active" type="button" role="tab" aria-selected="true" data-message-level="error">
+                  Errors <span id="message-error-count">0</span>
+                </button>
+                <button id="message-tab-info" class="message-tab-button secondary" type="button" role="tab" aria-selected="false" data-message-level="info">
+                  Info <span id="message-info-count">0</span>
+                </button>
+              </div>
               <div id="error-list" class="error-list"></div>
             </div>
           </details>
@@ -363,26 +371,26 @@
                       <span class="metric-label">Canvas Render</span>
                       <strong id="view-canvas-render-size" class="metric-value">--</strong>
                     </button>
-                    <div class="view-size-chip">
+                    <button id="view-canvas-css-action" class="view-size-chip" type="button">
                       <span class="metric-label">Canvas CSS</span>
                       <strong id="view-canvas-css-size" class="metric-value">--</strong>
-                    </div>
-                    <div class="view-size-chip">
+                    </button>
+                    <button id="view-remote-screen-action" class="view-size-chip" type="button">
                       <span class="metric-label">Remote Screen</span>
                       <strong id="view-remote-screen-size" class="metric-value">--</strong>
-                    </div>
-                    <div class="view-size-chip">
+                    </button>
+                    <button id="view-stream-action" class="view-size-chip" type="button">
                       <span class="metric-label">Stream</span>
                       <strong id="view-stream-size" class="metric-value">--</strong>
-                    </div>
+                    </button>
                     <button id="view-viewport-action" class="view-size-chip" type="button">
                       <span class="metric-label">Viewport</span>
                       <strong id="view-viewport-size" class="metric-value">--</strong>
                     </button>
-                    <div class="view-size-chip">
+                    <button id="view-window-action" class="view-size-chip" type="button">
                       <span class="metric-label">Window</span>
                       <strong id="view-window-size" class="metric-value">--</strong>
-                    </div>
+                    </button>
                   </div>
                 </div>
               </section>
@@ -411,11 +419,14 @@
                 </div>
               </section>
               <section id="tab-panel-performance" class="tab-panel" role="tabpanel" aria-labelledby="tab-button-performance" hidden>
-                <div class="performance-preset-row">
-                  <button id="performance-speed" class="is-active" type="button">Speed</button>
-                  <button id="performance-quality" class="secondary" type="button">Quality</button>
-                </div>
                 <div class="menu-grid">
+                  <label>Preset config
+                    <select id="performance-preset">
+                      <option value="speed">Speed</option>
+                      <option value="quality">Quality</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                  </label>
                   <div class="field-group">
                     <span class="field-label">Codec</span>
                     <div id="codec-group" class="radio-group" role="radiogroup" aria-label="Codec"></div>

@@ -137,6 +137,7 @@ fn role_name(role: SessionRole) -> &'static str {
         SessionRole::Video => "video",
         SessionRole::Audio => "audio",
         SessionRole::Mic => "mic",
+        SessionRole::Input => "input",
     }
 }
 
