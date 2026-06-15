@@ -56,6 +56,7 @@ const AUDIO_DRIFT_INTEGRAL_MAX = 0.03;
 const AUTO_DISCONNECT_DISABLED_MINUTES = 0;
 const AUTO_DISCONNECT_ACTIVITY_REFRESH_MS = 1000;
 const SETTINGS_RECONNECT_DELAY_MS = 3000;
+const CLIPBOARD_IMAGE_LIMIT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_CODEC_OPTIONS = [
   { value: "h264", label: "H.264" },
   { value: "h265", label: "H.265" },
@@ -979,31 +980,17 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
   markAppliedStreamSettings(applied);
 }
 
-function pushSharedStreamSettings(reason) {
+function reconnectWithCurrentStreamSettings(reason) {
   if (state.connecting) return;
   if (!isConnected()) return;
   clearSettingsReconnectTimer();
-  const settings = readSettingsFromControls();
-  send({
-    type: "update_stream_settings",
-    config: {
-      codec: settings.codec,
-      encode_preference: settings.encodePreference,
-      bitrate_kbps: settings.bitrate,
-      fps: settings.fps,
-      performance: {
-        encoder_latency: settings.encoderLatency,
-        encoder_quality: settings.encoderQuality,
-        gop_ms: settings.gopMs,
-        buffer_ms: settings.bufferMs,
-        scale: settings.videoScale,
-      },
-    },
-    audio_config: {
-      bitrate_kbps: settings.audioBitrateKbps,
-    },
-  });
-  setStatus(reason, { hideAfterMs: 3000 });
+  state.pendingStreamSettingsKey = streamReconnectSettingsKey();
+  closeConnection({ manual: false, preserveStatus: true, keepCameraEnabled: true });
+  setStatus(reason);
+  setTimeout(() => {
+    if (state.connecting || isConnected()) return;
+    void connect();
+  }, 150);
 }
 
 function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
@@ -1026,7 +1013,7 @@ function maybeScheduleSettingsReconnect(settings = readSettingsFromControls()) {
     if (!isConnected() || state.connecting) return;
     const latestSettings = readSettingsFromControls();
     if (streamReconnectSettingsKey(latestSettings) === state.appliedStreamSettingsKey) return;
-    pushSharedStreamSettings("Applying shared stream settings...");
+    reconnectWithCurrentStreamSettings("Reconnecting with stream settings...");
   }, SETTINGS_RECONNECT_DELAY_MS);
 }
 
@@ -2434,7 +2421,7 @@ async function connect() {
       audio.openPromise,
       mic.openPromise,
     ]);
-    state.appliedStreamSettingsKey = "";
+    markAppliedStreamSettings(settings);
     state.reconnectAttempt = 0;
     state.reconnectingForLatency = false;
     state.highLatencySinceAt = 0;
@@ -2476,7 +2463,7 @@ async function connect() {
   }
 }
 
-function closeConnection({ manual = true, preserveStatus = false } = {}) {
+function closeConnection({ manual = true, preserveStatus = false, keepCameraEnabled = false } = {}) {
   state.manualDisconnect = manual;
   clearReconnectTimer();
   clearSettingsReconnectTimer();
@@ -2497,7 +2484,7 @@ function closeConnection({ manual = true, preserveStatus = false } = {}) {
   }
   stopRemoteClipboardPolling();
   stopMicrophoneCapture();
-  void stopCameraCapture({ notifyServer: true, keepEnabled: false });
+  void stopCameraCapture({ notifyServer: true, keepEnabled: keepCameraEnabled });
   clearPendingPointerMotion();
   cancelVideoFrameRender();
   clearPendingVideoFrame();
@@ -5241,7 +5228,11 @@ async function readLocalClipboard() {
   for (const item of items) {
     if (!payload.image_png_b64 && item.types.includes("image/png")) {
       const blob = await item.getType("image/png");
-      payload.image_png_b64 = await blobToBase64(blob);
+      if (blob.size > CLIPBOARD_IMAGE_LIMIT_BYTES) {
+        showToast("clipboard_image_too_large", "Clipboard image is too large to paste remotely");
+      } else {
+        payload.image_png_b64 = await blobToBase64(blob);
+      }
     }
     if (!payload.text) {
       const textType = item.types.find((type) => type.startsWith("text/plain"));

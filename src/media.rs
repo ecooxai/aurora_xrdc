@@ -163,10 +163,8 @@ impl VideoHub {
     async fn acquire(self: &Arc<Self>, requested: StreamConfig) -> Result<VideoLease> {
         let rx = self.frames.subscribe();
         let mut runtime = self.runtime.lock().await;
-        if !runtime.configured {
-            runtime.desired_config = requested;
-            runtime.configured = true;
-        }
+        runtime.desired_config = requested;
+        runtime.configured = true;
         runtime.subscribers += 1;
         if let Err(err) = self.ensure_active(&mut runtime).await {
             runtime.subscribers = runtime.subscribers.saturating_sub(1);
@@ -356,10 +354,8 @@ impl VideoHub {
 impl AudioHub {
     async fn acquire(self: &Arc<Self>, requested: AudioStreamConfig) -> Result<AudioLease> {
         let mut runtime = self.runtime.lock().await;
-        if !runtime.configured {
-            runtime.desired_config = requested;
-            runtime.configured = true;
-        }
+        runtime.desired_config = requested;
+        runtime.configured = true;
         runtime.subscribers += 1;
         if let Err(err) = self.ensure_active(&mut runtime).await {
             runtime.subscribers = runtime.subscribers.saturating_sub(1);

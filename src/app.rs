@@ -48,6 +48,7 @@ const SERVICE_WORKER_JS: &str = include_str!("../web/sw.js");
 const ICON_SVG: &str = include_str!("../web/icon.svg");
 const ICON_192_PNG: &[u8] = include_bytes!("../web/icon-192.png");
 const ICON_512_PNG: &[u8] = include_bytes!("../web/icon-512.png");
+const WS_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -727,7 +728,9 @@ async fn ws(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let lease = state.clients.register(client_id, peer_addr, role).await;
     let close_rx = lease.close_rx.clone();
-    ws.on_upgrade(move |socket| async move {
+    ws.max_message_size(WS_MAX_MESSAGE_SIZE)
+        .max_frame_size(WS_MAX_MESSAGE_SIZE)
+        .on_upgrade(move |socket| async move {
         let _lease = lease;
         if let Err(err) = session::handle_socket(
             socket,

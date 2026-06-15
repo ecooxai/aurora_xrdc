@@ -64,6 +64,7 @@ XVFB_PID=""
 LAUNCHER_PID=""
 PULSE_PID=""
 PIPEWIRE_LOOPBACK_PID=""
+DBUS_PID=""
 
 APP_ARGS=()
 
@@ -581,8 +582,33 @@ using_sudo_audio_user() {
     [[ "$(id -u)" -eq 0 && -n "${SUDO_AUDIO_USER}" && -n "${SUDO_AUDIO_UID}" && "${SUDO_AUDIO_UID}" != "0" ]]
 }
 
+command_needs_appimage_library_path() {
+    [[ -n "${APPDIR:-}" ]] || return 1
+
+    local arg base resolved
+    for arg in "$@"; do
+        [[ -n "${arg}" ]] || continue
+        base="${arg##*/}"
+        case "${base}" in
+            Xvfb|dbus-daemon|dbus-launch|dbus-send|ip|modprobe|openssl|pactl|pipewire|pipewire-pulse|pulseaudio|pw-cli|pw-loopback|timeout|udevadm|wireplumber|wpctl|xclip|xdotool|xdpyinfo|xset|xterm)
+                if [[ "${arg}" == */* ]]; then
+                    resolved="${arg}"
+                else
+                    resolved="$(command -v "${arg}" 2>/dev/null || true)"
+                fi
+                if [[ -n "${resolved}" && "${resolved}" == "${APPDIR}/"* ]]; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+
+    return 1
+}
+
 run_as_audio_user() {
     local -a env_args=()
+    local -a unset_env_args=()
 
     if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
         env_args+=("XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}")
@@ -596,13 +622,67 @@ run_as_audio_user() {
     if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
         env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
     fi
+    if [[ -n "${APPDIR:-}" ]] && ! command_needs_appimage_library_path "$@"; then
+        if [[ -n "${VIBE_RDESK_HOST_LD_LIBRARY_PATH+x}" ]]; then
+            env_args+=("LD_LIBRARY_PATH=${VIBE_RDESK_HOST_LD_LIBRARY_PATH}")
+        else
+            unset_env_args+=("-u" "LD_LIBRARY_PATH")
+        fi
+    elif [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        env_args+=("LD_LIBRARY_PATH=${LD_LIBRARY_PATH}")
+    fi
 
     if using_sudo_audio_user && command -v runuser >/dev/null 2>&1; then
-        runuser -u "${SUDO_AUDIO_USER}" -- env "${env_args[@]}" "$@"
+        runuser -u "${SUDO_AUDIO_USER}" -- env "${unset_env_args[@]}" "${env_args[@]}" "$@"
         return $?
     fi
 
-    env "${env_args[@]}" "$@"
+    env "${unset_env_args[@]}" "${env_args[@]}" "$@"
+}
+
+session_bus_available() {
+    [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] || return 1
+    timeout 1s dbus-send \
+        --session \
+        --type=method_call \
+        --dest=org.freedesktop.DBus \
+        / \
+        org.freedesktop.DBus.ListNames >/dev/null 2>&1
+}
+
+start_private_session_bus() {
+    if session_bus_available; then
+        return 0
+    fi
+    command -v dbus-daemon >/dev/null 2>&1 || return 0
+
+    local dbus_dir="${DEV_LOG_DIR}/dbus-$$"
+    local dbus_socket="${dbus_dir}/session-bus"
+    local dbus_output=""
+    local dbus_address=""
+    local dbus_pid=""
+
+    mkdir -p "${dbus_dir}"
+    chmod 700 "${dbus_dir}" 2>/dev/null || true
+
+    if ! dbus_output="$(dbus-daemon \
+        --session \
+        --fork \
+        --nopidfile \
+        --address="unix:path=${dbus_socket}" \
+        --print-address=1 \
+        --print-pid=1 2>"${DEV_LOG_DIR}/dbus.log")"; then
+        echo "[dev] private D-Bus session bus did not start; see ${DEV_LOG_DIR}/dbus.log" >&2
+        return 0
+    fi
+
+    dbus_address="$(printf '%s\n' "${dbus_output}" | sed -n '1p')"
+    dbus_pid="$(printf '%s\n' "${dbus_output}" | sed -n '2p')"
+    if [[ -n "${dbus_address}" && "${dbus_pid}" =~ ^[0-9]+$ ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="${dbus_address}"
+        DBUS_PID="${dbus_pid}"
+        echo "[dev] started private D-Bus session bus"
+    fi
 }
 
 ensure_dev_log_dir() {
@@ -647,7 +727,7 @@ source_exists() {
         return 1
     fi
 
-    pactl list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "${source_name}"
+    run_as_audio_user timeout 1s pactl list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "${source_name}"
 }
 
 sink_exists() {
@@ -656,7 +736,7 @@ sink_exists() {
         return 1
     fi
 
-    pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "${sink_name}"
+    run_as_audio_user timeout 1s pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "${sink_name}"
 }
 
 pulse_device_by_description() {
@@ -669,7 +749,7 @@ pulse_device_by_description() {
         *) return 1 ;;
     esac
 
-    name="$(run_as_audio_user pactl list "${command_kind}" 2>/dev/null | awk -v description="${description}" '
+    name="$(run_as_audio_user timeout 1s pactl list "${command_kind}" 2>/dev/null | awk -v description="${description}" '
         /^[[:space:]]*Name:/ {
             current_name = $2
             next
@@ -925,23 +1005,93 @@ wait_for_source() {
 }
 
 wait_for_pulse_server() {
-    local attempts=20
+    local attempts="${1:-10}"
 
     while (( attempts > 0 )); do
-        if pactl info >/dev/null 2>&1; then
+        if run_as_audio_user timeout 0.5s pactl info >/dev/null 2>&1; then
             return 0
         fi
-        sleep 0.25
+        sleep 0.2
         ((attempts--))
     done
 
     return 1
 }
 
+start_private_pulse_server() {
+    local pulse_dir="${DEV_LOG_DIR}/pulse-$$"
+    local pulse_socket="${pulse_dir}/native"
+    local log_file="${DEV_LOG_DIR}/pulseaudio-private.log"
+    local pulse_module_dir=""
+    local pulse_module_args=()
+
+    prepare_dev_log_file "${log_file}"
+    mkdir -p "${pulse_dir}"
+    chmod 700 "${pulse_dir}" 2>/dev/null || true
+    if using_sudo_audio_user; then
+        chown -R "${SUDO_AUDIO_USER}:" "${pulse_dir}" 2>/dev/null || true
+    fi
+
+    export PULSE_SERVER="unix:${pulse_socket}"
+    if [[ -n "${APPDIR:-}" ]]; then
+        for dir in "${APPDIR}"/usr/lib/pulse-*/modules "${APPDIR}"/usr/lib/*/pulse-*/modules; do
+            if [[ -d "${dir}" ]]; then
+                pulse_module_dir="${dir}"
+                break
+            fi
+        done
+    fi
+    if [[ -n "${pulse_module_dir}" ]]; then
+        pulse_module_args=(--dl-search-path="${pulse_module_dir}")
+    fi
+    echo "[dev] starting private PulseAudio server at ${pulse_socket}"
+    local saved_dbus_session_bus_address="${DBUS_SESSION_BUS_ADDRESS-}"
+    local saved_ld_library_path="${LD_LIBRARY_PATH-}"
+    export DBUS_SESSION_BUS_ADDRESS="unix:path=${pulse_dir}/dbus-disabled"
+    if [[ -n "${pulse_module_dir}" ]]; then
+        export LD_LIBRARY_PATH="${pulse_module_dir}:${LD_LIBRARY_PATH:-}"
+    fi
+    run_as_audio_user pulseaudio \
+        "${pulse_module_args[@]}" \
+        -n \
+        --daemonize=no \
+        --exit-idle-time=-1 \
+        --disallow-exit=yes \
+        --use-pid-file=no \
+        --log-target=stderr \
+        --load="module-native-protocol-unix socket=${pulse_socket} auth-anonymous=1" \
+        --load="module-null-sink sink_name=${VIRTUAL_AUDIO_SINK_NAME} sink_properties=device.description=VibeRDesk" \
+        --load="module-null-sink sink_name=${VIRTUAL_MIC_SINK_NAME} sink_properties=device.description=VibeRDeskVirtualMicSink" \
+        > >(log_to_file_and_terminal "${log_file}") 2>&1 &
+    PULSE_PID=$!
+    if [[ -n "${saved_dbus_session_bus_address}" ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="${saved_dbus_session_bus_address}"
+    else
+        unset DBUS_SESSION_BUS_ADDRESS
+    fi
+    if [[ -n "${saved_ld_library_path}" ]]; then
+        export LD_LIBRARY_PATH="${saved_ld_library_path}"
+    else
+        unset LD_LIBRARY_PATH
+    fi
+
+    if wait_for_pulse_server; then
+        return 0
+    fi
+
+    echo "[dev] private PulseAudio did not become ready; see ${log_file}" >&2
+    return 1
+}
+
 start_pulse_server() {
-    if pactl info >/dev/null 2>&1; then
+    if run_as_audio_user timeout 1s pactl info >/dev/null 2>&1; then
         echo "[dev] using existing PulseAudio server"
         return 0
+    fi
+
+    if [[ -n "${APPDIR:-}" ]]; then
+        start_private_pulse_server
+        return $?
     fi
 
     if command -v dbus-launch >/dev/null 2>&1; then
@@ -957,7 +1107,8 @@ start_pulse_server() {
 
     if ! wait_for_pulse_server; then
         echo "[dev] PulseAudio did not become ready" >&2
-        return 1
+        start_private_pulse_server
+        return $?
     fi
 }
 
@@ -978,7 +1129,7 @@ start_pipewire_server() {
 }
 
 pipewire_uses_pulse_server() {
-    pactl info 2>/dev/null | grep -Fq 'Server Name: PulseAudio (on PipeWire'
+    run_as_audio_user timeout 1s pactl info 2>/dev/null | grep -Fq 'Server Name: PulseAudio (on PipeWire'
 }
 
 start_audio_server() {
@@ -1330,6 +1481,11 @@ cleanup() {
         kill "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null || true
         wait "${PIPEWIRE_LOOPBACK_PID}" 2>/dev/null || true
     fi
+
+    if [[ -n "${DBUS_PID}" ]] && kill -0 "${DBUS_PID}" 2>/dev/null; then
+        kill "${DBUS_PID}" 2>/dev/null || true
+        wait "${DBUS_PID}" 2>/dev/null || true
+    fi
 }
 
 build_and_run() {
@@ -1350,7 +1506,7 @@ build_and_run() {
     fi
 
     echo "[dev] starting app..."
-    cargo run -- "$@" &
+    target/debug/vibe_rdesk "$@" &
     APP_PID=$!
     show_server_access_urls "https"
 }
@@ -1382,6 +1538,7 @@ export VIBE_RDESK_TLS_CERT="${SSL_CERT}"
 export VIBE_RDESK_TLS_KEY="${SSL_KEY}"
 configure_sudo_audio_env
 ensure_dev_log_dir
+start_private_session_bus
 ensure_uinput_access
 ensure_display
 configure_virtual_audio_sink_env

@@ -1409,7 +1409,16 @@ async fn apply_client_message(
             run_xdotool(display, ["key", "ctrl+v"]).await?;
         }
         ClientMessage::PasteClipboard { payload } => {
-            write_remote_clipboard(display, &payload).await?;
+            if let Err(err) = write_remote_clipboard(display, &payload).await {
+                warn!("failed to write paste clipboard payload: {err}");
+                send_runtime_error(
+                    sender,
+                    "clipboard_write_failed",
+                    format!("Clipboard paste failed on the server: {err}"),
+                )
+                .await;
+                return Ok(());
+            }
             tokio::time::sleep(Duration::from_millis(80)).await;
             sender
                 .send(Message::Text(
@@ -1448,7 +1457,16 @@ async fn apply_client_message(
                 .await?;
         }
         ClientMessage::ClipboardSet { payload } => {
-            write_remote_clipboard(display, &payload).await?;
+            if let Err(err) = write_remote_clipboard(display, &payload).await {
+                warn!("failed to write clipboard payload: {err}");
+                send_runtime_error(
+                    sender,
+                    "clipboard_write_failed",
+                    format!("Clipboard write failed on the server: {err}"),
+                )
+                .await;
+                return Ok(());
+            }
             sender
                 .send(Message::Text(
                     serde_json::to_string(&ServerMessage::Clipboard {
@@ -1460,7 +1478,15 @@ async fn apply_client_message(
                 .await?;
         }
         ClientMessage::ClipboardGet => {
-            send_clipboard_update(display, sender).await?;
+            if let Err(err) = send_clipboard_update(display, sender).await {
+                warn!("failed to read remote clipboard: {err}");
+                send_runtime_error(
+                    sender,
+                    "clipboard_read_failed",
+                    format!("Clipboard read failed on the server: {err}"),
+                )
+                .await;
+            }
         }
     }
     Ok(())

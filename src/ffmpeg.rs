@@ -1067,6 +1067,7 @@ fn permission_denied_stderr(stderr: &[u8]) -> bool {
 
 pub async fn spawn_mic_input_injector(server: &ServerConfig) -> Result<MicInputHandle> {
     ensure_virtual_mic_source().await?;
+    let mic_sink_name = virtual_mic_sink_name();
     let mut cmd = Command::new("ffmpeg");
     cmd.env("DISPLAY", &server.display)
         .args([
@@ -1074,8 +1075,6 @@ pub async fn spawn_mic_input_injector(server: &ServerConfig) -> Result<MicInputH
             "error",
             "-fflags",
             "nobuffer",
-            "-avioflags",
-            "direct",
             "-probesize",
             "32",
             "-analyzeduration",
@@ -1103,7 +1102,7 @@ pub async fn spawn_mic_input_injector(server: &ServerConfig) -> Result<MicInputH
             "-minreq",
             "0",
             "-device",
-            VIRTUAL_MIC_SINK_NAME,
+            &mic_sink_name,
             "-stream_name",
             "VibeRDesk Mic Input",
             "vibe_rdesk_mic_input",
@@ -1449,7 +1448,15 @@ async fn ensure_virtual_sink_exists(server: &ServerConfig) -> Result<(String, St
 fn is_project_virtual_sink(sink_name: &str, virtual_sink: &str) -> bool {
     sink_name == virtual_sink
         || sink_name == VIRTUAL_MIC_SINK_NAME
+        || sink_name == virtual_mic_sink_name()
         || sink_name.starts_with("vibe_rdesk_")
+}
+
+fn virtual_mic_sink_name() -> String {
+    std::env::var("VIBE_RDESK_VIRTUAL_MIC_SINK_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| VIRTUAL_MIC_SINK_NAME.into())
 }
 
 async fn ensure_virtual_mic_source() -> Result<String> {
@@ -1462,7 +1469,7 @@ async fn ensure_virtual_mic_source() -> Result<String> {
         return Ok(existing_source);
     }
 
-    let mut mic_sink_name = VIRTUAL_MIC_SINK_NAME.to_string();
+    let mut mic_sink_name = virtual_mic_sink_name();
     if !sink_exists(&mic_sink_name).await? {
         if let Some(existing_sink) =
             pulse_device_by_description("sinks", "VibeRDeskVirtualMicSink").await?
@@ -1472,11 +1479,11 @@ async fn ensure_virtual_mic_source() -> Result<String> {
         pactl([
             "load-module",
             "module-null-sink",
-            &format!("sink_name={VIRTUAL_MIC_SINK_NAME}"),
+            &format!("sink_name={mic_sink_name}"),
             "sink_properties=device.description=VibeRDeskVirtualMicSink",
         ])
         .await?;
-        wait_for_sink(VIRTUAL_MIC_SINK_NAME).await?;
+        wait_for_sink(&mic_sink_name).await?;
         }
     }
     if !source_exists(VIRTUAL_MIC_SOURCE_NAME).await? {
