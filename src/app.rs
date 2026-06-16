@@ -896,7 +896,7 @@ async fn handle_wt_incoming(state: Arc<AppState>, incoming: IncomingSession) -> 
     let close_rx = lease.close_rx.clone();
 
     let (send, recv) = connection.accept_bi().await?;
-    let (sink, stream) = webtransport::wire_from_bi(send, recv);
+    let (sink, stream) = webtransport::wire_from_bi(connection, send, recv);
 
     let _lease = lease;
     session::handle_socket(

@@ -117,7 +117,7 @@ async fn handle_combined_socket(
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
-    maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
+    maybe_wake_display(&server.display, &mut initial_display_wake_at);
     let mut video_stream = media.acquire_video(config.clone()).await?;
     let mut audio_stream = match media.acquire_audio(audio_config).await {
         Ok(stream) => Some(stream),
@@ -244,7 +244,7 @@ async fn handle_control_socket(
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
-    maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
+    maybe_wake_display(&server.display, &mut initial_display_wake_at);
     let (ws_sender, receiver) = (sink, stream);
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -1016,8 +1016,7 @@ async fn handle_client(
                                 receiver_closed
                             } else {
                                 if should_wake_display_for_message(&client) {
-                                    maybe_wake_display(&server.display, &mut last_display_wake_at)
-                                        .await;
+                                    maybe_wake_display(&server.display, &mut last_display_wake_at);
                                 }
                                 apply_client_message(
                                     &server.display,
@@ -1176,12 +1175,14 @@ fn wheel_clicks_for_delta(
         &mut accumulator.x_last_at,
         &mut accumulator.x_last_sign,
         x_steps,
+        true,
     );
     let vertical_steps = accumulate_wheel_steps(
         &mut accumulator.y_steps,
         &mut accumulator.y_last_at,
         &mut accumulator.y_last_sign,
         y_steps,
+        true,
     );
     let mut clicks = Vec::with_capacity(2);
     if horizontal_steps < 0 {
@@ -1216,12 +1217,14 @@ fn smooth_wheel_units_for_delta(
         &mut accumulator.x_last_at,
         &mut accumulator.x_last_sign,
         x_units,
+        false,
     );
     let vertical_units = accumulate_wheel_steps(
         &mut accumulator.y_steps,
         &mut accumulator.y_last_at,
         &mut accumulator.y_last_sign,
         y_units,
+        false,
     );
     (horizontal_units, -vertical_units)
 }
@@ -1281,6 +1284,7 @@ fn accumulate_wheel_steps(
     last_at: &mut Option<Instant>,
     last_sign: &mut i8,
     delta_steps: f64,
+    kick_start: bool,
 ) -> i32 {
     if !delta_steps.is_finite() || delta_steps == 0.0 {
         return 0;
@@ -1296,11 +1300,21 @@ fn accumulate_wheel_steps(
     *last_at = Some(now);
     *last_sign = sign;
     *remainder += delta_steps;
-    let whole_steps = if *remainder >= 0.0 {
+    let mut whole_steps = if *remainder >= 0.0 {
         remainder.floor()
     } else {
         remainder.ceil()
     };
+    // On a fresh gesture (the pointer has been idle), emit at least one step in
+    // the scroll direction right away instead of swallowing the first event
+    // while the sub-step remainder fills up. This keeps coarse XTEST wheel
+    // clicks (headless X11) responsive: the first notch moves immediately. The
+    // borrowed fraction is repaid against the next event so the overall scroll
+    // rate is unchanged. Only the discrete-click path opts in; the high-res
+    // uinput path already moves on every event.
+    if kick_start && idle && whole_steps == 0.0 {
+        whole_steps = sign as f64;
+    }
     *remainder -= whole_steps;
     whole_steps as i32
 }
@@ -1331,16 +1345,24 @@ async fn apply_wheel_clicks(
     run_xdotool(display, &args).await
 }
 
-async fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
+fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
     if let Some(last_wake_at) = last_wake_at {
         if last_wake_at.elapsed() < DISPLAY_WAKE_INTERVAL {
             return;
         }
     }
-    match wake_display(display).await {
-        Ok(()) => *last_wake_at = Some(Instant::now()),
-        Err(err) => warn!("display wake failed: {err}"),
-    }
+    // Wake the display in the background. `wake_display` spawns `xset`/`dbus-send`
+    // processes and sleeps between retries (~150ms); awaiting it here would stall
+    // the serial input loop, blocking pointer-move and key events queued behind a
+    // scroll or click burst. Mark the attempt optimistically so it stays
+    // rate-limited regardless of the spawned task's outcome.
+    *last_wake_at = Some(Instant::now());
+    let display = display.to_owned();
+    tokio::spawn(async move {
+        if let Err(err) = wake_display(&display).await {
+            warn!("display wake failed: {err}");
+        }
+    });
 }
 
 async fn apply_client_message(
@@ -1401,7 +1423,12 @@ async fn apply_client_message(
                     delta_mode,
                     scroll_speed,
                 );
-                apply_wheel_clicks(display, None, &clicks).await?;
+                // Prefer the persistent XTEST connection (headless X11). Spawning
+                // an `xdotool` process per wheel event takes tens of milliseconds
+                // and, because this receive loop is serial, stalls the pointer-move
+                // and key messages queued behind it — input appears frozen while
+                // scrolling. Only fall back to xdotool when no injector exists.
+                apply_wheel_clicks(display, input_injector, &clicks).await?;
             }
         }
         ClientMessage::TouchTap => {
@@ -2027,24 +2054,28 @@ mod tests {
     }
 
     #[test]
-    fn pixel_wheel_deltas_accumulate_until_a_full_step() {
+    fn pixel_wheel_deltas_emit_first_notch_immediately_then_amortize() {
         let mut accumulator = WheelAccumulator::default();
-        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 12.0, Some(0), Some(1.0)).is_empty());
+        // A fresh gesture moves on the very first event (kick-start) instead of
+        // swallowing it while the sub-step remainder fills up.
         assert_eq!(
             wheel_clicks_for_delta(&mut accumulator, 0.0, 12.0, Some(0), Some(1.0)),
             vec![(5, 1)]
         );
+        // The borrowed fraction is repaid, so the overall rate is unchanged: a
+        // second half-step event produces nothing.
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 12.0, Some(0), Some(1.0)).is_empty());
     }
 
     #[test]
-    fn large_pixel_wheel_delta_emits_half_step_for_webclient() {
+    fn large_pixel_wheel_delta_emits_first_notch_immediately_for_webclient() {
         let mut accumulator = WheelAccumulator::default();
-        assert!(
-            wheel_clicks_for_delta(&mut accumulator, 0.0, 100.0, Some(0), Some(1.0)).is_empty()
-        );
         assert_eq!(
             wheel_clicks_for_delta(&mut accumulator, 0.0, 100.0, Some(0), Some(1.0)),
             vec![(5, 1)]
+        );
+        assert!(
+            wheel_clicks_for_delta(&mut accumulator, 0.0, 100.0, Some(0), Some(1.0)).is_empty()
         );
     }
 
@@ -2070,11 +2101,14 @@ mod tests {
     #[test]
     fn wheel_supports_horizontal_axis() {
         let mut accumulator = WheelAccumulator::default();
-        assert!(wheel_clicks_for_delta(&mut accumulator, 12.0, 0.0, Some(0), Some(1.0)).is_empty());
+        // Fresh gesture kicks the first notch right away.
         assert_eq!(
             wheel_clicks_for_delta(&mut accumulator, 12.0, 0.0, Some(0), Some(1.0)),
             vec![(7, 1)]
         );
+        assert!(wheel_clicks_for_delta(&mut accumulator, 12.0, 0.0, Some(0), Some(1.0)).is_empty());
+        // Reversing direction mid-gesture is not a fresh (idle) start, so it
+        // accumulates a full step before emitting.
         assert!(
             wheel_clicks_for_delta(&mut accumulator, -12.0, 0.0, Some(0), Some(1.0)).is_empty()
         );
@@ -2087,11 +2121,14 @@ mod tests {
     #[test]
     fn wheel_direction_change_drops_substep_remainder() {
         let mut accumulator = WheelAccumulator::default();
-        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 24.0, Some(0), Some(1.0)).is_empty());
+        // First event of the gesture moves immediately.
         assert_eq!(
             wheel_clicks_for_delta(&mut accumulator, 0.0, 24.0, Some(0), Some(1.0)),
             vec![(5, 1)]
         );
+        assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, 24.0, Some(0), Some(1.0)).is_empty());
+        // Reversing drops the leftover positive remainder, so the opposite
+        // direction must accumulate a full step on its own.
         assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, -6.0, Some(0), Some(1.0)).is_empty());
         assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, -6.0, Some(0), Some(1.0)).is_empty());
         assert!(wheel_clicks_for_delta(&mut accumulator, 0.0, -6.0, Some(0), Some(1.0)).is_empty());

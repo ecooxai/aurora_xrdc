@@ -2353,9 +2353,48 @@ function base64ToBytes(value) {
   return bytes;
 }
 
+// Reads the first 5 bytes (frame header) spread across a queue of chunks and
+// returns the big-endian u32 payload length at offset 1. Assumes >= 5 bytes are
+// buffered across `chunks`.
+function peekFrameLength(chunks) {
+  const header = new Uint8Array(5);
+  let filled = 0;
+  for (let c = 0; c < chunks.length && filled < 5; c += 1) {
+    const chunk = chunks[c];
+    const take = Math.min(5 - filled, chunk.length);
+    header.set(chunk.subarray(0, take), filled);
+    filled += take;
+  }
+  return ((header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4]) >>> 0;
+}
+
+// Removes and returns the first `count` bytes from a queue of chunks, splitting
+// the boundary chunk in place. Each byte is copied at most once, so a frame that
+// spans many QUIC packets costs O(frame) rather than O(frame²) to assemble.
+function takeBytes(chunks, count) {
+  const out = new Uint8Array(count);
+  let filled = 0;
+  while (filled < count) {
+    const chunk = chunks[0];
+    const remaining = count - filled;
+    if (chunk.length <= remaining) {
+      out.set(chunk, filled);
+      filled += chunk.length;
+      chunks.shift();
+    } else {
+      out.set(chunk.subarray(0, remaining), filled);
+      chunks[0] = chunk.subarray(remaining);
+      filled += remaining;
+    }
+  }
+  return out;
+}
+
 // A drop-in replacement for the parts of the WebSocket API the client uses,
-// backed by a single WebTransport bidirectional stream. Messages are framed as
-// [u8 kind][u32be length][payload]; kind 0 = binary, 1 = text, 2 = close.
+// backed by a WebTransport session: a bidirectional stream carries control and
+// input traffic while a server-initiated unidirectional stream carries video.
+// Messages are framed as [u8 kind][u32be length][payload]; kind 0 = binary,
+// 1 = text, 2 = close.
 class WtSocket {
   constructor(url, { certHashes } = {}) {
     this.url = url;
@@ -2394,6 +2433,9 @@ class WtSocket {
       const stream = await transport.createBidirectionalStream();
       this._writer = stream.writable.getWriter();
       this._readLoop(stream.readable.getReader());
+      // Video is delivered on a dedicated server-initiated unidirectional
+      // stream (see webtransport.rs): start accepting those in parallel.
+      this._acceptUniStreams();
       this.readyState = 1; // OPEN
       // Browsers don't expose a freshly opened bidirectional stream to the
       // server until the client writes to it. Send a no-op frame immediately so
@@ -2419,6 +2461,67 @@ class WtSocket {
       this._handleClosed(1000, "stream finished");
     } catch (err) {
       this._handleClosed(1006, String(err?.message || err));
+    }
+  }
+
+  // Accepts server-initiated unidirectional streams. The server carries video on
+  // its own stream so a congested video backlog never head-of-line-blocks the
+  // control/input traffic on the bidirectional stream. Each stream is a flow of
+  // length-prefixed binary frames identical to the bidirectional framing.
+  async _acceptUniStreams() {
+    const incoming = this._transport?.incomingUnidirectionalStreams;
+    if (!incoming) return;
+    let reader;
+    try {
+      reader = incoming.getReader();
+    } catch {
+      return;
+    }
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) this._readUniStream(value);
+      }
+    } catch {
+      // Transport closed; the bidirectional read loop reports the closure.
+    }
+  }
+
+  // Reads one unidirectional (video) stream, dispatching each complete
+  // [u8 kind][u32be length][payload] frame's payload as a binary message. The
+  // kind byte is always binary on this stream. Chunks are held in a queue and
+  // each byte is copied at most once even when a frame spans many QUIC packets.
+  async _readUniStream(readable) {
+    let reader;
+    try {
+      reader = readable.getReader();
+    } catch {
+      return;
+    }
+    const chunks = [];
+    let buffered = 0;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value || !value.length) continue;
+        chunks.push(value);
+        buffered += value.length;
+        for (;;) {
+          if (buffered < 5) break;
+          const length = peekFrameLength(chunks);
+          const frameLength = 5 + length;
+          if (buffered < frameLength) break;
+          const frame = takeBytes(chunks, frameLength);
+          buffered -= frameLength;
+          const payload = frame.subarray(5);
+          if (this.onmessage) this.onmessage({ data: payload.slice().buffer, target: this });
+        }
+      }
+    } catch {
+      // Stream reset (the server abandoned a superseded frame) or transport
+      // closed: drop any partial frame and move on.
     }
   }
 
@@ -5313,8 +5416,12 @@ function handleSmartTouchMove(event, previous) {
   clearSmartTouchTimers();
   state.smartTouchAction = "scroll";
   if (state.smartTouchScrollLastX === null || state.smartTouchScrollLastY === null) {
-    state.smartTouchScrollLastX = previous.clientX;
-    state.smartTouchScrollLastY = previous.clientY;
+    // Anchor at the gesture's start point (not the previous event) so the
+    // travel that crossed the move threshold is scrolled too — the screen
+    // reacts the moment the finger starts moving instead of dropping the
+    // first few millimetres of the swipe.
+    state.smartTouchScrollLastX = touch.startX;
+    state.smartTouchScrollLastY = touch.startY;
   }
   sendWheelDelta(
     (state.smartTouchScrollLastX - event.clientX) * SMART_TOUCH_SCROLL_MULTIPLIER,
@@ -5412,7 +5519,12 @@ function handleTouchPointerMove(event) {
         return;
       }
       clearTouchLongPress();
-      sendWheelDelta(0, (previous.clientY - event.clientY) * DIRECT_TOUCH_SCROLL_MULTIPLIER, 0);
+      // On the first scroll event, measure from where the finger first touched
+      // down so the travel that crossed the threshold scrolls immediately;
+      // afterwards track frame-to-frame movement.
+      const fromY = touch.scrolling ? previous.clientY : touch.startY;
+      touch.scrolling = true;
+      sendWheelDelta(0, (fromY - event.clientY) * DIRECT_TOUCH_SCROLL_MULTIPLIER, 0);
     } else {
       const point = pointerToCanvas(event);
       if (point) queuePointerMove(point.x, point.y);

@@ -2,24 +2,49 @@
 //!
 //! This mirrors the WebSocket `/ws` endpoint: the browser opens one
 //! WebTransport session per role, carrying the exact same query parameters in
-//! the request path. Each session uses a single bidirectional QUIC stream whose
-//! byte flow is framed into the same [`axum::extract::ws::Message`] values the
-//! WebSocket path produces, so the existing session handlers are reused verbatim.
+//! the request path.
+//!
+//! Control traffic (the JSON hello/stats/pong messages and inbound pointer/key
+//! events) rides a single bidirectional QUIC stream, framed into the same
+//! [`axum::extract::ws::Message`] values the WebSocket path produces, so the
+//! existing session handlers are reused verbatim.
+//!
+//! Video, however, does **not** share that bidirectional stream. Encoded video
+//! frames are pushed onto a dedicated *unidirectional* stream through a
+//! coalescing queue ([`VideoQueue`]). Two properties of that queue are what make
+//! WebTransport video low-latency:
+//!
+//! * **Always the freshest decode point.** Whenever a new keyframe is enqueued,
+//!   every frame queued before it is dropped — those frames are superseded by a
+//!   newer independent decode point, so forwarding them would only add latency.
+//!   Frames *between* keyframes are kept in order so the delta chain stays
+//!   decodable. The client therefore always advances toward the newest frame the
+//!   network can carry instead of grinding through a stale backlog.
+//! * **No head-of-line blocking against control.** Because video lives on its
+//!   own stream, a congested video backlog never stalls the hello/stats/input
+//!   messages on the bidirectional stream (and vice versa).
 
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::{net::SocketAddr, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Error, Result, anyhow};
 use axum::extract::ws::Message;
 use base64::Engine;
 use bytes::Bytes;
-use futures_util::{SinkExt, stream};
+use futures_util::{Sink, SinkExt, stream};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::PollSender;
 use tracing::warn;
+use wtransport::config::QuicTransportConfig;
 use wtransport::endpoint::endpoint_side::Server;
 use wtransport::error::StreamReadExactError;
-use wtransport::{Endpoint, Identity, RecvStream, SendStream, ServerConfig};
+use wtransport::quinn::VarInt;
+use wtransport::quinn::congestion::BbrConfig;
+use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig};
 
 use crate::transport::{WireSink, WireStream};
 
@@ -27,7 +52,7 @@ use crate::transport::{WireSink, WireStream};
 pub type WtEndpoint = Endpoint<Server>;
 
 // Frame kinds for the length-prefixed message framing carried on the QUIC
-// bidirectional stream. Layout: [u8 kind][u32 big-endian length][payload].
+// streams. Layout: [u8 kind][u32 big-endian length][payload].
 const FRAME_BINARY: u8 = 0;
 const FRAME_TEXT: u8 = 1;
 const FRAME_CLOSE: u8 = 2;
@@ -40,8 +65,21 @@ const FRAME_NOOP: u8 = 3;
 /// Upper bound on a single framed message; matches the WebSocket limit.
 const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 
-/// Outbound message channel depth before back-pressure kicks in.
-const SINK_CHANNEL_CAPACITY: usize = 64;
+/// Leading byte of an encoded video packet (see `streamer::pack_frame`). Audio
+/// packets use tag `2`; everything else is control JSON.
+const VIDEO_FRAME_TAG: u8 = 1;
+/// Byte offset of the keyframe flag within a video packet.
+const VIDEO_KEYFRAME_OFFSET: usize = 1;
+
+/// Outbound dispatcher channel depth for the bidirectional (control) stream.
+/// Video never flows through this channel — it is offloaded to [`VideoQueue`]
+/// instantly — so this only ever buffers the rare hello/stats/close messages.
+const DISPATCH_CHANNEL_CAPACITY: usize = 16;
+
+/// Hard cap on frames retained in the video queue. The keyframe-coalescing logic
+/// already bounds the backlog to a single group-of-pictures; this is only a
+/// safety valve in case keyframes dry up, preventing unbounded memory growth.
+const MAX_QUEUED_VIDEO_FRAMES: usize = 300;
 
 /// A ready-to-serve WebTransport endpoint plus the metadata browsers need to
 /// connect to it with a self-signed certificate.
@@ -72,7 +110,7 @@ pub fn setup(addr: SocketAddr) -> Result<WtSetup> {
 
     let config = ServerConfig::builder()
         .with_bind_address(addr)
-        .with_identity(identity)
+        .with_custom_transport(identity, tuned_transport_config())
         .keep_alive_interval(Some(Duration::from_secs(3)))
         .max_idle_timeout(Some(Duration::from_secs(30)))
         .map_err(|err| anyhow!("invalid WebTransport idle timeout: {err}"))?
@@ -87,24 +125,73 @@ pub fn setup(addr: SocketAddr) -> Result<WtSetup> {
     })
 }
 
-/// Wraps a WebTransport bidirectional stream into the transport-agnostic
-/// sink/stream pair the session layer consumes.
-pub fn wire_from_bi(mut send: SendStream, recv: RecvStream) -> (WireSink, WireStream) {
-    let (tx, mut rx) = mpsc::channel::<Message>(SINK_CHANNEL_CAPACITY);
-    tokio::spawn(async move {
-        while let Some(message) = rx.recv().await {
-            let closing = matches!(message, Message::Close(_));
-            if let Err(err) = write_frame(&mut send, &message).await {
-                warn!("webtransport frame write error: {err}");
-                break;
+/// QUIC transport tuning aimed at low-latency interactive video.
+///
+/// The defaults are tuned for bulk file transfer; for a live screen stream we
+/// care about keeping the pipe full and reacting quickly:
+///
+/// * **BBR congestion control.** The default (CUBIC) repeatedly halves its
+///   window on any packet loss, which on a lossy/jittery Wi-Fi or remote link
+///   produces exactly the stuttering the user sees — and is the main reason
+///   plain TCP/WebSocket can feel smoother there. BBR paces to the measured
+///   bottleneck bandwidth instead, so throughput (and thus frame freshness)
+///   stays stable under loss. On a clean link the two behave the same.
+/// * **Large send window.** Stops the server from self-throttling the video
+///   stream on higher bandwidth-delay-product links; the congestion controller
+///   still bounds what is actually in flight.
+/// * **Lower initial RTT estimate.** The 333 ms default makes loss recovery and
+///   MTU probing sluggish on the low-latency links a remote desktop targets.
+fn tuned_transport_config() -> QuicTransportConfig {
+    let mut transport = QuicTransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(BbrConfig::default()));
+    transport.send_window(32 * 1024 * 1024);
+    transport.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
+    transport.receive_window(VarInt::from_u32(32 * 1024 * 1024));
+    transport.initial_rtt(Duration::from_millis(80));
+    transport
+}
+
+/// Wraps a WebTransport session into the transport-agnostic sink/stream pair the
+/// session layer consumes.
+///
+/// `send`/`recv` are the bidirectional control stream; `connection` is retained
+/// so the video writer can open its dedicated unidirectional stream on demand.
+pub fn wire_from_bi(
+    connection: Connection,
+    mut send: SendStream,
+    recv: RecvStream,
+) -> (WireSink, WireStream) {
+    let video = Arc::new(VideoQueue::new());
+
+    // Video rides its own unidirectional stream, coalesced to the freshest
+    // decodable frame, so it never head-of-line-blocks control traffic below.
+    spawn_video_writer(connection, video.clone());
+
+    let (tx, mut rx) = mpsc::channel::<Message>(DISPATCH_CHANNEL_CAPACITY);
+    {
+        let video = video.clone();
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let closing = matches!(message, Message::Close(_));
+                if let Err(err) = write_frame(&mut send, &message).await {
+                    warn!("webtransport frame write error: {err}");
+                    break;
+                }
+                if closing {
+                    break;
+                }
             }
-            if closing {
-                break;
-            }
-        }
-        let _ = send.finish().await;
+            let _ = send.finish().await;
+            // The control stream is gone (session ended); release the video
+            // writer so it drains, finishes its stream and exits.
+            video.close();
+        });
+    }
+
+    let sink: WireSink = Box::pin(WtSink {
+        video,
+        bidi: PollSender::new(tx),
     });
-    let sink: WireSink = Box::pin(PollSender::new(tx).sink_map_err(|err| anyhow!(err)));
 
     let stream: WireStream = Box::pin(stream::unfold(RxState::Active(recv), |state| async move {
         match state {
@@ -128,6 +215,175 @@ pub fn wire_from_bi(mut send: SendStream, recv: RecvStream) -> (WireSink, WireSt
 enum RxState {
     Active(RecvStream),
     Done,
+}
+
+/// Outbound sink that routes encoded video onto the coalescing [`VideoQueue`]
+/// (its dedicated unidirectional stream) and everything else onto the
+/// bidirectional control stream.
+struct WtSink {
+    video: Arc<VideoQueue>,
+    bidi: PollSender<Message>,
+}
+
+impl Sink<Message> for WtSink {
+    type Error = Error;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        // Only the control channel can apply back-pressure; video is accepted
+        // unconditionally and coalesced, so the upstream never stalls on it.
+        self.bidi.poll_ready_unpin(cx).map_err(|err| anyhow!(err))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<()> {
+        if let Message::Binary(bytes) = &item {
+            if is_video_packet(bytes) {
+                self.video.push(bytes.clone());
+                return Ok(());
+            }
+        }
+        self.bidi.start_send_unpin(item).map_err(|err| anyhow!(err))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.bidi.poll_flush_unpin(cx).map_err(|err| anyhow!(err))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        self.video.close();
+        self.bidi.poll_close_unpin(cx).map_err(|err| anyhow!(err))
+    }
+}
+
+fn is_video_packet(bytes: &Bytes) -> bool {
+    bytes.first() == Some(&VIDEO_FRAME_TAG)
+}
+
+fn is_video_keyframe(frame: &Bytes) -> bool {
+    frame.len() > VIDEO_KEYFRAME_OFFSET && frame[VIDEO_KEYFRAME_OFFSET] == 1
+}
+
+/// A coalescing queue of encoded video frames awaiting transmission on the
+/// dedicated unidirectional stream.
+struct VideoQueue {
+    inner: Mutex<VideoQueueInner>,
+    notify: Notify,
+}
+
+struct VideoQueueInner {
+    frames: VecDeque<Bytes>,
+    closed: bool,
+}
+
+impl VideoQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(VideoQueueInner {
+                frames: VecDeque::new(),
+                closed: false,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Enqueues a frame, then drops any now-superseded backlog so the consumer
+    /// always pulls the freshest decodable sequence.
+    fn push(&self, frame: Bytes) {
+        {
+            let mut inner = self.inner.lock().expect("video queue poisoned");
+            if inner.closed {
+                return;
+            }
+            inner.frames.push_back(frame);
+            coalesce_to_latest_keyframe(&mut inner.frames);
+            // Safety valve: should keyframes ever stop arriving, bound memory by
+            // dropping the oldest frames (the client will resync on the next
+            // keyframe).
+            while inner.frames.len() > MAX_QUEUED_VIDEO_FRAMES {
+                inner.frames.pop_front();
+            }
+        }
+        self.notify.notify_one();
+    }
+
+    fn close(&self) {
+        {
+            let mut inner = self.inner.lock().expect("video queue poisoned");
+            inner.closed = true;
+        }
+        self.notify.notify_one();
+    }
+
+    /// Waits for and returns the next frame to send, or `None` once the queue is
+    /// closed and drained.
+    async fn next(&self) -> Option<Bytes> {
+        loop {
+            {
+                let mut inner = self.inner.lock().expect("video queue poisoned");
+                if let Some(frame) = inner.frames.pop_front() {
+                    return Some(frame);
+                }
+                if inner.closed {
+                    return None;
+                }
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+/// Drops every frame preceding the most recent keyframe in the queue. Those
+/// frames belong to an older group-of-pictures that the newer keyframe makes
+/// obsolete, so discarding them lets the client jump straight to the fresh
+/// decode point instead of replaying stale history.
+fn coalesce_to_latest_keyframe(frames: &mut VecDeque<Bytes>) {
+    let last_keyframe = frames
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, frame)| is_video_keyframe(frame).then_some(index));
+    if let Some(index) = last_keyframe {
+        for _ in 0..index {
+            frames.pop_front();
+        }
+    }
+}
+
+/// Drains [`VideoQueue`] onto a dedicated unidirectional QUIC stream, opening it
+/// lazily on the first frame.
+fn spawn_video_writer(connection: Connection, queue: Arc<VideoQueue>) {
+    tokio::spawn(async move {
+        let mut send: Option<SendStream> = None;
+        while let Some(frame) = queue.next().await {
+            if send.is_none() {
+                match open_video_stream(&connection).await {
+                    Ok(stream) => send = Some(stream),
+                    Err(err) => {
+                        warn!("webtransport video stream open error: {err}");
+                        break;
+                    }
+                }
+            }
+            let stream = send.as_mut().expect("video stream initialized above");
+            if let Err(err) = write_payload(stream, FRAME_BINARY, frame.as_ref()).await {
+                warn!("webtransport video frame write error: {err}");
+                break;
+            }
+        }
+        if let Some(mut stream) = send {
+            let _ = stream.finish().await;
+        }
+    });
+}
+
+async fn open_video_stream(connection: &Connection) -> Result<SendStream> {
+    let opening = connection
+        .open_uni()
+        .await
+        .map_err(|err| anyhow!("open video stream: {err}"))?;
+    let stream = opening
+        .await
+        .map_err(|err| anyhow!("initialize video stream: {err}"))?;
+    Ok(stream)
 }
 
 async fn write_frame(send: &mut SendStream, message: &Message) -> Result<()> {
