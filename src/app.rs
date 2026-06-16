@@ -37,7 +37,9 @@ use crate::{
         AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, EncoderQualityMode,
         ServerConfig, StreamConfig, VideoPerformanceConfig, VideoScale,
     },
+    transport, webtransport,
 };
+use wtransport::endpoint::IncomingSession;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
@@ -57,6 +59,15 @@ struct AppState {
     camera: CameraRelay,
     media: MediaHub,
     clients: Arc<ClientManager>,
+    wt_info: Option<WtInfo>,
+}
+
+/// Connection metadata advertised to browsers so they can reach the
+/// WebTransport endpoint with a self-signed certificate.
+#[derive(Clone, Debug)]
+struct WtInfo {
+    port: u16,
+    cert_hashes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -248,7 +259,7 @@ struct CodecsQuery {
     passwd: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct WsQuery {
     client_id: Option<String>,
     role: Option<SessionRole>,
@@ -263,6 +274,55 @@ struct WsQuery {
     buffer_ms: Option<u32>,
     scale: Option<VideoScale>,
     passwd: Option<String>,
+}
+
+impl WsQuery {
+    /// Builds the normalized video stream configuration from the query.
+    fn stream_config(&self) -> StreamConfig {
+        StreamConfig {
+            codec: self.codec.unwrap_or(CodecKind::H264),
+            bitrate_kbps: self
+                .bitrate_kbps
+                .unwrap_or_else(|| StreamConfig::default().bitrate_kbps),
+            fps: self.fps.unwrap_or_else(|| StreamConfig::default().fps),
+            encode_preference: self.encode_preference.unwrap_or_default(),
+            performance: VideoPerformanceConfig {
+                encoder_latency: self.encoder_latency.unwrap_or_default(),
+                encoder_quality: self.encoder_quality.unwrap_or_default(),
+                gop_ms: self
+                    .gop_ms
+                    .unwrap_or_else(|| VideoPerformanceConfig::default().gop_ms),
+                buffer_ms: self
+                    .buffer_ms
+                    .unwrap_or_else(|| VideoPerformanceConfig::default().buffer_ms),
+                scale: self
+                    .scale
+                    .unwrap_or_else(|| VideoPerformanceConfig::default().scale),
+            },
+        }
+        .normalized()
+    }
+
+    /// Builds the normalized audio stream configuration from the query.
+    fn audio_config(&self) -> AudioStreamConfig {
+        AudioStreamConfig {
+            bitrate_kbps: self.audio_bitrate_kbps.unwrap_or(128),
+        }
+        .normalized()
+    }
+
+    /// Resolves the session role, defaulting to a combined session.
+    fn role(&self) -> SessionRole {
+        self.role.unwrap_or_default()
+    }
+
+    /// Resolves the client id, generating a fresh one when absent.
+    fn resolve_client_id(&self) -> String {
+        self.client_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,13 +380,28 @@ pub async fn run(server: ServerConfig) -> Result<()> {
     if let Err(err) = ffmpeg::warm_audio_stack(&server).await {
         warn!("audio bootstrap failed during startup: {err}");
     }
+    let wt_setup = setup_webtransport(&server.bind);
+    let wt_meta = wt_setup.as_ref().map(|setup| WtInfo {
+        port: setup.local_addr.port(),
+        cert_hashes: setup.cert_hashes.clone(),
+    });
     let state = Arc::new(AppState {
         server,
         auth: Arc::new(AuthTracker::new()),
         camera,
         media: media.clone(),
         clients: Arc::new(ClientManager::default()),
+        wt_info: wt_meta,
     });
+    if let Some(setup) = wt_setup {
+        info!(
+            "WebTransport listening on udp://{} ({} cert hash(es))",
+            setup.local_addr,
+            setup.cert_hashes.len()
+        );
+        let wt_state = state.clone();
+        tokio::spawn(run_webtransport(setup.endpoint, wt_state));
+    }
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(js))
@@ -338,6 +413,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/icon-192.png", get(icon_192_png))
         .route("/icon-512.png", get(icon_512_png))
         .route("/healthz", get(healthz))
+        .route("/api/wt-info", get(wt_info))
         .route("/api/auth", get(auth_check).post(auth_login))
         .route("/api/codecs", get(codecs))
         .route("/api/encoders", get(encoders))
@@ -695,45 +771,20 @@ async fn ws(
     {
         return response.into_response();
     }
-    let config = StreamConfig {
-        codec: query.codec.unwrap_or(CodecKind::H264),
-        bitrate_kbps: query
-            .bitrate_kbps
-            .unwrap_or_else(|| StreamConfig::default().bitrate_kbps),
-        fps: query.fps.unwrap_or_else(|| StreamConfig::default().fps),
-        encode_preference: query.encode_preference.unwrap_or_default(),
-        performance: VideoPerformanceConfig {
-            encoder_latency: query.encoder_latency.unwrap_or_default(),
-            encoder_quality: query.encoder_quality.unwrap_or_default(),
-            gop_ms: query
-                .gop_ms
-                .unwrap_or_else(|| VideoPerformanceConfig::default().gop_ms),
-            buffer_ms: query
-                .buffer_ms
-                .unwrap_or_else(|| VideoPerformanceConfig::default().buffer_ms),
-            scale: query
-                .scale
-                .unwrap_or_else(|| VideoPerformanceConfig::default().scale),
-        },
-    }
-    .normalized();
-    let audio_config = AudioStreamConfig {
-        bitrate_kbps: query.audio_bitrate_kbps.unwrap_or(128),
-    }
-    .normalized();
-    let role = query.role.unwrap_or_default();
-    let client_id = query
-        .client_id
-        .filter(|id| !id.trim().is_empty())
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let config = query.stream_config();
+    let audio_config = query.audio_config();
+    let role = query.role();
+    let client_id = query.resolve_client_id();
     let lease = state.clients.register(client_id, peer_addr, role).await;
     let close_rx = lease.close_rx.clone();
     ws.max_message_size(WS_MAX_MESSAGE_SIZE)
         .max_frame_size(WS_MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| async move {
         let _lease = lease;
+        let (sink, stream) = transport::from_websocket(socket);
         if let Err(err) = session::handle_socket(
-            socket,
+            sink,
+            stream,
             state.server.clone(),
             state.media.clone(),
             config,
@@ -746,6 +797,119 @@ async fn ws(
             warn!(error = %err, "websocket session ended with an error");
         }
     })
+}
+
+#[derive(Debug, Serialize)]
+struct WtInfoResponse {
+    enabled: bool,
+    port: u16,
+    cert_hashes: Vec<String>,
+}
+
+/// Advertises whether the WebTransport endpoint is available and how to reach
+/// it (UDP port and the self-signed certificate hashes for the browser).
+async fn wt_info(State(state): State<Arc<AppState>>) -> Json<WtInfoResponse> {
+    match &state.wt_info {
+        Some(info) => Json(WtInfoResponse {
+            enabled: true,
+            port: info.port,
+            cert_hashes: info.cert_hashes.clone(),
+        }),
+        None => Json(WtInfoResponse {
+            enabled: false,
+            port: 0,
+            cert_hashes: Vec::new(),
+        }),
+    }
+}
+
+/// Resolves the UDP socket address the WebTransport endpoint should bind to.
+///
+/// Defaults to the first HTTP bind address (UDP and TCP port namespaces are
+/// independent, so reusing the port is fine) and can be overridden with
+/// `VIBE_RDESK_WT_BIND`. Set `VIBE_RDESK_WT=0` to disable WebTransport entirely.
+fn webtransport_bind_addr(http_bind: &str) -> Option<SocketAddr> {
+    match std::env::var("VIBE_RDESK_WT") {
+        Ok(value) if matches!(value.trim(), "0" | "false" | "no" | "off") => return None,
+        _ => {}
+    }
+    if let Ok(explicit) = std::env::var("VIBE_RDESK_WT_BIND") {
+        return explicit.trim().parse().ok();
+    }
+    http_bind
+        .split(',')
+        .map(str::trim)
+        .find(|entry| !entry.is_empty())
+        .and_then(|entry| entry.parse().ok())
+}
+
+/// Sets up the WebTransport endpoint, logging and disabling it on failure.
+fn setup_webtransport(http_bind: &str) -> Option<webtransport::WtSetup> {
+    let addr = webtransport_bind_addr(http_bind)?;
+    match webtransport::setup(addr) {
+        Ok(setup) => Some(setup),
+        Err(err) => {
+            warn!("WebTransport disabled: {err}");
+            None
+        }
+    }
+}
+
+/// Accepts incoming WebTransport sessions and dispatches each to the shared
+/// session handlers.
+async fn run_webtransport(endpoint: webtransport::WtEndpoint, state: Arc<AppState>) {
+    loop {
+        let incoming = endpoint.accept().await;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_wt_incoming(state, incoming).await {
+                warn!(error = %err, "webtransport session ended with an error");
+            }
+        });
+    }
+}
+
+async fn handle_wt_incoming(state: Arc<AppState>, incoming: IncomingSession) -> Result<()> {
+    let session_request = incoming.await?;
+    let path = session_request.path();
+    let query_str = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let query: WsQuery = serde_urlencoded::from_str(query_str).unwrap_or_default();
+
+    if state
+        .auth
+        .require_passwd(&state.server.passwd, query.passwd.as_deref(), None)
+        .await
+        .is_err()
+    {
+        session_request.forbidden().await;
+        return Ok(());
+    }
+
+    let config = query.stream_config();
+    let audio_config = query.audio_config();
+    let role = query.role();
+    let client_id = query.resolve_client_id();
+
+    let connection = session_request.accept().await?;
+    let peer_addr = connection.remote_address();
+    let lease = state.clients.register(client_id, peer_addr, role).await;
+    let close_rx = lease.close_rx.clone();
+
+    let (send, recv) = connection.accept_bi().await?;
+    let (sink, stream) = webtransport::wire_from_bi(send, recv);
+
+    let _lease = lease;
+    session::handle_socket(
+        sink,
+        stream,
+        state.server.clone(),
+        state.media.clone(),
+        config,
+        audio_config,
+        role,
+        close_rx,
+    )
+    .await
 }
 
 async fn webclients(

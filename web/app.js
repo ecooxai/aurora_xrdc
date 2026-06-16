@@ -261,6 +261,9 @@ const state = {
   lastAutoDisconnectActivityAt: 0,
   webclientsManagerOpen: false,
   webclients: [],
+  transport: "websocket",
+  wtInfo: null,
+  protocolMenuOpen: false,
 };
 
 const status = $("status");
@@ -355,6 +358,9 @@ const webclientsCount = $("webclients-count");
 const webclientsManager = $("webclients-manager");
 const webclientsList = $("webclients-list");
 const webclientsCloseOthers = $("webclients-close-others");
+const protocolToggle = $("protocol-toggle");
+const protocolValue = $("protocol-value");
+const protocolMenu = $("protocol-menu");
 const localClipboardSyncBtn = $("local-clipboard-sync-btn");
 const remoteClipboardSyncBtn = $("remote-clipboard-sync-btn");
 const clipboardHistoryList = $("clipboard-history-list");
@@ -2281,6 +2287,247 @@ function createClientSessionId() {
   return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
 }
 
+const TRANSPORT_STORAGE_KEY = "vibe_rdesk_transport";
+
+function isWebTransportSupported() {
+  return typeof WebTransport !== "undefined" && window.isSecureContext;
+}
+
+function loadStoredTransport() {
+  // An explicit ?wt=1 / ?wt=0 query parameter wins, then a stored preference.
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has("wt")) {
+      const value = params.get("wt");
+      return value === "0" || value === "false" ? "websocket" : "webtransport";
+    }
+  } catch {
+    // Ignore malformed query strings.
+  }
+  try {
+    const stored = window.localStorage?.getItem(TRANSPORT_STORAGE_KEY);
+    if (stored === "webtransport" || stored === "websocket") return stored;
+  } catch {
+    // Ignore storage access errors (private mode, etc.).
+  }
+  return "websocket";
+}
+
+function saveTransport(transport) {
+  try {
+    window.localStorage?.setItem(TRANSPORT_STORAGE_KEY, transport);
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+// Resolves the transport to actually use, downgrading to WebSocket when
+// WebTransport is unavailable in this browser/context.
+function currentTransport() {
+  if (state.transport === "webtransport" && isWebTransportSupported()) {
+    return "webtransport";
+  }
+  return "websocket";
+}
+
+// Fetches (fresh each connect, since the self-signed cert rotates on restart)
+// the WebTransport endpoint metadata the browser needs to connect.
+async function ensureWtInfo() {
+  const url = apiUrl("/api/wt-info");
+  const response = await fetch(url, { cache: "no-store", credentials: "include" });
+  if (!response.ok) throw new Error(`wt-info request failed (${response.status})`);
+  const data = await response.json();
+  if (!data.enabled || !data.port) {
+    throw new Error("WebTransport is not available on the server");
+  }
+  state.wtInfo = data;
+  return data;
+}
+
+function base64ToBytes(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+// A drop-in replacement for the parts of the WebSocket API the client uses,
+// backed by a single WebTransport bidirectional stream. Messages are framed as
+// [u8 kind][u32be length][payload]; kind 0 = binary, 1 = text, 2 = close.
+class WtSocket {
+  constructor(url, { certHashes } = {}) {
+    this.url = url;
+    this.binaryType = "arraybuffer";
+    this.readyState = 0; // CONNECTING
+    this.onopen = null;
+    this.onerror = null;
+    this.onclose = null;
+    this.onmessage = null;
+    this._transport = null;
+    this._writer = null;
+    this._writeChain = Promise.resolve();
+    this._closed = false;
+    this._textDecoder = new TextDecoder();
+    this._textEncoder = new TextEncoder();
+    this._buffer = new Uint8Array(0);
+    this._start(certHashes);
+  }
+
+  async _start(certHashes) {
+    try {
+      const options = {};
+      if (Array.isArray(certHashes) && certHashes.length) {
+        options.serverCertificateHashes = certHashes.map((hash) => ({
+          algorithm: "sha-256",
+          value: base64ToBytes(hash),
+        }));
+      }
+      const transport = new WebTransport(this.url, options);
+      this._transport = transport;
+      transport.closed
+        .then(() => this._handleClosed(1000, "transport closed"))
+        .catch((err) => this._handleClosed(1006, String(err?.message || err)));
+      await transport.ready;
+      if (this._closed) return;
+      const stream = await transport.createBidirectionalStream();
+      this._writer = stream.writable.getWriter();
+      this._readLoop(stream.readable.getReader());
+      this.readyState = 1; // OPEN
+      // Browsers don't expose a freshly opened bidirectional stream to the
+      // server until the client writes to it. Send a no-op frame immediately so
+      // read-only streams (video/audio) start flowing right away.
+      this._writeChain = this._writer.write(this._buildFrame(3, new Uint8Array(0))).catch(() => {});
+      if (this.onopen) this.onopen({ target: this });
+    } catch (err) {
+      if (this.onerror) this.onerror({ target: this, message: String(err?.message || err) });
+      this._handleClosed(1006, String(err?.message || err));
+    }
+  }
+
+  async _readLoop(reader) {
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value && value.length) {
+          this._append(value);
+          if (this._drainFrames()) return; // close frame consumed
+        }
+      }
+      this._handleClosed(1000, "stream finished");
+    } catch (err) {
+      this._handleClosed(1006, String(err?.message || err));
+    }
+  }
+
+  _append(chunk) {
+    if (this._buffer.length === 0) {
+      this._buffer = chunk.slice();
+      return;
+    }
+    const merged = new Uint8Array(this._buffer.length + chunk.length);
+    merged.set(this._buffer, 0);
+    merged.set(chunk, this._buffer.length);
+    this._buffer = merged;
+  }
+
+  // Parses and dispatches every complete frame currently buffered. Returns true
+  // when a close frame was seen (the caller should stop reading).
+  _drainFrames() {
+    let offset = 0;
+    const buffer = this._buffer;
+    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    while (buffer.length - offset >= 5) {
+      const kind = buffer[offset];
+      const length = view.getUint32(offset + 1, false);
+      if (buffer.length - offset - 5 < length) break;
+      const start = offset + 5;
+      const payload = buffer.subarray(start, start + length);
+      offset = start + length;
+      if (kind === 2) {
+        const code = length >= 2 ? new DataView(payload.buffer, payload.byteOffset, 2).getUint16(0, false) : 1000;
+        this._buffer = buffer.subarray(offset).slice();
+        this._handleClosed(code, "");
+        return true;
+      }
+      if (kind === 1) {
+        const text = this._textDecoder.decode(payload);
+        if (this.onmessage) this.onmessage({ data: text, target: this });
+      } else {
+        const copy = payload.slice();
+        if (this.onmessage) this.onmessage({ data: copy.buffer, target: this });
+      }
+    }
+    this._buffer = offset === 0 ? buffer : buffer.subarray(offset).slice();
+    return false;
+  }
+
+  _buildFrame(kind, payload) {
+    const frame = new Uint8Array(5 + payload.length);
+    frame[0] = kind;
+    new DataView(frame.buffer).setUint32(1, payload.length, false);
+    frame.set(payload, 5);
+    return frame;
+  }
+
+  send(data) {
+    if (this.readyState !== 1 || !this._writer) return;
+    let frame;
+    if (typeof data === "string") {
+      frame = this._buildFrame(1, this._textEncoder.encode(data));
+    } else if (data instanceof ArrayBuffer) {
+      frame = this._buildFrame(0, new Uint8Array(data));
+    } else if (ArrayBuffer.isView(data)) {
+      frame = this._buildFrame(0, new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+    } else {
+      return;
+    }
+    const writer = this._writer;
+    this._writeChain = this._writeChain
+      .then(() => writer.write(frame))
+      .catch((err) => {
+        if (this.onerror) this.onerror({ target: this, message: String(err?.message || err) });
+      });
+  }
+
+  close() {
+    if (this._closed && this.readyState === 3) return;
+    this.readyState = 2; // CLOSING
+    const writer = this._writer;
+    const transport = this._transport;
+    if (writer) {
+      const closeFrame = this._buildFrame(2, new Uint8Array([0x03, 0xe8])); // 1000
+      this._writeChain = this._writeChain
+        .then(() => writer.write(closeFrame))
+        .then(() => writer.close())
+        .catch(() => {})
+        .finally(() => {
+          try {
+            transport?.close();
+          } catch {
+            // Already closing.
+          }
+        });
+    } else {
+      try {
+        transport?.close();
+      } catch {
+        // Already closing.
+      }
+    }
+    this._handleClosed(1000, "");
+  }
+
+  _handleClosed(code, reason) {
+    if (this._closed) return;
+    this._closed = true;
+    this.readyState = 3; // CLOSED
+    if (this.onclose) this.onclose({ code, reason, target: this });
+  }
+}
+
 function isSocketOpen(socket) {
   return socket?.readyState === WebSocket.OPEN;
 }
@@ -2301,8 +2548,27 @@ function isFullyConnected() {
     && isSocketOpen(state.micSocket);
 }
 
+function roleWebTransportUrl(role, settings, port) {
+  const url = apiUrl("/ws");
+  url.protocol = "https:";
+  url.port = String(port);
+  appendStreamQuery(url, settings);
+  url.searchParams.set("role", role);
+  return url;
+}
+
 function openRoleSocket(role, settings, onMessage) {
-  const socket = new WebSocket(roleWebSocketUrl(role, settings));
+  const transport = currentTransport();
+  const label = transport === "webtransport" ? "WebTransport" : "WebSocket";
+  let socket;
+  if (transport === "webtransport") {
+    const info = state.wtInfo;
+    socket = new WtSocket(roleWebTransportUrl(role, settings, info.port).toString(), {
+      certHashes: info.cert_hashes,
+    });
+  } else {
+    socket = new WebSocket(roleWebSocketUrl(role, settings));
+  }
   socket.binaryType = "arraybuffer";
   let opened = false;
   const openPromise = new Promise((resolve, reject) => {
@@ -2312,14 +2578,14 @@ function openRoleSocket(role, settings, onMessage) {
     };
     socket.onerror = () => {
       if (!opened) {
-        reject(new Error(`${role} WebSocket error`));
+        reject(new Error(`${role} ${label} error`));
       } else {
-        showToast("ws_error", `${role} WebSocket error`);
+        showToast("ws_error", `${role} ${label} error`);
       }
     };
     socket.onclose = (event) => {
       if (!opened) {
-        reject(new Error(`${role} WebSocket closed (${event.code || "no code"})`));
+        reject(new Error(`${role} ${label} closed (${event.code || "no code"})`));
         return;
       }
       handleRoleSocketClose(role, event);
@@ -2417,6 +2683,49 @@ function setWebclientsManagerOpen(open) {
   webclientsManager.classList.toggle("hidden", !open);
   webclientsToggle.setAttribute("aria-expanded", open ? "true" : "false");
   if (open) void refreshWebClients();
+}
+
+function renderProtocolStatus() {
+  if (!protocolValue) return;
+  const active = currentTransport();
+  protocolValue.textContent = active === "webtransport" ? "WebTransport" : "WebSocket";
+  if (protocolMenu) {
+    const supported = isWebTransportSupported();
+    for (const option of protocolMenu.querySelectorAll(".protocol-option")) {
+      const value = option.dataset.protocol;
+      const disabled = value === "webtransport" && !supported;
+      option.disabled = disabled;
+      option.title = disabled ? "WebTransport requires a secure (HTTPS) context" : "";
+      option.classList.toggle("is-active", value === active);
+      option.setAttribute("aria-selected", value === active ? "true" : "false");
+    }
+  }
+}
+
+function setProtocolMenuOpen(open) {
+  state.protocolMenuOpen = open;
+  if (protocolMenu) protocolMenu.classList.toggle("hidden", !open);
+  if (protocolToggle) protocolToggle.setAttribute("aria-expanded", open ? "true" : "false");
+}
+
+async function selectTransport(transport) {
+  setProtocolMenuOpen(false);
+  if (transport !== "websocket" && transport !== "webtransport") return;
+  if (transport === "webtransport" && !isWebTransportSupported()) {
+    showToast("wt_unsupported", "WebTransport is not supported in this browser or context");
+    return;
+  }
+  if (transport === state.transport) return;
+  const reconnect = isConnected() || state.connecting || !isConnectionDisconnected();
+  state.transport = transport;
+  state.wtInfo = null;
+  saveTransport(transport);
+  renderProtocolStatus();
+  if (reconnect) {
+    closeConnection({ manual: true });
+    state.manualDisconnect = false;
+    await connect();
+  }
 }
 
 async function closeWebClient(clientId) {
@@ -2521,6 +2830,16 @@ async function connect() {
     setStatus("Connecting...");
     setEncoderStatus("Connecting...");
     state.sessionId = createClientSessionId();
+    if (currentTransport() === "webtransport") {
+      try {
+        await ensureWtInfo();
+      } catch (error) {
+        showToast("wt_unavailable", `WebTransport unavailable, using WebSocket: ${error.message || error}`);
+        state.transport = "websocket";
+        saveTransport("websocket");
+        renderProtocolStatus();
+      }
+    }
     const control = openRoleSocket("control", settings, handleControlSocketMessage);
     const input = openRoleSocket("input", settings, handleControlSocketMessage);
     const video = openRoleSocket("video", settings, handleMediaSocketMessage);
@@ -5670,6 +5989,15 @@ function initControls() {
   webclientsCloseOthers.addEventListener("click", () => {
     void closeOtherWebClients();
   });
+  protocolToggle?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setProtocolMenuOpen(!state.protocolMenuOpen);
+  });
+  protocolMenu?.addEventListener("click", (event) => {
+    const option = event.target.closest(".protocol-option");
+    if (!option || option.disabled) return;
+    void selectTransport(option.dataset.protocol);
+  });
   $("connect").addEventListener("click", () => connect());
   $("disconnect").addEventListener("click", disconnect);
   micToggle.addEventListener("click", toggleMicDeviceMenu);
@@ -5887,9 +6215,15 @@ function initControls() {
     if (micToggle.contains(event.target) || micDeviceMenu.contains(event.target)) return;
     closeMicDeviceMenu();
   });
+  document.addEventListener("click", (event) => {
+    if (!state.protocolMenuOpen) return;
+    if (protocolToggle?.contains(event.target) || protocolMenu?.contains(event.target)) return;
+    setProtocolMenuOpen(false);
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       closeMicDeviceMenu();
+      setProtocolMenuOpen(false);
     }
   });
   navigator.mediaDevices?.addEventListener?.("devicechange", () => {
@@ -5934,6 +6268,8 @@ renderClipboardHistory();
 syncMobileKeyboardButton();
 setActiveTab("status");
 syncFullscreenToggle();
+state.transport = loadStoredTransport();
+renderProtocolStatus();
 applySettings(loadStoredSettings());
 applyCanvasZoom();
 resetStatusMetrics();

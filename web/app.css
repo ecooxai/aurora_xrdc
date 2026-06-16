@@ -861,6 +861,78 @@ button.view-size-chip:active {
   padding-top: 2px;
 }
 
+.protocol-card {
+  position: relative;
+  gap: 5px;
+}
+
+.protocol-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 0;
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.protocol-caret {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.protocol-menu {
+  position: absolute;
+  z-index: 20;
+  left: 8px;
+  right: 8px;
+  bottom: calc(100% - 4px);
+  display: grid;
+  gap: 2px;
+  padding: 6px;
+  border-radius: 12px;
+  background: rgba(20, 22, 30, 0.98);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+}
+
+.protocol-menu.hidden {
+  display: none;
+}
+
+.protocol-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+  font-size: 0.85rem;
+}
+
+.protocol-option:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.protocol-option.is-active {
+  background: rgba(108, 140, 255, 0.18);
+  color: var(--accent);
+}
+
+.protocol-option:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .status-icon-button {
   width: 42px;
   height: 38px;

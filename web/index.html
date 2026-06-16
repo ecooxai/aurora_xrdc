@@ -323,6 +323,17 @@
                     <span class="metric-label">Encoder</span>
                     <strong id="encoder-status" class="metric-value">Not connected</strong>
                   </article>
+                  <article class="metric-card protocol-card">
+                    <span class="metric-label">Protocol</span>
+                    <button id="protocol-toggle" class="protocol-toggle" type="button" aria-haspopup="listbox" aria-expanded="false" title="Click to change the transport protocol">
+                      <strong id="protocol-value" class="metric-value">WebSocket</strong>
+                      <span class="protocol-caret" aria-hidden="true">▾</span>
+                    </button>
+                    <div id="protocol-menu" class="protocol-menu hidden" role="listbox" aria-label="Transport protocol">
+                      <button class="protocol-option" type="button" role="option" data-protocol="websocket">WebSocket</button>
+                      <button class="protocol-option" type="button" role="option" data-protocol="webtransport">WebTransport</button>
+                    </div>
+                  </article>
                   <article class="metric-card metric-card-wide webclients-card">
                     <button id="webclients-toggle" class="webclients-toggle secondary" type="button" aria-expanded="false">
                       <span>

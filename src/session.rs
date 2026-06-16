@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
-use axum::extract::ws::{CloseFrame, Message, WebSocket};
+use axum::extract::ws::{CloseFrame, Message};
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use serde::Deserialize;
@@ -25,6 +25,7 @@ use crate::{
     settings::{AudioStreamConfig, ServerConfig, StreamConfig},
     streamer::StreamFrame,
     system_stats::StatsSampler,
+    transport::{WireSink, WireStream},
     uinput::{UInputPointerInjector, UInputWheelInjector},
     x11_input::{X11InputInjector, screen_size},
 };
@@ -79,7 +80,8 @@ struct WheelAccumulator {
 }
 
 pub async fn handle_socket(
-    socket: WebSocket,
+    sink: WireSink,
+    stream: WireStream,
     server: ServerConfig,
     media: MediaHub,
     config: StreamConfig,
@@ -89,18 +91,25 @@ pub async fn handle_socket(
 ) -> Result<()> {
     match role {
         SessionRole::All => {
-            handle_combined_socket(socket, server, media, config, audio_config, close_rx).await
+            handle_combined_socket(sink, stream, server, media, config, audio_config, close_rx).await
         }
-        SessionRole::Control => handle_control_socket(socket, server, media, close_rx).await,
-        SessionRole::Video => handle_video_socket(socket, server, media, config, close_rx).await,
-        SessionRole::Audio => handle_audio_socket(socket, media, audio_config, close_rx).await,
-        SessionRole::Mic => handle_mic_socket(socket, server, close_rx).await,
-        SessionRole::Input => handle_input_socket(socket, server, media, close_rx).await,
+        SessionRole::Control => {
+            handle_control_socket(sink, stream, server, media, close_rx).await
+        }
+        SessionRole::Video => {
+            handle_video_socket(sink, stream, server, media, config, close_rx).await
+        }
+        SessionRole::Audio => {
+            handle_audio_socket(sink, stream, media, audio_config, close_rx).await
+        }
+        SessionRole::Mic => handle_mic_socket(sink, stream, server, close_rx).await,
+        SessionRole::Input => handle_input_socket(sink, stream, server, media, close_rx).await,
     }
 }
 
 async fn handle_combined_socket(
-    socket: WebSocket,
+    sink: WireSink,
+    stream: WireStream,
     server: ServerConfig,
     media: MediaHub,
     config: StreamConfig,
@@ -118,7 +127,7 @@ async fn handle_combined_socket(
     let initial_audio = audio_stream
         .as_ref()
         .and_then(|stream| stream.state_rx.borrow().clone());
-    let (ws_sender, receiver) = socket.split();
+    let (ws_sender, receiver) = (sink, stream);
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
     let (video_tx, video_rx) = mpsc::channel::<Bytes>(VIDEO_PACKET_QUEUE_CAPACITY);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(AUDIO_PACKET_QUEUE_CAPACITY);
@@ -228,14 +237,15 @@ async fn handle_combined_socket(
 }
 
 async fn handle_control_socket(
-    socket: WebSocket,
+    sink: WireSink,
+    stream: WireStream,
     server: ServerConfig,
     media: MediaHub,
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
     maybe_wake_display(&server.display, &mut initial_display_wake_at).await;
-    let (ws_sender, receiver) = socket.split();
+    let (ws_sender, receiver) = (sink, stream);
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
@@ -292,7 +302,8 @@ async fn handle_control_socket(
 }
 
 async fn handle_video_socket(
-    socket: WebSocket,
+    sink: WireSink,
+    stream: WireStream,
     server: ServerConfig,
     media: MediaHub,
     config: StreamConfig,
@@ -302,7 +313,7 @@ async fn handle_video_socket(
     let initial_video = current_video_state(&video_stream.state_rx)?;
     let audio_state_rx = media.audio_state_rx();
     let initial_audio = current_audio_state(Some(&audio_state_rx));
-    let (ws_sender, receiver) = socket.split();
+    let (ws_sender, receiver) = (sink, stream);
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
     let (video_tx, video_rx) = mpsc::channel::<Bytes>(VIDEO_PACKET_QUEUE_CAPACITY);
     let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(1);
@@ -341,12 +352,13 @@ async fn handle_video_socket(
 }
 
 async fn handle_audio_socket(
-    socket: WebSocket,
+    sink: WireSink,
+    stream: WireStream,
     media: MediaHub,
     audio_config: AudioStreamConfig,
     close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (ws_sender, receiver) = socket.split();
+    let (ws_sender, receiver) = (sink, stream);
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
     let (video_tx, video_rx) = mpsc::channel::<Bytes>(1);
     drop(video_tx);
@@ -382,11 +394,12 @@ async fn handle_audio_socket(
 }
 
 async fn handle_mic_socket(
-    socket: WebSocket,
+    sink: WireSink,
+    stream: WireStream,
     server: ServerConfig,
     close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (ws_sender, receiver) = socket.split();
+    let (ws_sender, receiver) = (sink, stream);
     let (out_tx, out_rx) = mpsc::channel::<Message>(8);
     let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
     let recv_task = tokio::spawn(handle_mic_client(receiver, out_tx.clone(), server));
@@ -395,12 +408,13 @@ async fn handle_mic_socket(
 }
 
 async fn handle_input_socket(
-    socket: WebSocket,
+    sink: WireSink,
+    stream: WireStream,
     server: ServerConfig,
     media: MediaHub,
     mut close_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let (ws_sender, receiver) = socket.split();
+    let (ws_sender, receiver) = (sink, stream);
     let (out_tx, out_rx) = mpsc::channel::<Message>(8);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
@@ -460,10 +474,7 @@ async fn send_server_close(sender: &mpsc::Sender<Message>) {
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
-async fn write_control_socket(
-    mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
-    mut control_rx: mpsc::Receiver<Message>,
-) {
+async fn write_control_socket(mut ws_sender: WireSink, mut control_rx: mpsc::Receiver<Message>) {
     while let Some(message) = control_rx.recv().await {
         let should_close = matches!(message, Message::Close(_));
         if futures_util::SinkExt::send(&mut ws_sender, message)
@@ -478,9 +489,7 @@ async fn write_control_socket(
     }
 }
 
-async fn wait_for_socket_close(
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
-) -> Result<()> {
+async fn wait_for_socket_close(mut receiver: WireStream) -> Result<()> {
     while let Some(message) = receiver.next().await {
         match message? {
             Message::Close(_) => break,
@@ -547,7 +556,7 @@ async fn forward_state_hellos(
 }
 
 async fn handle_mic_client(
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    mut receiver: WireStream,
     sender: mpsc::Sender<Message>,
     server: ServerConfig,
 ) -> Result<()> {
@@ -795,7 +804,7 @@ async fn forward_audio(
 }
 
 async fn write_socket(
-    mut ws_sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    mut ws_sender: WireSink,
     mut control_rx: mpsc::Receiver<Message>,
     mut video_rx: mpsc::Receiver<Bytes>,
     mut audio_rx: mpsc::Receiver<Vec<u8>>,
@@ -930,7 +939,7 @@ fn spawn_stats(
 }
 
 async fn handle_client(
-    mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    mut receiver: WireStream,
     sender: mpsc::Sender<Message>,
     server: ServerConfig,
     media: MediaHub,
@@ -1119,7 +1128,7 @@ fn push_pointer_motion_command(commands: &mut Vec<PointerMotionCommand>, message
 }
 
 fn drain_pointer_motion_messages(
-    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    receiver: &mut WireStream,
     pending_message: &mut Option<Message>,
     motions: &mut Vec<PointerMotionCommand>,
 ) -> Result<bool> {
