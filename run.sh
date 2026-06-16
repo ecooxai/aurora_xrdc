@@ -70,7 +70,7 @@ VIBE_RDESK_BIND_WAS_SET=0
 if [[ -n "${VIBE_RDESK_BIND+x}" ]]; then
     VIBE_RDESK_BIND_WAS_SET=1
 fi
-DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:${DEFAULT_HTTPS_PORT},[::]:${DEFAULT_HTTPS_PORT}}"
+DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:${DEFAULT_HTTP_PORT}}"
 export VIBE_RDESK_BIND="${DEFAULT_BIND}"
 DEV_LOG_UID="${SUDO_UID:-$(id -u)}"
 DEV_LOG_DIR="${VIBE_RDESK_LOG_DIR:-/tmp/vibe_rdesk-${DEV_LOG_UID}}"
@@ -91,6 +91,8 @@ XTERM_PID=""
 DBUS_PID=""
 HEADLESS_LAUNCHER_PENDING=0
 HTTPS_ENABLED="yes"
+HTTPS_PROXY_PID=""
+HTTPS_PROXY_PORT=""
 
 if [[ -n "${APPDIR:-}" && -z "${VIBE_RDESK_SSL_DIR:-}" && -d "${APPDIR}/ssl_keys" ]]; then
     export VIBE_RDESK_SSL_DIR="${APPDIR}/ssl_keys"
@@ -157,6 +159,18 @@ parse_script_args() {
                     FORCE_HEADLESS_DISPLAY="yes"
                 fi
                 ;;
+            --https)
+                if (( i + 1 < ${#args[@]} )) && [[ "${args[$((i + 1))]}" != --* ]]; then
+                    if [[ "${args[$((i + 1))]}" == "no" ]]; then
+                        HTTPS_ENABLED="no"
+                    else
+                        HTTPS_ENABLED="yes"
+                    fi
+                    ((i += 1))
+                else
+                    HTTPS_ENABLED="yes"
+                fi
+                ;;
             *)
                 APP_ARGS+=("${args[$i]}")
                 ;;
@@ -221,6 +235,7 @@ show_access_urls() {
     local label="$1"
     local protocol="$2"
     local port="$3"
+    local address_family="${4:-}"
     local ifname family cidr addr key url
     local -A seen=()
     local printed=0
@@ -234,6 +249,9 @@ show_access_urls() {
                 inet|inet6) ;;
                 *) continue ;;
             esac
+            if [[ -n "${address_family}" && "${family}" != "${address_family}" ]]; then
+                continue
+            fi
 
             ifname="${ifname%%@*}"
             addr="${cidr%%/*}"
@@ -282,20 +300,6 @@ configure_bind_args() {
 
     for ((i = 0; i < ${#args[@]}; i++)); do
         case "${args[$i]}" in
-            --https)
-                if (( i + 1 >= ${#args[@]} )); then
-                    echo "[run] --https requires yes or no" >&2
-                    exit 1
-                fi
-                value="${args[$((i + 1))]}"
-                case "${value}" in
-                    yes|no) HTTPS_ENABLED="${value}" ;;
-                    *)
-                        echo "[run] --https must be yes or no" >&2
-                        exit 1
-                        ;;
-                esac
-                ;;
             -p|--port)
                 if (( i + 1 >= ${#args[@]} )) || [[ ! "${args[$((i + 1))]}" =~ ^[0-9]+$ ]]; then
                     echo "[run] -p/--port requires a numeric port value" >&2
@@ -324,54 +328,55 @@ configure_bind_args() {
     if [[ -z "${port}" ]]; then
         if [[ "${VIBE_RDESK_BIND_WAS_SET}" == "1" ]]; then
             port="$(first_bind_port "${VIBE_RDESK_BIND}")"
-        elif [[ "${HTTPS_ENABLED}" == "yes" ]]; then
-            port="${DEFAULT_HTTPS_PORT}"
         else
             port="${DEFAULT_HTTP_PORT}"
         fi
     fi
 
     if [[ "${localhost}" == "yes" ]]; then
-        export VIBE_RDESK_BIND="127.0.0.1:${port},[::1]:${port}"
+        export VIBE_RDESK_BIND="127.0.0.1:${port}"
     elif [[ "${port_explicit}" == "yes" || "${VIBE_RDESK_BIND_WAS_SET}" == "0" ]]; then
-        export VIBE_RDESK_BIND="0.0.0.0:${port},[::]:${port}"
+        export VIBE_RDESK_BIND="0.0.0.0:${port}"
     fi
 }
 
 show_startup_help() {
-    local protocol="$1"
-    local port
-    port="$(first_bind_port "${VIBE_RDESK_BIND}")"
+    local http_port
+    http_port="$(first_bind_port "${VIBE_RDESK_BIND}")"
 
-    local server_label="HTTPS"
-    local reminder="use https://, not http://."
-    if [[ "${protocol}" == "http" ]]; then
-        server_label="HTTP"
+    local https_line="HTTPS proxy: enabled; first available port at or after $((http_port + 1))"
+    local reminder="use https:// for TLS, or http:// for direct local HTTP."
+    if [[ "${HTTPS_ENABLED}" == "no" ]]; then
+        https_line="HTTPS proxy: disabled because --https no was specified"
         reminder="using normal http:// because --https no was specified."
     fi
 
     cat <<EOF
-[run] Production:  bash run.sh --passwd passwd --port 18443 --https yes --headless no
+[run] Production:  bash run.sh --passwd passwd --port ${http_port} --https yes --headless no
 [run] Development: bash dev.sh --passwd passwd
-[run] starting vibe_rdesk ${server_label} server
-[run] bind: ${VIBE_RDESK_BIND}
+[run] starting vibe_rdesk HTTP server
+[run] HTTP bind: ${VIBE_RDESK_BIND}
+[run] ${https_line}
 [run] ${reminder} Default is all IPv4/IPv6 interfaces; use --localhost yes for loopback only.
-[run] Use --https no to disable built-in HTTPS and serve HTTP.
-[run] If you need HTTPS with --https no, put an HTTPS proxy in front of this server.
+[run] Use --https no to disable the HTTPS proxy and serve HTTP only.
 [run] starting in ${STARTUP_HELP_SECONDS}s...
 EOF
 }
 
 show_server_access_urls() {
-    local protocol="$1"
-    local port
-    port="$(first_bind_port "${VIBE_RDESK_BIND}")"
+    local http_port
+    http_port="$(first_bind_port "${VIBE_RDESK_BIND}")"
 
-    if ! wait_for_server_port "${port}" && [[ -n "${APP_PID}" ]] && ! kill -0 "${APP_PID}" 2>/dev/null; then
+    if ! wait_for_server_port "${http_port}" && [[ -n "${APP_PID}" ]] && ! kill -0 "${APP_PID}" 2>/dev/null; then
         return 1
     fi
-    echo "[run] server started on ${VIBE_RDESK_BIND}"
-    show_access_urls "[run]" "${protocol}" "${port}"
+    echo "[run] HTTP server started on ${VIBE_RDESK_BIND}"
+    show_access_urls "[run]" "http" "${http_port}" "inet"
+
+    if [[ "${HTTPS_ENABLED}" != "no" ]]; then
+        start_https_proxy "${http_port}"
+        show_access_urls "[run]" "https" "${HTTPS_PROXY_PORT}" "inet"
+    fi
 }
 
 wait_for_server_port() {
@@ -444,6 +449,111 @@ EOF
         -config "${openssl_config}" \
         >/dev/null 2>&1
     chmod 600 "${SSL_KEY}" 2>/dev/null || true
+}
+
+start_https_proxy() {
+    local http_port="$1"
+    local start_port="$((http_port + 1))"
+    local bind_host="0.0.0.0"
+    local first_bind
+
+    first_bind="${VIBE_RDESK_BIND%%,*}"
+    if [[ "${first_bind}" == 127.0.0.1:* || "${first_bind}" == "[::1]:"* ]]; then
+        bind_host="127.0.0.1"
+    fi
+
+    if [[ -n "${HTTPS_PROXY_PID}" ]] && kill -0 "${HTTPS_PROXY_PID}" 2>/dev/null; then
+        kill "${HTTPS_PROXY_PID}" 2>/dev/null || true
+        wait "${HTTPS_PROXY_PID}" 2>/dev/null || true
+    fi
+
+    local proxy_ready="${DEV_LOG_DIR}/https-proxy.port"
+    local proxy_log="${DEV_LOG_DIR}/https-proxy.log"
+    rm -f "${proxy_ready}"
+
+    python3 - "${bind_host}" "${start_port}" "127.0.0.1" "${http_port}" "${SSL_CERT}" "${SSL_KEY}" "${proxy_ready}" >"${proxy_log}" 2>&1 <<'PY' &
+import os
+import select
+import socket
+import ssl
+import sys
+import threading
+
+bind_host, start_port, upstream_host, upstream_port, cert_path, key_path, ready_path = sys.argv[1:]
+start_port = int(start_port)
+upstream_port = int(upstream_port)
+
+listener = None
+port = start_port
+while port <= 65535:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((bind_host, port))
+        sock.listen(128)
+        listener = sock
+        break
+    except OSError:
+        sock.close()
+        port += 1
+
+if listener is None:
+    raise SystemExit(f"no free HTTPS proxy port found at or above {start_port}")
+
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(cert_path, key_path)
+
+with open(ready_path, "w", encoding="utf-8") as ready:
+    ready.write(f"{port}\n")
+
+def relay(client):
+    upstream = None
+    try:
+        tls_client = context.wrap_socket(client, server_side=True)
+        upstream = socket.create_connection((upstream_host, upstream_port))
+        sockets = [tls_client, upstream]
+        while True:
+            readable, _, _ = select.select(sockets, [], [])
+            for source in readable:
+                data = source.recv(65536)
+                if not data:
+                    return
+                target = upstream if source is tls_client else tls_client
+                target.sendall(data)
+    except Exception:
+        return
+    finally:
+        for sock in (client, upstream):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+while True:
+    client, _ = listener.accept()
+    thread = threading.Thread(target=relay, args=(client,), daemon=True)
+    thread.start()
+PY
+    HTTPS_PROXY_PID=$!
+
+    local attempts=120
+    while (( attempts > 0 )); do
+        if [[ -s "${proxy_ready}" ]]; then
+            HTTPS_PROXY_PORT="$(<"${proxy_ready}")"
+            echo "[run] HTTPS proxy started on ${bind_host}:${HTTPS_PROXY_PORT} -> 127.0.0.1:${http_port}"
+            return 0
+        fi
+        if ! kill -0 "${HTTPS_PROXY_PID}" 2>/dev/null; then
+            echo "[run] HTTPS proxy failed to start; see ${proxy_log}" >&2
+            exit 1
+        fi
+        sleep 0.25
+        ((attempts--))
+    done
+
+    echo "[run] timed out waiting for HTTPS proxy startup; see ${proxy_log}" >&2
+    exit 1
 }
 
 normalize_display() {
@@ -1745,6 +1855,11 @@ ensure_display() {
 }
 
 cleanup() {
+    if [[ -n "${HTTPS_PROXY_PID}" ]] && kill -0 "${HTTPS_PROXY_PID}" 2>/dev/null; then
+        kill "${HTTPS_PROXY_PID}" 2>/dev/null || true
+        wait "${HTTPS_PROXY_PID}" 2>/dev/null || true
+    fi
+
     if [[ -n "${APP_PID}" ]] && kill -0 "${APP_PID}" 2>/dev/null; then
         kill "${APP_PID}" 2>/dev/null || true
         wait "${APP_PID}" 2>/dev/null || true
@@ -1790,7 +1905,7 @@ run_server() {
     echo "[run] starting app..."
     "${APP_BINARY}" "$@" &
     APP_PID=$!
-    show_server_access_urls "${SERVER_PROTOCOL}"
+    show_server_access_urls
     start_pending_launcher_after_server
     wait "${APP_PID}"
 }
@@ -1815,19 +1930,12 @@ trap cleanup EXIT INT TERM
 parse_script_args "$@"
 require_passwd_arg "${APP_ARGS[@]}"
 configure_bind_args "${APP_ARGS[@]}"
-if [[ "${HTTPS_ENABLED}" == "yes" ]]; then
-    SERVER_PROTOCOL="https"
-else
-    SERVER_PROTOCOL="http"
-    unset VIBE_RDESK_TLS_CERT
-    unset VIBE_RDESK_TLS_KEY
-fi
-show_startup_help "${SERVER_PROTOCOL}"
+unset VIBE_RDESK_TLS_CERT
+unset VIBE_RDESK_TLS_KEY
+show_startup_help
 sleep "${STARTUP_HELP_SECONDS}"
-if [[ "${HTTPS_ENABLED}" == "yes" ]]; then
+if [[ "${HTTPS_ENABLED}" != "no" ]]; then
     ensure_tls_keys
-    export VIBE_RDESK_TLS_CERT="${SSL_CERT}"
-    export VIBE_RDESK_TLS_KEY="${SSL_KEY}"
 fi
 configure_session_runtime_env
 ensure_dev_log_dir
