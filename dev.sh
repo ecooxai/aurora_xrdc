@@ -47,7 +47,7 @@ STARTUP_HELP_SECONDS="${VIBE_RDESK_HELP_SECONDS:-3}"
 VIRTUAL_MIC_SOURCE_NAME="${VIBE_RDESK_VIRTUAL_MIC_SOURCE_NAME:-Viberdeskmic}"
 VIRTUAL_MIC_SINK_NAME="${VIBE_RDESK_VIRTUAL_MIC_SINK_NAME:-vibe_rdesk_virtual_mic_sink}"
 VIRTUAL_AUDIO_SINK_NAME="${VIBE_RDESK_AUDIO_SINK:-}"
-DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:8001}"
+DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:8001,[::]:8001}"
 export VIBE_RDESK_BIND="${DEFAULT_BIND}"
 HTTPS_ENABLED="yes"
 SSL_DIR="${VIBE_RDESK_SSL_DIR:-ssl_keys}"
@@ -262,9 +262,9 @@ configure_bind_args() {
     fi
 
     if [[ "${localhost}" == "yes" ]]; then
-        export VIBE_RDESK_BIND="127.0.0.1:${port}"
+        export VIBE_RDESK_BIND="127.0.0.1:${port},[::1]:${port}"
     elif [[ -n "${port}" ]]; then
-        export VIBE_RDESK_BIND="0.0.0.0:${port}"
+        export VIBE_RDESK_BIND="0.0.0.0:${port},[::]:${port}"
     fi
 }
 
@@ -411,13 +411,26 @@ bind_host, start_port, upstream_host, upstream_port, cert_path, key_path, ready_
 start_port = int(start_port)
 upstream_port = int(upstream_port)
 
+# Listen on IPv6 with a dual-stack socket so the proxy is reachable over both
+# IPv4 and IPv6. For the wildcard bind, "::" with IPV6_V6ONLY=0 also accepts
+# IPv4-mapped clients; for an explicit IPv4 host keep an IPv4-only socket.
+if bind_host in ("0.0.0.0", "::", ""):
+    family, listen_host, dual_stack = socket.AF_INET6, "::", True
+else:
+    family, listen_host, dual_stack = socket.AF_INET, bind_host, False
+
 listener = None
 port = start_port
 while port <= 65535:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = socket.socket(family, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if dual_stack:
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError:
+            pass
     try:
-        sock.bind((bind_host, port))
+        sock.bind((listen_host, port))
         sock.listen(128)
         listener = sock
         break

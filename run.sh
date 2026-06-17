@@ -70,7 +70,7 @@ VIBE_RDESK_BIND_WAS_SET=0
 if [[ -n "${VIBE_RDESK_BIND+x}" ]]; then
     VIBE_RDESK_BIND_WAS_SET=1
 fi
-DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:${DEFAULT_HTTP_PORT}}"
+DEFAULT_BIND="${VIBE_RDESK_BIND:-0.0.0.0:${DEFAULT_HTTP_PORT},[::]:${DEFAULT_HTTP_PORT}}"
 export VIBE_RDESK_BIND="${DEFAULT_BIND}"
 DEV_LOG_UID="${SUDO_UID:-$(id -u)}"
 DEV_LOG_DIR="${VIBE_RDESK_LOG_DIR:-/tmp/vibe_rdesk-${DEV_LOG_UID}}"
@@ -334,9 +334,9 @@ configure_bind_args() {
     fi
 
     if [[ "${localhost}" == "yes" ]]; then
-        export VIBE_RDESK_BIND="127.0.0.1:${port}"
+        export VIBE_RDESK_BIND="127.0.0.1:${port},[::1]:${port}"
     elif [[ "${port_explicit}" == "yes" || "${VIBE_RDESK_BIND_WAS_SET}" == "0" ]]; then
-        export VIBE_RDESK_BIND="0.0.0.0:${port}"
+        export VIBE_RDESK_BIND="0.0.0.0:${port},[::]:${port}"
     fi
 }
 
@@ -483,13 +483,26 @@ bind_host, start_port, upstream_host, upstream_port, cert_path, key_path, ready_
 start_port = int(start_port)
 upstream_port = int(upstream_port)
 
+# Listen on IPv6 with a dual-stack socket so the proxy is reachable over both
+# IPv4 and IPv6. For the wildcard bind, "::" with IPV6_V6ONLY=0 also accepts
+# IPv4-mapped clients; for an explicit IPv4 host keep an IPv4-only socket.
+if bind_host in ("0.0.0.0", "::", ""):
+    family, listen_host, dual_stack = socket.AF_INET6, "::", True
+else:
+    family, listen_host, dual_stack = socket.AF_INET, bind_host, False
+
 listener = None
 port = start_port
 while port <= 65535:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = socket.socket(family, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if dual_stack:
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError:
+            pass
     try:
-        sock.bind((bind_host, port))
+        sock.bind((listen_host, port))
         sock.listen(128)
         listener = sock
         break
