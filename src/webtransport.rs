@@ -35,7 +35,6 @@ use axum::extract::ws::Message;
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, stream};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::PollSender;
 use tracing::warn;
@@ -406,7 +405,10 @@ async fn write_payload(send: &mut SendStream, kind: u8, payload: &[u8]) -> Resul
     if !payload.is_empty() {
         send.write_all(payload).await?;
     }
-    send.flush().await?;
+    // No per-frame `flush()`: quinn's connection driver transmits buffered stream
+    // data on its own event loop as soon as congestion/flow control allow, so an
+    // explicit flush only adds a driver round-trip per frame without improving
+    // latency. Graceful delivery on shutdown is still guaranteed by `finish()`.
     Ok(())
 }
 
