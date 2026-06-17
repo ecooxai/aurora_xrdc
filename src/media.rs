@@ -52,6 +52,7 @@ struct VideoRuntime {
     subscribers: usize,
     desired_config: StreamConfig,
     configured: bool,
+    explicitly_configured: bool,
 }
 
 struct AudioRuntime {
@@ -59,6 +60,7 @@ struct AudioRuntime {
     subscribers: usize,
     desired_config: AudioStreamConfig,
     configured: bool,
+    explicitly_configured: bool,
 }
 
 struct VideoProcess {
@@ -107,6 +109,7 @@ impl MediaHub {
                     subscribers: 0,
                     desired_config: StreamConfig::default(),
                     configured: false,
+                    explicitly_configured: false,
                 }),
             }),
             audio: Arc::new(AudioHub {
@@ -118,6 +121,7 @@ impl MediaHub {
                     subscribers: 0,
                     desired_config: AudioStreamConfig::default(),
                     configured: false,
+                    explicitly_configured: false,
                 }),
             }),
         }
@@ -163,8 +167,10 @@ impl VideoHub {
     async fn acquire(self: &Arc<Self>, requested: StreamConfig) -> Result<VideoLease> {
         let rx = self.frames.subscribe();
         let mut runtime = self.runtime.lock().await;
-        runtime.desired_config = requested;
-        runtime.configured = true;
+        if !runtime.explicitly_configured {
+            runtime.desired_config = requested;
+            runtime.configured = true;
+        }
         runtime.subscribers += 1;
         if let Err(err) = self.ensure_active(&mut runtime).await {
             runtime.subscribers = runtime.subscribers.saturating_sub(1);
@@ -183,6 +189,7 @@ impl VideoHub {
         let mut runtime = self.runtime.lock().await;
         runtime.desired_config = config;
         runtime.configured = true;
+        runtime.explicitly_configured = true;
         self.ensure_active(&mut runtime).await
     }
 
@@ -354,8 +361,10 @@ impl VideoHub {
 impl AudioHub {
     async fn acquire(self: &Arc<Self>, requested: AudioStreamConfig) -> Result<AudioLease> {
         let mut runtime = self.runtime.lock().await;
-        runtime.desired_config = requested;
-        runtime.configured = true;
+        if !runtime.explicitly_configured {
+            runtime.desired_config = requested;
+            runtime.configured = true;
+        }
         runtime.subscribers += 1;
         if let Err(err) = self.ensure_active(&mut runtime).await {
             runtime.subscribers = runtime.subscribers.saturating_sub(1);
@@ -374,6 +383,7 @@ impl AudioHub {
         let mut runtime = self.runtime.lock().await;
         runtime.desired_config = config;
         runtime.configured = true;
+        runtime.explicitly_configured = true;
         self.ensure_active(&mut runtime).await
     }
 

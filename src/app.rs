@@ -791,6 +791,7 @@ async fn ws(
             audio_config,
             role,
             close_rx,
+            state.clients.clone(),
         )
         .await
         {
@@ -923,6 +924,7 @@ async fn handle_wt_incoming(state: Arc<AppState>, incoming: IncomingSession) -> 
         audio_config,
         role,
         close_rx,
+        state.clients.clone(),
     )
     .await
 }

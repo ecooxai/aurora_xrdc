@@ -65,6 +65,10 @@ impl ClientManager {
         }
     }
 
+    pub async fn count(&self) -> usize {
+        self.clients.lock().await.len()
+    }
+
     pub async fn list(&self) -> Vec<WebClientInfo> {
         let clients = self.clients.lock().await;
         let mut list = clients

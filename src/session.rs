@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -18,6 +19,7 @@ use tracing::{error, warn};
 
 use crate::{
     audio::AudioFrame,
+    client_manager::ClientManager,
     clipboard::{read_remote_clipboard, write_remote_clipboard},
     ffmpeg::{MicInputHandle, read_stderr, run_xdotool, spawn_mic_input_injector, wake_display},
     media::{ActiveAudioState, ActiveVideoState, MediaHub},
@@ -88,13 +90,14 @@ pub async fn handle_socket(
     audio_config: AudioStreamConfig,
     role: SessionRole,
     close_rx: watch::Receiver<bool>,
+    clients: Arc<ClientManager>,
 ) -> Result<()> {
     match role {
         SessionRole::All => {
-            handle_combined_socket(sink, stream, server, media, config, audio_config, close_rx).await
+            handle_combined_socket(sink, stream, server, media, config, audio_config, close_rx, clients).await
         }
         SessionRole::Control => {
-            handle_control_socket(sink, stream, server, media, close_rx).await
+            handle_control_socket(sink, stream, server, media, close_rx, clients).await
         }
         SessionRole::Video => {
             handle_video_socket(sink, stream, server, media, config, close_rx).await
@@ -115,6 +118,7 @@ async fn handle_combined_socket(
     config: StreamConfig,
     audio_config: AudioStreamConfig,
     mut close_rx: watch::Receiver<bool>,
+    clients: Arc<ClientManager>,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
     maybe_wake_display(&server.display, &mut initial_display_wake_at);
@@ -154,7 +158,7 @@ async fn handle_combined_socket(
             .await;
     }
     let writer_task = tokio::spawn(write_socket(ws_sender, out_rx, video_rx, audio_rx));
-    let stats_task = spawn_stats(out_tx.clone(), video_stream.state_rx.clone());
+    let stats_task = spawn_stats(out_tx.clone(), video_stream.state_rx.clone(), clients);
     let send_task = tokio::spawn(forward_frames(
         out_tx.clone(),
         video_tx,
@@ -242,6 +246,7 @@ async fn handle_control_socket(
     server: ServerConfig,
     media: MediaHub,
     mut close_rx: watch::Receiver<bool>,
+    clients: Arc<ClientManager>,
 ) -> Result<()> {
     let mut initial_display_wake_at = None;
     maybe_wake_display(&server.display, &mut initial_display_wake_at);
@@ -249,7 +254,7 @@ async fn handle_control_socket(
     let (out_tx, out_rx) = mpsc::channel::<Message>(32);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let writer_task = tokio::spawn(write_control_socket(ws_sender, out_rx));
-    let stats_task = spawn_stats(out_tx.clone(), media.video_state_rx());
+    let stats_task = spawn_stats(out_tx.clone(), media.video_state_rx(), clients);
     let state_task = tokio::spawn(forward_state_hellos(
         out_tx.clone(),
         server.display.clone(),
@@ -897,10 +902,11 @@ async fn write_socket(
 fn spawn_stats(
     sender: mpsc::Sender<Message>,
     video_state_rx: watch::Receiver<Option<ActiveVideoState>>,
+    clients: Arc<ClientManager>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sampler = StatsSampler::new();
-        let mut tick = tokio::time::interval(Duration::from_secs(3));
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
         let video_state_rx = video_state_rx;
         loop {
             tick.tick().await;
@@ -908,6 +914,7 @@ fn spawn_stats(
                 continue;
             };
             let sample = sampler.sample();
+            let client_count = clients.count().await as u32;
             let msg = ServerMessage::Stats {
                 capture_fps: video_state.config.fps as f32,
                 bitrate_kbps: video_state.config.bitrate_kbps,
@@ -922,6 +929,7 @@ fn spawn_stats(
                 swap_total_mb: sample.swap_total_mb,
                 net_tx_kbps: sample.net_tx_kbps,
                 net_rx_kbps: sample.net_rx_kbps,
+                client_count,
             };
             match serde_json::to_string(&msg) {
                 Ok(text) => {

@@ -184,6 +184,8 @@ const state = {
   decoderRecovering: false,
   waitingForKeyframe: true,
   frameCount: 0,
+  statsLastFrameCount: 0,
+  statsLastFrameAt: 0,
   bytesReceived: 0,
   netWindowBytes: 0,
   lastNetAt: performance.now(),
@@ -353,6 +355,8 @@ const statusSpeedDownload = $("status-speed-download");
 const statusSpeedUpload = $("status-speed-upload");
 const statusAudioBuffer = $("status-audio-buffer");
 const statusUpdatedAt = $("status-updated-at");
+const statusFps = $("status-fps");
+const statusFpsMeta = $("status-fps-meta");
 const webclientsToggle = $("webclients-toggle");
 const webclientsCount = $("webclients-count");
 const webclientsManager = $("webclients-manager");
@@ -535,6 +539,8 @@ function renderStatusMetrics({
   swap_total_mb,
   net_tx_kbps,
   net_rx_kbps,
+  capture_fps,
+  client_count,
 } = {}) {
   statusCpu.textContent = formatPercent(cpu_usage);
   statusRam.textContent = formatMemoryUsage(memory_used_mb, memory_total_mb);
@@ -544,6 +550,26 @@ function renderStatusMetrics({
   statusSpeedDownload.textContent = `↓ ${formatMbPerSecond(net_rx_kbps)}`;
   statusSpeedUpload.textContent = `↑ ${formatMbPerSecond(net_tx_kbps)}`;
   statusUpdatedAt.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+  const now = performance.now();
+  if (state.statsLastFrameAt > 0) {
+    const elapsed = (now - state.statsLastFrameAt) / 1000;
+    const rendered = state.frameCount - state.statsLastFrameCount;
+    const renderFps = elapsed > 0 ? Math.round(rendered / elapsed) : 0;
+    statusFps.textContent = `${renderFps}`;
+    if (Number.isFinite(capture_fps) && capture_fps > 0) {
+      statusFpsMeta.textContent = `cap ${Math.round(capture_fps)}`;
+    } else {
+      statusFpsMeta.textContent = "";
+    }
+  } else {
+    statusFps.textContent = "--";
+    statusFpsMeta.textContent = "";
+  }
+  state.statsLastFrameCount = state.frameCount;
+  state.statsLastFrameAt = now;
+  if (typeof client_count === "number") {
+    webclientsCount.textContent = `${client_count}`;
+  }
 }
 
 function renderLatencyMetric() {
@@ -588,8 +614,12 @@ function renderAudioBufferMetric() {
 function resetStatusMetrics() {
   state.wsLatencyMs = null;
   state.latencyProbeSentAt.clear();
+  state.statsLastFrameAt = 0;
+  state.statsLastFrameCount = 0;
+  statusFps.textContent = "--";
+  statusFpsMeta.textContent = "";
   renderStatusMetrics({});
-  statusUpdatedAt.textContent = "Stats and latency every 3s";
+  statusUpdatedAt.textContent = "Stats and latency every 5s";
   state.highLatencySinceAt = 0;
   state.lastStaleDropAt = 0;
   setStreamWarning("");
@@ -1092,6 +1122,9 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
   const applied = readSettingsFromControls();
   saveSettings(applied);
   markAppliedStreamSettings(applied);
+  if (isConnected() && !state.connecting) {
+    reconnectWithCurrentStreamSettings("Reconnecting with updated stream settings...");
+  }
 }
 
 function reconnectWithCurrentStreamSettings(reason) {
@@ -6394,7 +6427,6 @@ renderCameraToggle();
 void refreshMicDevices({ silent: true });
 setInterval(renderAudioBufferMetric, 1000);
 setInterval(monitorConnectionHealth, HEALTH_WATCHDOG_INTERVAL_MS);
-setInterval(refreshWebClients, 3000);
 state.apiOrigin = loadStoredApiOrigin();
 authOriginInput.value = state.apiOrigin;
 state.sessionPasswd = loadStoredPasswd();
