@@ -828,6 +828,12 @@ async fn wt_info(State(state): State<Arc<AppState>>) -> Json<WtInfoResponse> {
 /// Defaults to the first HTTP bind address (UDP and TCP port namespaces are
 /// independent, so reusing the port is fine) and can be overridden with
 /// `VIBE_RDESK_WT_BIND`. Set `VIBE_RDESK_WT=0` to disable WebTransport entirely.
+///
+/// When the bind list contains both an IPv4 (`0.0.0.0`) and an IPv6 (`[::]`)
+/// wildcard, the IPv6 one is preferred: on Linux the resulting QUIC/UDP socket
+/// is dual-stack (IPV6_V6ONLY defaults to 0), so it accepts both IPv4 and IPv6
+/// clients through a single endpoint.  Without this, a browser that connects to
+/// the server over IPv6 cannot reach the IPv4-only WebTransport port.
 fn webtransport_bind_addr(http_bind: &str) -> Option<SocketAddr> {
     match std::env::var("VIBE_RDESK_WT") {
         Ok(value) if matches!(value.trim(), "0" | "false" | "no" | "off") => return None,
@@ -836,11 +842,20 @@ fn webtransport_bind_addr(http_bind: &str) -> Option<SocketAddr> {
     if let Ok(explicit) = std::env::var("VIBE_RDESK_WT_BIND") {
         return explicit.trim().parse().ok();
     }
-    http_bind
+    let addrs: Vec<SocketAddr> = http_bind
         .split(',')
         .map(str::trim)
-        .find(|entry| !entry.is_empty())
-        .and_then(|entry| entry.parse().ok())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    // Prefer [::]:port (dual-stack) so the QUIC endpoint is reachable from
+    // both IPv4 and IPv6 clients.  Fall back to the first address if no IPv6
+    // wildcard is present.
+    addrs
+        .iter()
+        .find(|a| a.is_ipv6() && a.ip().is_unspecified())
+        .or_else(|| addrs.first())
+        .copied()
 }
 
 /// Sets up the WebTransport endpoint, logging and disabling it on failure.
