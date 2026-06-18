@@ -186,6 +186,10 @@ const state = {
   frameCount: 0,
   statsLastFrameCount: 0,
   statsLastFrameAt: 0,
+  // WebRTC media-mode: rendering the decoded video track through the canvas
+  // pipeline (vs the WebCodecs paths) and the track reader to cancel on close.
+  mediaTrackRendering: false,
+  mediaTrackReader: null,
   bytesReceived: 0,
   netWindowBytes: 0,
   lastNetAt: performance.now(),
@@ -2901,7 +2905,7 @@ class WebRtcSocket {
       : new MediaStream([event.track]);
     this._mediaStream = stream;
     if (event.track.kind === "video") {
-      attachMediaVideo(stream);
+      attachMediaVideoTrack(event.track, stream);
     } else if (event.track.kind === "audio") {
       attachMediaAudio(stream);
     }
@@ -2949,12 +2953,57 @@ class WebRtcSocket {
 
 // --- WebRTC media-mode native rendering -----------------------------------
 
-function attachMediaVideo(stream) {
+// Renders a WebRTC media-mode video track. Where supported (Chromium), frames
+// are pulled off the decoded track with MediaStreamTrackProcessor and pushed
+// through the SAME canvas render pipeline as every other transport, so canvas
+// sizing, zoom and pointer coordinate mapping all work unchanged. Browsers
+// without MediaStreamTrackProcessor fall back to the native <video> overlay.
+function attachMediaVideoTrack(track, stream) {
+  if (typeof MediaStreamTrackProcessor !== "undefined") {
+    state.mediaTrackRendering = true;
+    if (screenVideo) {
+      screenVideo.srcObject = null;
+      screenVideo.classList.add("hidden");
+    }
+    void pumpMediaTrackFrames(track);
+    return;
+  }
+  // Fallback: native overlay.
+  state.mediaTrackRendering = false;
   if (!screenVideo) return;
   screenVideo.srcObject = stream;
   screenVideo.classList.remove("hidden");
   const play = screenVideo.play();
   if (play && typeof play.catch === "function") play.catch(() => {});
+}
+
+// Reads decoded VideoFrames off a media track and feeds them into the canvas
+// renderer until the track ends.
+async function pumpMediaTrackFrames(track) {
+  let processor;
+  try {
+    processor = new MediaStreamTrackProcessor({ track });
+  } catch (error) {
+    showToast("media_track_processor", error?.message || String(error));
+    return;
+  }
+  const reader = processor.readable.getReader();
+  state.mediaTrackReader = reader;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) queueVideoFrameForRender(value);
+    }
+  } catch {
+    // Track ended or transport closed; the close handler clears overlay state.
+  } finally {
+    try {
+      reader.releaseLock();
+    } catch {
+      // Reader already released.
+    }
+  }
 }
 
 function attachMediaAudio(stream) {
@@ -2966,9 +3015,20 @@ function attachMediaAudio(stream) {
 }
 
 function detachMediaOverlay(role) {
-  if ((role === "video" || role === "all") && screenVideo) {
-    screenVideo.srcObject = null;
-    screenVideo.classList.add("hidden");
+  if (role === "video" || role === "all") {
+    state.mediaTrackRendering = false;
+    if (state.mediaTrackReader) {
+      try {
+        state.mediaTrackReader.cancel();
+      } catch {
+        // Already cancelled.
+      }
+      state.mediaTrackReader = null;
+    }
+    if (screenVideo) {
+      screenVideo.srcObject = null;
+      screenVideo.classList.add("hidden");
+    }
   }
   if ((role === "audio" || role === "all") && screenAudio) {
     screenAudio.srcObject = null;
@@ -3817,10 +3877,15 @@ async function renderLatestVideoFrame() {
   state.pendingVideoFrame = null;
   state.renderingVideoFrame = true;
   try {
-    const sentAtMs = Number(frame.timestamp ?? 0) / 1000;
-    if (estimateMediaAgeMs(sentAtMs) > state.liveMediaMaxAgeMs) {
-      markStaleDrop("Dropping delayed video");
-      return;
+    // Media-track frames carry RTP, not server-wall-clock, timestamps, and the
+    // browser's jitter buffer already paces them, so skip the wall-clock
+    // staleness check that the WebCodecs paths use.
+    if (!state.mediaTrackRendering) {
+      const sentAtMs = Number(frame.timestamp ?? 0) / 1000;
+      if (estimateMediaAgeMs(sentAtMs) > state.liveMediaMaxAgeMs) {
+        markStaleDrop("Dropping delayed video");
+        return;
+      }
     }
     await drawFrame(frame);
   } finally {
