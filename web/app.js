@@ -2784,12 +2784,13 @@ class WebRtcSocket {
         if (this._wantsAudio) pc.addTransceiver("audio", { direction: "recvonly" });
         pc.ontrack = (event) => this._handleTrack(event);
       } else if (this._wantsVideo) {
-        // Reliable, unordered video channel. The server coalesces to the freshest
-        // keyframe (like the WebTransport video stream), and each frame is
-        // fragmented below the SCTP max message size; reliability guarantees every
-        // fragment of a sent frame arrives (so large keyframes are never silently
-        // dropped), while unordered delivery avoids head-of-line blocking.
-        const video = pc.createDataChannel("video", { ordered: false });
+        // Unreliable, unordered video channel (latency-first). The server
+        // coalesces to the freshest keyframe and skips frames when the link is
+        // congested, so there's no retransmit backlog or head-of-line blocking —
+        // a momentary slow link drops frames instead of stalling for seconds.
+        // Each frame is fragmented below the SCTP max message size; a frame whose
+        // fragments don't all arrive before the next one is simply discarded.
+        const video = pc.createDataChannel("video", { ordered: false, maxRetransmits: 0 });
         video.binaryType = "arraybuffer";
         this._video = video;
         this._videoReasm = { seq: -1, count: 0, received: 0, parts: null };

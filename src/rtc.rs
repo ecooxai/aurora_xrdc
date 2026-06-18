@@ -252,7 +252,15 @@ pub async fn answer(
 
     // Build the transport-agnostic sink/stream and run the session on a detached
     // task that owns the peer connection and the client lease for its lifetime.
-    let sink = build_sink(mode, ctrl_tx, video, video_track, audio_track, config.fps);
+    let sink = build_sink(
+        mode,
+        config.codec,
+        ctrl_tx,
+        video,
+        video_track,
+        audio_track,
+        config.fps,
+    );
     let stream = build_stream(in_rx, shutdown);
     let pc_for_task = pc.clone();
     tokio::spawn(async move {
@@ -344,10 +352,20 @@ async fn add_track(pc: &Arc<RTCPeerConnection>, track: Arc<TrackLocalStaticSampl
 const VIDEO_FRAGMENT_PAYLOAD: usize = 16 * 1024;
 /// Per-fragment header: `[u32 LE frame seq][u16 LE fragment index][u16 LE count]`.
 const VIDEO_FRAGMENT_HEADER: usize = 8;
+/// If the data channel's send buffer already holds more than this, the next frame
+/// is skipped rather than queued. The video channel is unreliable (latency-first):
+/// queuing onto a backed-up channel only adds delay, and the server already
+/// coalesces to the freshest keyframe, so dropping a frame and waiting for the
+/// next is strictly better than stalling. Roughly one large keyframe's worth.
+const VIDEO_BUFFER_SKIP_THRESHOLD: usize = 256 * 1024;
 
-/// Wires the reliable, unordered `video` data channel to the coalescing queue:
+/// Wires the unreliable, unordered `video` data channel to the coalescing queue:
 /// once the browser opens it, drain the freshest-keyframe queue onto it,
 /// fragmenting each frame so no single SCTP message exceeds the channel's max.
+///
+/// Latency-first: the channel does not retransmit, and a frame is skipped
+/// entirely when the send buffer is congested, so a momentary slow link can't
+/// build a backlog — the client always advances toward the newest frame.
 fn wire_video_channel(dc: Arc<RTCDataChannel>, video: Arc<VideoQueue>) {
     let dc_open = dc.clone();
     dc.on_open(Box::new(move || {
@@ -356,6 +374,12 @@ fn wire_video_channel(dc: Arc<RTCDataChannel>, video: Arc<VideoQueue>) {
         Box::pin(async move {
             let mut seq: u32 = 0;
             while let Some(frame) = video.next().await {
+                // Drop the frame if the channel is already backed up: sending it
+                // would only add latency, and a fresher frame is coming.
+                if dc.buffered_amount().await > VIDEO_BUFFER_SKIP_THRESHOLD {
+                    seq = seq.wrapping_add(1);
+                    continue;
+                }
                 if send_video_fragments(&dc, seq, &frame).await.is_err() {
                     break;
                 }
@@ -367,8 +391,8 @@ fn wire_video_channel(dc: Arc<RTCDataChannel>, video: Arc<VideoQueue>) {
 
 /// Splits one encoded frame into `[u32 seq][u16 idx][u16 count]`-prefixed
 /// fragments and sends each as its own data channel message. The channel is
-/// reliable, so every fragment of a frame that began sending is delivered; the
-/// client reassembles by `seq` and discards any older incomplete frame.
+/// unreliable, so a fragment can be lost; the client reassembles by `seq` and
+/// discards any frame whose fragments don't all arrive before the next one.
 async fn send_video_fragments(
     dc: &Arc<RTCDataChannel>,
     seq: u32,
@@ -541,6 +565,7 @@ fn build_stream(rx: mpsc::Receiver<Result<Message>>, shutdown: Arc<Notify>) -> W
 #[allow(clippy::too_many_arguments)]
 fn build_sink(
     mode: RtcMode,
+    codec: CodecKind,
     ctrl_tx: mpsc::Sender<Message>,
     video: Arc<VideoQueue>,
     video_track: Option<Arc<TrackLocalStaticSample>>,
@@ -549,6 +574,7 @@ fn build_sink(
 ) -> WireSink {
     Box::pin(RtcSink {
         mode,
+        codec,
         ctrl: PollSender::new(ctrl_tx),
         video,
         video_track,
@@ -562,6 +588,7 @@ fn build_sink(
 /// video/audio are written to RTP tracks and only control rides the ctrl channel.
 struct RtcSink {
     mode: RtcMode,
+    codec: CodecKind,
     ctrl: PollSender<Message>,
     video: Arc<VideoQueue>,
     video_track: Option<Arc<TrackLocalStaticSample>>,
@@ -591,18 +618,18 @@ impl Sink<Message> for RtcSink {
                     if is_video_packet(bytes) {
                         if let Some(track) = self.video_track.clone() {
                             let fps = self.fps;
-                            write_track_sample(track, bytes.clone(), VIDEO_PAYLOAD_OFFSET, fps);
+                            let payload =
+                                media_video_payload(self.codec, bytes, VIDEO_PAYLOAD_OFFSET);
+                            write_track_payload(track, payload, fps);
                         }
                         return Ok(());
                     }
                     if bytes.first() == Some(&AUDIO_FRAME_TAG) {
                         if let Some(track) = self.audio_track.clone() {
-                            write_track_sample(
-                                track,
-                                bytes.clone(),
-                                AUDIO_PAYLOAD_OFFSET,
-                                OPUS_FRAMES_PER_SEC,
-                            );
+                            if bytes.len() > AUDIO_PAYLOAD_OFFSET {
+                                let payload = bytes.slice(AUDIO_PAYLOAD_OFFSET..);
+                                write_track_payload(track, payload, OPUS_FRAMES_PER_SEC);
+                            }
                         }
                         return Ok(());
                     }
@@ -622,19 +649,54 @@ impl Sink<Message> for RtcSink {
     }
 }
 
-/// Strips our framing header and writes the encoded payload to a media track.
-/// `write_sample` is async; we spawn so the synchronous `start_send` never
-/// blocks (samples are independently timestamped by the track).
-fn write_track_sample(
-    track: Arc<TrackLocalStaticSample>,
-    packet: Bytes,
-    payload_offset: usize,
-    rate_hz: u32,
-) {
+/// Prepares the encoded video payload for a media track. The WebRTC H.264/H.265
+/// RTP packetizers expect Annex-B (start-code-delimited) NAL units, but our
+/// packed frames carry the length-prefixed (AVCC) form the WebCodecs clients use,
+/// so convert it back. VP8/VP9/AV1 frames are passed through unchanged.
+fn media_video_payload(codec: CodecKind, packet: &Bytes, payload_offset: usize) -> Bytes {
     if packet.len() <= payload_offset {
-        return;
+        return Bytes::new();
     }
     let payload = packet.slice(payload_offset..);
+    match codec {
+        CodecKind::H264 | CodecKind::H265 => Bytes::from(avcc_to_annex_b(&payload)),
+        CodecKind::Vp8 | CodecKind::Vp9 | CodecKind::Av1 => payload,
+    }
+}
+
+/// Converts a length-prefixed (AVCC: `[u32 BE len][NAL]...`) access unit into
+/// Annex-B (`[00 00 00 01][NAL]...`). Any SPS/PPS units present in the access
+/// unit are preserved, which is what lets the browser decode mid-stream
+/// keyframes. Returns the input unchanged if it doesn't parse as AVCC.
+fn avcc_to_annex_b(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 16);
+    let mut pos = 0;
+    while pos + 4 <= data.len() {
+        let len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        pos += 4;
+        if len == 0 || pos + len > data.len() {
+            // Not valid AVCC framing; fall back to the raw payload.
+            return data.to_vec();
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&data[pos..pos + len]);
+        pos += len;
+    }
+    if pos == data.len() && !out.is_empty() {
+        out
+    } else {
+        data.to_vec()
+    }
+}
+
+/// Writes an already-extracted encoded payload to a media track. `write_sample`
+/// is async; we spawn so the synchronous `start_send` never blocks (samples are
+/// independently timestamped by the track).
+fn write_track_payload(track: Arc<TrackLocalStaticSample>, payload: Bytes, rate_hz: u32) {
+    if payload.is_empty() {
+        return;
+    }
     let duration = Duration::from_secs_f64(1.0 / rate_hz.max(1) as f64);
     tokio::spawn(async move {
         let _ = track
@@ -645,4 +707,27 @@ fn write_track_sample(
             })
             .await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::avcc_to_annex_b;
+
+    #[test]
+    fn avcc_converts_each_nal_to_start_code_prefixed() {
+        // Two NALs: [len=3][aa bb cc][len=2][dd ee].
+        let avcc = [0, 0, 0, 3, 0xaa, 0xbb, 0xcc, 0, 0, 0, 2, 0xdd, 0xee];
+        let annexb = avcc_to_annex_b(&avcc);
+        assert_eq!(
+            annexb,
+            vec![0, 0, 0, 1, 0xaa, 0xbb, 0xcc, 0, 0, 0, 1, 0xdd, 0xee]
+        );
+    }
+
+    #[test]
+    fn avcc_passthrough_on_invalid_framing() {
+        // A declared length that overruns the buffer is not valid AVCC.
+        let bogus = [0, 0, 0, 9, 0x01, 0x02];
+        assert_eq!(avcc_to_annex_b(&bogus), bogus.to_vec());
+    }
 }
