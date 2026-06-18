@@ -32,6 +32,7 @@ use crate::{
     },
     ffmpeg,
     media::MediaHub,
+    rtc::{self, RtcMode},
     session::{self, SessionRole},
     settings::{
         AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, EncoderQualityMode,
@@ -425,6 +426,7 @@ pub async fn run(server: ServerConfig) -> Result<()> {
         .route("/api/webclients/close-others", post(close_other_webclients))
         .route("/api/webclients/{client_id}/close", post(close_webclient))
         .route("/ws", get(ws))
+        .route("/api/webrtc/offer", post(webrtc_offer))
         .route("/api/upload", post(upload))
         .route("/api/camera/chunk", post(upload_camera_chunk))
         .route("/api/camera/stop", post(stop_camera))
@@ -798,6 +800,63 @@ async fn ws(
             warn!(error = %err, "websocket session ended with an error");
         }
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct WebRtcOfferRequest {
+    sdp: String,
+    #[serde(default)]
+    mode: RtcMode,
+}
+
+#[derive(Debug, Serialize)]
+struct WebRtcAnswerResponse {
+    sdp: String,
+}
+
+/// WebRTC signaling: accepts a fully-gathered SDP offer (non-trickle), builds the
+/// peer connection, hands it to the shared session handlers, and returns the SDP
+/// answer. Stream/role parameters ride the query string exactly like `/ws`.
+async fn webrtc_offer(
+    headers: HeaderMap,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WsQuery>,
+    Json(body): Json<WebRtcOfferRequest>,
+) -> Result<Json<WebRtcAnswerResponse>, (StatusCode, String)> {
+    let session_token = cookie_session_token(&headers);
+    state
+        .auth
+        .require_passwd(
+            &state.server.passwd,
+            query.passwd.as_deref(),
+            session_token.as_deref(),
+        )
+        .await?;
+    let config = query.stream_config();
+    let audio_config = query.audio_config();
+    let role = query.role();
+    let client_id = query.resolve_client_id();
+    let lease = state.clients.register(client_id, peer_addr, role).await;
+    let close_rx = lease.close_rx.clone();
+    let sdp = rtc::answer(
+        body.sdp,
+        body.mode,
+        role,
+        state.server.clone(),
+        state.media.clone(),
+        config,
+        audio_config,
+        close_rx,
+        state.clients.clone(),
+        lease,
+    )
+    .await
+    .map_err(|err| {
+        warn!(error = %err, "webrtc offer negotiation failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    })?;
+    Ok(Json(WebRtcAnswerResponse { sdp }))
 }
 
 #[derive(Debug, Serialize)]

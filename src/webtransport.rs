@@ -253,7 +253,7 @@ impl Sink<Message> for WtSink {
     }
 }
 
-fn is_video_packet(bytes: &Bytes) -> bool {
+pub(crate) fn is_video_packet(bytes: &Bytes) -> bool {
     bytes.first() == Some(&VIDEO_FRAME_TAG)
 }
 
@@ -263,7 +263,11 @@ fn is_video_keyframe(frame: &Bytes) -> bool {
 
 /// A coalescing queue of encoded video frames awaiting transmission on the
 /// dedicated unidirectional stream.
-struct VideoQueue {
+///
+/// Also reused by the WebRTC DataChannel transport (`crate::rtc`), which drains
+/// it onto an unreliable/unordered data channel with the same freshest-keyframe
+/// semantics.
+pub(crate) struct VideoQueue {
     inner: Mutex<VideoQueueInner>,
     notify: Notify,
 }
@@ -274,7 +278,7 @@ struct VideoQueueInner {
 }
 
 impl VideoQueue {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(VideoQueueInner {
                 frames: VecDeque::new(),
@@ -286,7 +290,7 @@ impl VideoQueue {
 
     /// Enqueues a frame, then drops any now-superseded backlog so the consumer
     /// always pulls the freshest decodable sequence.
-    fn push(&self, frame: Bytes) {
+    pub(crate) fn push(&self, frame: Bytes) {
         {
             let mut inner = self.inner.lock().expect("video queue poisoned");
             if inner.closed {
@@ -304,7 +308,7 @@ impl VideoQueue {
         self.notify.notify_one();
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         {
             let mut inner = self.inner.lock().expect("video queue poisoned");
             inner.closed = true;
@@ -314,7 +318,7 @@ impl VideoQueue {
 
     /// Waits for and returns the next frame to send, or `None` once the queue is
     /// closed and drained.
-    async fn next(&self) -> Option<Bytes> {
+    pub(crate) async fn next(&self) -> Option<Bytes> {
         loop {
             {
                 let mut inner = self.inner.lock().expect("video queue poisoned");

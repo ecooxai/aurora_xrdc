@@ -271,6 +271,8 @@ const state = {
 const status = $("status");
 const viewportCard = $("viewport-card");
 const canvas = $("screen");
+const screenVideo = $("screen-video");
+const screenAudio = $("screen-audio");
 let ctx = null;
 const toast = $("toast");
 const streamWarning = $("stream-warning");
@@ -2321,9 +2323,32 @@ function createClientSessionId() {
 }
 
 const TRANSPORT_STORAGE_KEY = "vibe_rdesk_transport";
+// Transport keepalive for WebRTC peer connections. Must match KEEPALIVE_SENTINEL
+// in src/rtc.rs. The server tears a session down when these stop arriving.
+const WEBRTC_KEEPALIVE = "ka";
+const WEBRTC_KEEPALIVE_INTERVAL_MS = 3000;
 
 function isWebTransportSupported() {
   return typeof WebTransport !== "undefined" && window.isSecureContext;
+}
+
+function isWebRtcSupported() {
+  return typeof RTCPeerConnection !== "undefined";
+}
+
+function isWebRtcTransport(transport) {
+  return transport === "webrtc-dc" || transport === "webrtc-media";
+}
+
+// Maps a transport id to the server-side RtcMode value.
+function rtcModeFor(transport) {
+  return transport === "webrtc-media" ? "media" : "data_channel";
+}
+
+function isTransportSupported(transport) {
+  if (transport === "webtransport") return isWebTransportSupported();
+  if (isWebRtcTransport(transport)) return isWebRtcSupported();
+  return true; // websocket is always available
 }
 
 function loadStoredTransport() {
@@ -2339,7 +2364,14 @@ function loadStoredTransport() {
   }
   try {
     const stored = window.localStorage?.getItem(TRANSPORT_STORAGE_KEY);
-    if (stored === "webtransport" || stored === "websocket") return stored;
+    if (
+      stored === "webtransport"
+      || stored === "websocket"
+      || stored === "webrtc-dc"
+      || stored === "webrtc-media"
+    ) {
+      return stored;
+    }
   } catch {
     // Ignore storage access errors (private mode, etc.).
   }
@@ -2357,10 +2389,23 @@ function saveTransport(transport) {
 // Resolves the transport to actually use, downgrading to WebSocket when
 // WebTransport is unavailable in this browser/context.
 function currentTransport() {
-  if (state.transport === "webtransport" && isWebTransportSupported()) {
-    return "webtransport";
+  if (isTransportSupported(state.transport)) {
+    return state.transport;
   }
   return "websocket";
+}
+
+function transportLabel(transport) {
+  switch (transport) {
+    case "webtransport":
+      return "WebTransport";
+    case "webrtc-dc":
+      return "WebRTC (DataChannel)";
+    case "webrtc-media":
+      return "WebRTC (Media)";
+    default:
+      return "WebSocket";
+  }
 }
 
 // Fetches (fresh each connect, since the self-signed cert rotates on restart)
@@ -2664,6 +2709,280 @@ class WtSocket {
   }
 }
 
+// A drop-in replacement for the parts of the WebSocket API the client uses,
+// backed by a WebRTC peer connection (one per role, mirroring the WebSocket /
+// WebTransport split). Signaling is a single non-trickle HTTP round-trip.
+//
+// In DataChannel mode the encoded video/audio packets arrive verbatim over data
+// channels and flow into the same WebCodecs renderer as the other transports: a
+// reliable ordered `ctrl` channel carries text/control (and audio), and the
+// video role additionally opens an unreliable unordered `video` channel.
+//
+// In Media mode the video/audio roles negotiate recvonly media tracks instead;
+// the decoded tracks are rendered natively via the overlay <video>/<audio>
+// elements, so those roles deliver no binary messages to the WebCodecs path.
+class WebRtcSocket {
+  constructor({ offerUrl, mode, role }) {
+    this.binaryType = "arraybuffer";
+    this.readyState = 0; // CONNECTING
+    this.onopen = null;
+    this.onerror = null;
+    this.onclose = null;
+    this.onmessage = null;
+    this._mode = mode; // "data_channel" | "media"
+    this._role = role;
+    this._pc = null;
+    this._ctrl = null;
+    this._video = null;
+    this._closed = false;
+    this._opened = false;
+    this._mediaStream = null;
+    this._kaTimer = null;
+    this._start(offerUrl);
+  }
+
+  get _wantsVideo() {
+    return this._role === "video" || this._role === "all";
+  }
+
+  get _wantsAudio() {
+    return this._role === "audio" || this._role === "all";
+  }
+
+  async _start(offerUrl) {
+    try {
+      // No ICE servers: localhost/LAN host candidates are sufficient, and the
+      // server answers non-trickle, so we only need a single round-trip.
+      const pc = new RTCPeerConnection({ iceServers: [] });
+      this._pc = pc;
+      pc.onconnectionstatechange = () => {
+        const s = pc.connectionState;
+        if (s === "failed" || s === "disconnected" || s === "closed") {
+          this._handleClosed(s === "closed" ? 1000 : 1006, `peer ${s}`);
+        }
+      };
+
+      // Reliable control channel (text/control, plus audio in DataChannel mode).
+      const ctrl = pc.createDataChannel("ctrl", { ordered: true });
+      ctrl.binaryType = "arraybuffer";
+      this._ctrl = ctrl;
+      ctrl.onmessage = (event) => {
+        if (this.onmessage) this.onmessage({ data: event.data, target: this });
+      };
+      ctrl.onopen = () => {
+        this._startKeepalive();
+        this._markOpen();
+      };
+      ctrl.onclose = () => this._handleClosed(1000, "ctrl channel closed");
+
+      if (this._mode === "media") {
+        if (this._wantsVideo) pc.addTransceiver("video", { direction: "recvonly" });
+        if (this._wantsAudio) pc.addTransceiver("audio", { direction: "recvonly" });
+        pc.ontrack = (event) => this._handleTrack(event);
+      } else if (this._wantsVideo) {
+        // Reliable, unordered video channel. The server coalesces to the freshest
+        // keyframe (like the WebTransport video stream), and each frame is
+        // fragmented below the SCTP max message size; reliability guarantees every
+        // fragment of a sent frame arrives (so large keyframes are never silently
+        // dropped), while unordered delivery avoids head-of-line blocking.
+        const video = pc.createDataChannel("video", { ordered: false });
+        video.binaryType = "arraybuffer";
+        this._video = video;
+        this._videoReasm = { seq: -1, count: 0, received: 0, parts: null };
+        video.onmessage = (event) => this._handleVideoFragment(event.data);
+      }
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await this._waitForIceGathering(pc);
+      if (this._closed) return;
+      const response = await fetch(offerUrl, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sdp: pc.localDescription.sdp, mode: this._mode }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const answer = await response.json();
+      if (this._closed) return;
+      await pc.setRemoteDescription({ type: "answer", sdp: answer.sdp });
+      // `ctrl.onopen` resolves the open state once the channel is live.
+    } catch (err) {
+      if (this.onerror) this.onerror({ target: this, message: String(err?.message || err) });
+      this._handleClosed(1006, String(err?.message || err));
+    }
+  }
+
+  // Resolves once ICE candidate gathering completes so the offer carries every
+  // host candidate (non-trickle). Falls back after a short timeout.
+  _waitForIceGathering(pc) {
+    if (pc.iceGatheringState === "complete") return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => {
+        pc.removeEventListener("icegatheringstatechange", check);
+        clearTimeout(timer);
+        resolve();
+      };
+      const check = () => {
+        if (pc.iceGatheringState === "complete") done();
+      };
+      const timer = setTimeout(done, 2000);
+      pc.addEventListener("icegatheringstatechange", check);
+    });
+  }
+
+  // Reassembles a video frame from `[u32 seq][u16 idx][u16 count]`-prefixed
+  // fragments (see rtc.rs send_video_fragments). The channel is reliable, so
+  // every fragment of a frame that began arriving is delivered; a newer `seq`
+  // supersedes any still-incomplete older frame (freshest-frame semantics).
+  _handleVideoFragment(data) {
+    const buf = data instanceof ArrayBuffer ? data : data.buffer;
+    if (buf.byteLength < 8) return;
+    const view = new DataView(buf);
+    const seq = view.getUint32(0, true);
+    const idx = view.getUint16(4, true);
+    const count = view.getUint16(6, true);
+    const payload = new Uint8Array(buf, 8);
+    const r = this._videoReasm;
+    if (count <= 1) {
+      // Single-fragment frame: deliver immediately.
+      if (this.onmessage) this.onmessage({ data: payload.slice().buffer, target: this });
+      r.seq = seq; r.count = 0; r.received = 0; r.parts = null;
+      return;
+    }
+    if (seq !== r.seq) {
+      // Start (or restart) reassembly for a new frame, dropping any incomplete one.
+      r.seq = seq;
+      r.count = count;
+      r.received = 0;
+      r.parts = new Array(count);
+    }
+    if (r.parts && idx < r.count && r.parts[idx] === undefined) {
+      r.parts[idx] = payload;
+      r.received += 1;
+      if (r.received === r.count) {
+        let total = 0;
+        for (const p of r.parts) total += p.length;
+        const frame = new Uint8Array(total);
+        let offset = 0;
+        for (const p of r.parts) { frame.set(p, offset); offset += p.length; }
+        r.parts = null;
+        if (this.onmessage) this.onmessage({ data: frame.buffer, target: this });
+      }
+    }
+  }
+
+  // Sends a transport keepalive on the control channel every few seconds. The
+  // server treats silence as a disconnect and tears the session down, because
+  // WebRTC peer connections don't always surface a vanished/closed peer. This is
+  // sent for every role (not just control) so each peer connection self-cleans.
+  _startKeepalive() {
+    if (this._kaTimer) return;
+    this._kaTimer = setInterval(() => {
+      if (this._closed || !this._ctrl || this._ctrl.readyState !== "open") return;
+      try {
+        this._ctrl.send(WEBRTC_KEEPALIVE);
+      } catch {
+        // Channel went away; the close handler will clean up.
+      }
+    }, WEBRTC_KEEPALIVE_INTERVAL_MS);
+  }
+
+  _markOpen() {
+    if (this._opened || this._closed) return;
+    this._opened = true;
+    this.readyState = 1; // OPEN
+    if (this.onopen) this.onopen({ target: this });
+  }
+
+  _handleTrack(event) {
+    const stream = event.streams && event.streams[0]
+      ? event.streams[0]
+      : new MediaStream([event.track]);
+    this._mediaStream = stream;
+    if (event.track.kind === "video") {
+      attachMediaVideo(stream);
+    } else if (event.track.kind === "audio") {
+      attachMediaAudio(stream);
+    }
+  }
+
+  send(data) {
+    if (this.readyState !== 1 || !this._ctrl || this._ctrl.readyState !== "open") return;
+    try {
+      this._ctrl.send(data);
+    } catch (err) {
+      if (this.onerror) this.onerror({ target: this, message: String(err?.message || err) });
+    }
+  }
+
+  close() {
+    if (this._closed && this.readyState === 3) return;
+    this.readyState = 2; // CLOSING
+    try {
+      this._ctrl?.close();
+    } catch {
+      // Already closing.
+    }
+    this._handleClosed(1000, "");
+  }
+
+  _handleClosed(code, reason) {
+    if (this._closed) return;
+    this._closed = true;
+    this.readyState = 3; // CLOSED
+    if (this._kaTimer) {
+      clearInterval(this._kaTimer);
+      this._kaTimer = null;
+    }
+    if (this._mode === "media" && (this._wantsVideo || this._wantsAudio)) {
+      detachMediaOverlay(this._role);
+    }
+    try {
+      this._pc?.close();
+    } catch {
+      // Already closing.
+    }
+    if (this.onclose) this.onclose({ code, reason, target: this });
+  }
+}
+
+// --- WebRTC media-mode native rendering -----------------------------------
+
+function attachMediaVideo(stream) {
+  if (!screenVideo) return;
+  screenVideo.srcObject = stream;
+  screenVideo.classList.remove("hidden");
+  const play = screenVideo.play();
+  if (play && typeof play.catch === "function") play.catch(() => {});
+}
+
+function attachMediaAudio(stream) {
+  if (!screenAudio) return;
+  screenAudio.srcObject = stream;
+  screenAudio.classList.remove("hidden");
+  const play = screenAudio.play();
+  if (play && typeof play.catch === "function") play.catch(() => {});
+}
+
+function detachMediaOverlay(role) {
+  if ((role === "video" || role === "all") && screenVideo) {
+    screenVideo.srcObject = null;
+    screenVideo.classList.add("hidden");
+  }
+  if ((role === "audio" || role === "all") && screenAudio) {
+    screenAudio.srcObject = null;
+    screenAudio.classList.add("hidden");
+  }
+}
+
+function roleWebRtcOfferUrl(role, settings) {
+  const url = apiUrl("/api/webrtc/offer");
+  appendStreamQuery(url, settings);
+  url.searchParams.set("role", role);
+  return url;
+}
+
 function isSocketOpen(socket) {
   return socket?.readyState === WebSocket.OPEN;
 }
@@ -2695,12 +3014,18 @@ function roleWebTransportUrl(role, settings, port) {
 
 function openRoleSocket(role, settings, onMessage) {
   const transport = currentTransport();
-  const label = transport === "webtransport" ? "WebTransport" : "WebSocket";
+  const label = transportLabel(transport);
   let socket;
   if (transport === "webtransport") {
     const info = state.wtInfo;
     socket = new WtSocket(roleWebTransportUrl(role, settings, info.port).toString(), {
       certHashes: info.cert_hashes,
+    });
+  } else if (isWebRtcTransport(transport)) {
+    socket = new WebRtcSocket({
+      offerUrl: roleWebRtcOfferUrl(role, settings).toString(),
+      mode: rtcModeFor(transport),
+      role,
     });
   } else {
     socket = new WebSocket(roleWebSocketUrl(role, settings));
@@ -2824,14 +3149,17 @@ function setWebclientsManagerOpen(open) {
 function renderProtocolStatus() {
   if (!protocolValue) return;
   const active = currentTransport();
-  protocolValue.textContent = active === "webtransport" ? "WebTransport" : "WebSocket";
+  protocolValue.textContent = transportLabel(active);
   if (protocolMenu) {
-    const supported = isWebTransportSupported();
     for (const option of protocolMenu.querySelectorAll(".protocol-option")) {
       const value = option.dataset.protocol;
-      const disabled = value === "webtransport" && !supported;
+      const disabled = !isTransportSupported(value);
       option.disabled = disabled;
-      option.title = disabled ? "WebTransport requires a secure (HTTPS) context" : "";
+      option.title = disabled
+        ? value === "webtransport"
+          ? "WebTransport requires a secure (HTTPS) context"
+          : "This transport is not supported in this browser"
+        : "";
       option.classList.toggle("is-active", value === active);
       option.setAttribute("aria-selected", value === active ? "true" : "false");
     }
@@ -2846,9 +3174,18 @@ function setProtocolMenuOpen(open) {
 
 async function selectTransport(transport) {
   setProtocolMenuOpen(false);
-  if (transport !== "websocket" && transport !== "webtransport") return;
-  if (transport === "webtransport" && !isWebTransportSupported()) {
-    showToast("wt_unsupported", "WebTransport is not supported in this browser or context");
+  if (
+    transport !== "websocket"
+    && transport !== "webtransport"
+    && !isWebRtcTransport(transport)
+  ) {
+    return;
+  }
+  if (!isTransportSupported(transport)) {
+    const message = transport === "webtransport"
+      ? "WebTransport is not supported in this browser or context"
+      : "WebRTC is not supported in this browser";
+    showToast("transport_unsupported", message);
     return;
   }
   if (transport === state.transport) return;

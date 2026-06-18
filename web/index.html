@@ -19,6 +19,11 @@
       <section id="viewport-card" class="viewport-card">
         <div id="viewport-stage" class="viewport-stage">
           <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+          <!-- WebRTC media-mode renders the decoded video track natively here,
+               overlaid on the canvas. pointer-events are disabled so all input
+               still targets the canvas underneath. -->
+          <video id="screen-video" class="screen-video hidden" playsinline muted></video>
+          <audio id="screen-audio" class="hidden"></audio>
         </div>
         <div id="status" class="status-pill">Connecting...</div>
         <div id="stream-warning" class="stream-warning hidden" role="status" aria-live="polite" aria-label="Stream warning">
@@ -337,6 +342,8 @@
                     <div id="protocol-menu" class="protocol-menu hidden" role="listbox" aria-label="Transport protocol">
                       <button class="protocol-option" type="button" role="option" data-protocol="websocket">WebSocket</button>
                       <button class="protocol-option" type="button" role="option" data-protocol="webtransport">WebTransport</button>
+                      <button class="protocol-option" type="button" role="option" data-protocol="webrtc-dc">WebRTC (DataChannel)</button>
+                      <button class="protocol-option" type="button" role="option" data-protocol="webrtc-media">WebRTC (Media)</button>
                     </div>
                   </article>
                   <article class="metric-card metric-card-wide webclients-card">
