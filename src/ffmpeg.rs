@@ -880,6 +880,74 @@ pub async fn spawn_audio_capture(
     cmd.spawn().context("failed to spawn ffmpeg audio capture")
 }
 
+/// Spawns an ffmpeg process that captures the desktop audio monitor and encodes
+/// it as a low-latency Ogg-Opus bitstream on stdout. Used by the WebRTC media
+/// transport when the client opts to carry audio as a native Opus RTP track:
+/// WebRTC media tracks must be Opus, but the shared capture above is AAC for the
+/// WebCodecs clients, so this is a separate, on-demand encoder.
+pub async fn spawn_opus_audio_capture(
+    server: &ServerConfig,
+    config: &AudioStreamConfig,
+) -> Result<tokio::process::Child> {
+    let source = ensure_pulse_monitor_source(server).await?;
+    let bitrate = format!("{}k", config.bitrate_kbps);
+    let mut cmd = Command::new("ffmpeg");
+    cmd.env("DISPLAY", &server.display)
+        .args([
+            "-loglevel",
+            "error",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+            "-fflags",
+            "nobuffer",
+            "-avioflags",
+            "direct",
+            "-flush_packets",
+            "1",
+            "-max_delay",
+            "0",
+            "-flags",
+            "low_delay",
+            "-f",
+            "pulse",
+            "-sample_rate",
+            "48000",
+            "-channels",
+            "2",
+            "-frame_size",
+            "1024",
+            "-fragment_size",
+            "4096",
+            "-i",
+            &source,
+            "-vn",
+            "-sn",
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-c:a",
+            "libopus",
+            "-application",
+            "lowdelay",
+            "-frame_duration",
+            "20",
+            "-vbr",
+            "off",
+            "-b:a",
+            &bitrate,
+            "-f",
+            "opus",
+            "pipe:1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.spawn()
+        .context("failed to spawn ffmpeg opus audio capture")
+}
+
 pub async fn warm_audio_stack(server: &ServerConfig) -> Result<()> {
     ensure_pulse_server().await?;
     ensure_virtual_sink(server).await?;

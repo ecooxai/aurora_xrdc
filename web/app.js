@@ -181,6 +181,7 @@ const state = {
   audioClockAutoLastIncreaseLead: 0,
   audioClockAutoLastSlowTuneAt: 0,
   audioUseRealOutput: false,
+  audioInVideo: false,
   decoderRecovering: false,
   waitingForKeyframe: true,
   frameCount: 0,
@@ -328,6 +329,7 @@ const audioClockRateInput = $("audio-clock-rate");
 const audioClockRateValue = $("audio-clock-rate-value");
 const audioClockAutoInput = $("audio-clock-auto");
 const audioRealOutputInput = $("audio-real-output");
+const audioInVideoInput = $("audio-in-video");
 const audioOutputStatus = $("audio-output-status");
 const autoDisconnectMinutesInput = $("auto-disconnect-minutes");
 const encoderLatencySelect = $("encoder-latency");
@@ -1048,6 +1050,7 @@ function streamReconnectSettingsKey(settings = readSettingsFromControls()) {
     videoScale: settings.videoScale,
     gopMs: settings.gopMs,
     bufferMs: settings.bufferMs,
+    audioInVideo: settings.audioInVideo,
   });
 }
 
@@ -1389,6 +1392,7 @@ function normalizeSettings(settings = {}) {
     micEnabled: settings.micEnabled === true,
     micDeviceId: typeof settings.micDeviceId === "string" ? settings.micDeviceId : "",
     audioMuted: settings.audioMuted === true,
+    audioInVideo: settings.audioInVideo === true,
     audioUseRealOutput: settings.audioUseRealOutput === true,
     audioVolumePercent: clampControlValue(audioVolumeInput, settings.audioVolumePercent, defaultAudioVolumePercent),
     audioLatencyMs: clampControlValue(audioLatencyInput, settings.audioLatencyMs, Number(audioLatencyInput.value)),
@@ -1549,6 +1553,7 @@ function readSettingsFromControls() {
     audioClockRate: audioClockRateInput.value,
     audioClockAuto: audioClockAutoInput.checked,
     audioUseRealOutput: audioRealOutputInput.checked,
+    audioInVideo: audioInVideoInput?.checked ?? state.audioInVideo,
     encoderLatency: encoderLatencySelect.value,
     encoderQuality: encoderQualitySelect.value,
     videoScale: videoScaleSelect.value,
@@ -1836,6 +1841,9 @@ function applySettings(settings) {
   audioClockRateInput.value = String(normalized.audioClockRate);
   audioClockAutoInput.checked = normalized.audioClockAuto;
   audioRealOutputInput.checked = normalized.audioUseRealOutput;
+  if (audioInVideoInput) {
+    audioInVideoInput.checked = normalized.audioInVideo;
+  }
   if (audioMuteInput) {
     audioMuteInput.checked = normalized.audioMuted;
   }
@@ -1855,6 +1863,7 @@ function applySettings(settings) {
   state.audioMuted = normalized.audioMuted;
   state.audioVolumePercent = normalized.audioVolumePercent;
   state.audioUseRealOutput = normalized.audioUseRealOutput;
+  state.audioInVideo = normalized.audioInVideo;
   state.viewZoomPercent = normalized.viewZoomPercent;
   state.liveMediaMaxAgeMs = normalized.staleDropMs;
   state.mediaStallResetMs = normalized.stallResetMs;
@@ -2307,6 +2316,9 @@ function appendStreamQuery(url, settings) {
   url.searchParams.set("scale", settings.videoScale);
   url.searchParams.set("gop_ms", settings.gopMs);
   url.searchParams.set("buffer_ms", settings.bufferMs);
+  if (settings.audioInVideo) {
+    url.searchParams.set("audio_in_video", "true");
+  }
   if (state.sessionPasswd) {
     url.searchParams.set("passwd", state.sessionPasswd);
   }
@@ -2726,7 +2738,7 @@ class WtSocket {
 // the decoded tracks are rendered natively via the overlay <video>/<audio>
 // elements, so those roles deliver no binary messages to the WebCodecs path.
 class WebRtcSocket {
-  constructor({ offerUrl, mode, role }) {
+  constructor({ offerUrl, mode, role, audioInVideo = false }) {
     this.binaryType = "arraybuffer";
     this.readyState = 0; // CONNECTING
     this.onopen = null;
@@ -2735,6 +2747,9 @@ class WebRtcSocket {
     this.onmessage = null;
     this._mode = mode; // "data_channel" | "media"
     this._role = role;
+    // Media mode only: when true, server audio arrives as a native Opus RTP track
+    // alongside video; when false it rides the ctrl data channel as AAC (WebCodecs).
+    this._audioInVideo = audioInVideo === true;
     this._pc = null;
     this._ctrl = null;
     this._video = null;
@@ -2781,7 +2796,12 @@ class WebRtcSocket {
 
       if (this._mode === "media") {
         if (this._wantsVideo) pc.addTransceiver("video", { direction: "recvonly" });
-        if (this._wantsAudio) pc.addTransceiver("audio", { direction: "recvonly" });
+        // Only negotiate a native audio track when the user opts to carry audio in
+        // the video stream; otherwise audio is delivered as AAC over the ctrl
+        // channel and decoded by WebCodecs (handled via onmessage).
+        if (this._wantsAudio && this._audioInVideo) {
+          pc.addTransceiver("audio", { direction: "recvonly" });
+        }
         pc.ontrack = (event) => this._handleTrack(event);
       } else if (this._wantsVideo) {
         // Unreliable, unordered video channel (latency-first). The server
@@ -3010,9 +3030,31 @@ async function pumpMediaTrackFrames(track) {
 function attachMediaAudio(stream) {
   if (!screenAudio) return;
   screenAudio.srcObject = stream;
+  screenAudio.muted = state.audioMuted === true;
   screenAudio.classList.remove("hidden");
+  playMediaAudio();
+}
+
+// Starts (or resumes) playback of the WebRTC media-mode <audio> element. Autoplay
+// may be blocked until a user gesture; flag it so the audio toggle reflects the
+// blocked state and a later gesture (connect click, unmute) can retry.
+function playMediaAudio() {
+  if (!screenAudio || !screenAudio.srcObject) return;
   const play = screenAudio.play();
-  if (play && typeof play.catch === "function") play.catch(() => {});
+  if (play && typeof play.catch === "function") {
+    play.catch(() => {
+      state.audioPlaybackBlocked = true;
+      renderAudioToggle();
+    });
+  }
+}
+
+// Reflects the server-audio mute toggle onto the media-mode <audio> element
+// (the DataChannel/WebCodecs path is muted separately via the audio decoder).
+function applyMediaAudioMute() {
+  if (!screenAudio) return;
+  screenAudio.muted = state.audioMuted === true;
+  if (!state.audioMuted) playMediaAudio();
 }
 
 function detachMediaOverlay(role) {
@@ -3087,6 +3129,7 @@ function openRoleSocket(role, settings, onMessage) {
       offerUrl: roleWebRtcOfferUrl(role, settings).toString(),
       mode: rtcModeFor(transport),
       role,
+      audioInVideo: settings.audioInVideo === true,
     });
   } else {
     socket = new WebSocket(roleWebSocketUrl(role, settings));
@@ -3374,11 +3417,27 @@ async function connect() {
         renderProtocolStatus();
       }
     }
-    const control = openRoleSocket("control", settings, handleControlSocketMessage);
+    // In WebRTC media mode video and audio are real RTP media tracks, so carry
+    // both (plus control/stats) on a single combined "all" peer connection — the
+    // server audio track then rides alongside the video track on the same
+    // connection instead of a separate one. Input and mic keep their own
+    // low-latency channels. Every other transport keeps the per-role split.
+    const combineMedia =
+      isWebRtcTransport(currentTransport()) && rtcModeFor(currentTransport()) === "media";
     const input = openRoleSocket("input", settings, handleControlSocketMessage);
-    const video = openRoleSocket("video", settings, handleMediaSocketMessage);
-    const audio = openRoleSocket("audio", settings, handleMediaSocketMessage);
     const mic = openRoleSocket("mic", settings, handleMicSocketMessage);
+    let control;
+    let video;
+    let audio;
+    if (combineMedia) {
+      control = openRoleSocket("all", settings, handleMediaSocketMessage);
+      video = control;
+      audio = control;
+    } else {
+      control = openRoleSocket("control", settings, handleControlSocketMessage);
+      video = openRoleSocket("video", settings, handleMediaSocketMessage);
+      audio = openRoleSocket("audio", settings, handleMediaSocketMessage);
+    }
     state.socket = control.socket;
     state.inputSocket = input.socket;
     state.videoSocket = video.socket;
@@ -4529,6 +4588,9 @@ async function primeAudioPlayback() {
       resetAudioDecoderForLiveCatchup();
     }
     state.audioPlaybackBlocked = false;
+    // Media-mode audio rides a native <audio> element rather than the WebCodecs
+    // path; resume it on the same user gesture that unblocked WebCodecs audio.
+    applyMediaAudioMute();
   } catch {
     // Autoplay policy may require a user gesture; playback will retry later.
     state.audioPlaybackBlocked = true;
@@ -4936,6 +4998,7 @@ function setServerAudioMuted(muted) {
     if (!nextMuted) {
       void primeAudioPlayback();
     }
+    applyMediaAudioMute();
     renderAudioToggle();
     renderAudioBufferMetric();
     return;
@@ -4945,6 +5008,7 @@ function setServerAudioMuted(muted) {
     audioMuteInput.checked = nextMuted;
   }
   resetAudioDecoderForLiveCatchup();
+  applyMediaAudioMute();
   if (!state.audioMuted) {
     void primeAudioPlayback();
   }
@@ -6401,6 +6465,7 @@ function initControls() {
   bitrateInput.addEventListener("input", persistCurrentSettings);
   bitrateInput.addEventListener("change", persistCurrentSettings);
   audioBitrateSelect.addEventListener("change", persistCurrentSettings);
+  audioInVideoInput?.addEventListener("change", persistCurrentSettings);
   micBitrateSelect.addEventListener("change", () => {
     persistCurrentSettings();
     if (!state.micEnabled || !isSocketOpen(state.micSocket)) return;

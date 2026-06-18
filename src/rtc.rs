@@ -38,6 +38,7 @@ use axum::extract::ws::Message;
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, stream};
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::PollSender;
 use tracing::warn;
@@ -70,13 +71,10 @@ use crate::{
 /// Byte offset of the encoded payload inside a packed video frame
 /// (`streamer::pack_frame`: `[tag][keyframe][u64 ts][u32 seq][u32 len]`).
 const VIDEO_PAYLOAD_OFFSET: usize = 18;
-/// Leading tag of an Opus audio packet (`session::binary_audio_frame`).
+/// Leading tag of a packed audio frame (`session::binary_audio_frame`).
 const AUDIO_FRAME_TAG: u8 = 2;
-/// Byte offset of the Opus payload inside a packed audio frame
-/// (`[tag][u64 ts][u32 len]`).
-const AUDIO_PAYLOAD_OFFSET: usize = 13;
-/// Opus packets emitted by the capture pipeline are 20 ms (50 per second).
-const OPUS_FRAMES_PER_SEC: u32 = 50;
+/// Opus frames emitted by the dedicated media-mode encoder are 20 ms.
+const OPUS_FRAME_DURATION: Duration = Duration::from_millis(20);
 
 /// Outbound dispatcher depth for the reliable control channel. Video/audio are
 /// offloaded to their own queue/track, so this only buffers hello/stats/close.
@@ -115,6 +113,7 @@ pub enum RtcMode {
 pub async fn answer(
     offer_sdp: String,
     mode: RtcMode,
+    audio_in_video: bool,
     role: SessionRole,
     server: ServerConfig,
     media: MediaHub,
@@ -160,7 +159,13 @@ pub async fn answer(
             add_track(&pc, vt.clone()).await?;
             video_track = Some(vt);
         }
-        if matches!(role, SessionRole::Audio | SessionRole::All) {
+        // Audio rides a native Opus RTP track only when the client opts to carry
+        // it "in the video stream". WebRTC media tracks must be Opus, but the
+        // shared capture is AAC (for the WebCodecs clients), so a dedicated Opus
+        // encoder feeds this track. When the option is off the audio instead flows
+        // as AAC over the ctrl data channel and is decoded by WebCodecs (see the
+        // sink), exactly like the DataChannel transport.
+        if audio_in_video && matches!(role, SessionRole::Audio | SessionRole::All) {
             let at = Arc::new(TrackLocalStaticSample::new(
                 RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_OPUS.to_owned(),
@@ -172,6 +177,7 @@ pub async fn answer(
                 "vibe-rdesk".to_owned(),
             ));
             add_track(&pc, at.clone()).await?;
+            spawn_opus_track_feed(at.clone(), server.clone(), audio_config.clone(), shutdown.clone());
             audio_track = Some(at);
         }
     }
@@ -258,7 +264,7 @@ pub async fn answer(
         ctrl_tx,
         video,
         video_track,
-        audio_track,
+        audio_track.is_some(),
         config.fps,
     );
     let stream = build_stream(in_rx, shutdown);
@@ -569,7 +575,7 @@ fn build_sink(
     ctrl_tx: mpsc::Sender<Message>,
     video: Arc<VideoQueue>,
     video_track: Option<Arc<TrackLocalStaticSample>>,
-    audio_track: Option<Arc<TrackLocalStaticSample>>,
+    audio_in_track: bool,
     fps: u32,
 ) -> WireSink {
     Box::pin(RtcSink {
@@ -578,7 +584,7 @@ fn build_sink(
         ctrl: PollSender::new(ctrl_tx),
         video,
         video_track,
-        audio_track,
+        audio_in_track,
         fps: fps.max(1),
     })
 }
@@ -592,7 +598,10 @@ struct RtcSink {
     ctrl: PollSender<Message>,
     video: Arc<VideoQueue>,
     video_track: Option<Arc<TrackLocalStaticSample>>,
-    audio_track: Option<Arc<TrackLocalStaticSample>>,
+    /// Whether a native Opus audio track exists (fed by a dedicated encoder). When
+    /// true the session's AAC audio frames are dropped here; when false they are
+    /// forwarded over the ctrl channel for WebCodecs decode.
+    audio_in_track: bool,
     fps: u32,
 }
 
@@ -624,13 +633,10 @@ impl Sink<Message> for RtcSink {
                         }
                         return Ok(());
                     }
-                    if bytes.first() == Some(&AUDIO_FRAME_TAG) {
-                        if let Some(track) = self.audio_track.clone() {
-                            if bytes.len() > AUDIO_PAYLOAD_OFFSET {
-                                let payload = bytes.slice(AUDIO_PAYLOAD_OFFSET..);
-                                write_track_payload(track, payload, OPUS_FRAMES_PER_SEC);
-                            }
-                        }
+                    if bytes.first() == Some(&AUDIO_FRAME_TAG) && self.audio_in_track {
+                        // The native Opus track is fed by a dedicated encoder; drop
+                        // the session's AAC audio frame. Without a track the frame
+                        // falls through to the ctrl channel (WebCodecs) below.
                         return Ok(());
                     }
                 }
@@ -690,6 +696,137 @@ fn avcc_to_annex_b(data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Feeds a native Opus media track from a dedicated low-latency Opus encoder.
+///
+/// WebRTC media tracks require Opus, but the shared capture pipeline encodes AAC
+/// (for the WebCodecs clients), so when the client opts to carry audio in the
+/// video stream we run a separate `ffmpeg -c:a libopus -f opus` process, demux the
+/// Ogg-Opus bitstream into raw Opus packets, and write each as a 20 ms sample —
+/// sequentially, so packet order is preserved. Tied to `shutdown`, so it stops
+/// (and kills ffmpeg) when the peer connection ends.
+fn spawn_opus_track_feed(
+    track: Arc<TrackLocalStaticSample>,
+    server: ServerConfig,
+    audio_config: AudioStreamConfig,
+    shutdown: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        let mut child = match crate::ffmpeg::spawn_opus_audio_capture(&server, &audio_config).await {
+            Ok(child) => child,
+            Err(err) => {
+                warn!(error = %err, "failed to start opus audio capture for webrtc media");
+                return;
+            }
+        };
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill().await;
+            return;
+        };
+        let mut demux = OggOpusDemux::default();
+        let mut buf = vec![0u8; 8192];
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                read = stdout.read(&mut buf) => match read {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        for packet in demux.push(&buf[..n]) {
+                            if track
+                                .write_sample(&Sample {
+                                    data: packet,
+                                    duration: OPUS_FRAME_DURATION,
+                                    ..Default::default()
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                },
+            }
+        }
+        let _ = child.kill().await;
+    });
+}
+
+/// Streaming Ogg demuxer specialized for the `ffmpeg -f opus` bitstream. It yields
+/// raw Opus packets, skipping the two mandatory Ogg-Opus header packets (OpusHead,
+/// OpusTags). Our encoder emits small CBR 20 ms frames that never span Ogg pages,
+/// so cross-page packet continuation is intentionally not reassembled.
+#[derive(Default)]
+struct OggOpusDemux {
+    buf: Vec<u8>,
+    headers_skipped: usize,
+}
+
+impl OggOpusDemux {
+    fn push(&mut self, data: &[u8]) -> Vec<Bytes> {
+        self.buf.extend_from_slice(data);
+        let mut packets = Vec::new();
+        let mut consumed = 0;
+        loop {
+            let rest = &self.buf[consumed..];
+            // Each Ogg page starts with a fixed 27-byte header.
+            if rest.len() < 27 {
+                break;
+            }
+            if &rest[0..4] != b"OggS" {
+                // Resync to the next capture pattern, or drop everything but a
+                // possible partial "OggS" tail.
+                match find_subslice(&rest[1..], b"OggS") {
+                    Some(pos) => {
+                        consumed += 1 + pos;
+                        continue;
+                    }
+                    None => {
+                        consumed = self.buf.len().saturating_sub(3);
+                        break;
+                    }
+                }
+            }
+            let n_seg = rest[26] as usize;
+            let header_len = 27 + n_seg;
+            if rest.len() < header_len {
+                break;
+            }
+            let seg_table = &rest[27..header_len];
+            let body_len: usize = seg_table.iter().map(|&v| v as usize).sum();
+            if rest.len() < header_len + body_len {
+                break;
+            }
+            let body = &rest[header_len..header_len + body_len];
+            let mut off = 0;
+            let mut pkt_len = 0;
+            for &lace in seg_table {
+                pkt_len += lace as usize;
+                if lace < 255 {
+                    if self.headers_skipped < 2 {
+                        self.headers_skipped += 1;
+                    } else if pkt_len > 0 {
+                        packets.push(Bytes::copy_from_slice(&body[off..off + pkt_len]));
+                    }
+                    off += pkt_len;
+                    pkt_len = 0;
+                }
+            }
+            consumed += header_len + body_len;
+        }
+        if consumed > 0 {
+            self.buf.drain(0..consumed);
+        }
+        packets
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Writes an already-extracted encoded payload to a media track. `write_sample`
 /// is async; we spawn so the synchronous `start_send` never blocks (samples are
 /// independently timestamped by the track).
@@ -711,7 +848,48 @@ fn write_track_payload(track: Arc<TrackLocalStaticSample>, payload: Bytes, rate_
 
 #[cfg(test)]
 mod tests {
-    use super::avcc_to_annex_b;
+    use super::{OggOpusDemux, avcc_to_annex_b};
+
+    /// Builds one Ogg page carrying the given packets (with correct lacing).
+    fn ogg_page(packets: &[&[u8]]) -> Vec<u8> {
+        let mut seg = Vec::new();
+        let mut body = Vec::new();
+        for p in packets {
+            let mut len = p.len();
+            loop {
+                if len >= 255 {
+                    seg.push(255);
+                    len -= 255;
+                } else {
+                    seg.push(len as u8);
+                    break;
+                }
+            }
+            body.extend_from_slice(p);
+        }
+        let mut page = Vec::new();
+        page.extend_from_slice(b"OggS");
+        page.extend_from_slice(&[0u8; 22]); // version, type, granule, serial, seq, crc
+        page.push(seg.len() as u8);
+        page.extend_from_slice(&seg);
+        page.extend_from_slice(&body);
+        page
+    }
+
+    #[test]
+    fn ogg_opus_demux_skips_headers_and_yields_packets() {
+        let mut demux = OggOpusDemux::default();
+        let mut stream = ogg_page(&[b"OpusHead"]);
+        stream.extend(ogg_page(&[b"OpusTags"]));
+        stream.extend(ogg_page(&[b"\x01audio-one", b"\x02audio-two"]));
+        // Feed split across a page boundary to exercise the streaming buffer.
+        let mid = stream.len() / 2;
+        let mut out = demux.push(&stream[..mid]);
+        out.extend(demux.push(&stream[mid..]));
+        assert_eq!(out.len(), 2);
+        assert_eq!(&out[0][..], b"\x01audio-one");
+        assert_eq!(&out[1][..], b"\x02audio-two");
+    }
 
     #[test]
     fn avcc_converts_each_nal_to_start_code_prefixed() {

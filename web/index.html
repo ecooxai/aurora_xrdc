@@ -73,7 +73,7 @@
                 </div>
                 <div class="menu-grid">
                   <label class="toggle-label">
-                    <span>Mute server audio</span>
+                    <span>Mute</span>
                     <input id="audio-muted" type="checkbox" />
                   </label>
                   <label class="toggle-label">
@@ -81,6 +81,11 @@
                     <input id="audio-real-output" type="checkbox" />
                   </label>
                   <span id="audio-output-status" class="field-help">Virtual output</span>
+                  <label class="toggle-label">
+                    <span>Encode audio in video (WebRTC media)</span>
+                    <input id="audio-in-video" type="checkbox" />
+                  </label>
+                  <span class="field-help">On: native Opus track with the video. Off: audio sent separately and decoded by WebCodecs.</span>
                   <label>Audio playback bitrate
                     <select id="audio-bitrate">
                       <option value="16">16 kbps</option>

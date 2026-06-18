@@ -274,6 +274,9 @@ struct WsQuery {
     gop_ms: Option<u32>,
     buffer_ms: Option<u32>,
     scale: Option<VideoScale>,
+    /// WebRTC media mode only: carry audio as a native Opus RTP track in the video
+    /// stream instead of AAC over the data channel (WebCodecs).
+    audio_in_video: Option<bool>,
     passwd: Option<String>,
 }
 
@@ -842,6 +845,7 @@ async fn webrtc_offer(
     let sdp = rtc::answer(
         body.sdp,
         body.mode,
+        query.audio_in_video.unwrap_or(false),
         role,
         state.server.clone(),
         state.media.clone(),
