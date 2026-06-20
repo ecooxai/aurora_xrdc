@@ -1072,6 +1072,7 @@ function syncPendingStreamSettings(settings = readSettingsFromControls()) {
 }
 
 function syncServerStreamSettings(streamConfig, audioConfig, { force = false } = {}) {
+  const current = readSettingsFromControls();
   const incoming = normalizeSettings({
     codec: streamConfig?.codec,
     encodePreference: streamConfig?.encode_preference,
@@ -1083,8 +1084,11 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
     videoScale: streamConfig?.performance?.scale,
     gopMs: streamConfig?.performance?.gop_ms,
     bufferMs: streamConfig?.performance?.buffer_ms,
+    // The server never reports this client-only WebRTC transport preference, so
+    // mirror the local value — otherwise reconciliation would see a permanent
+    // mismatch and reconnect forever when it is enabled.
+    audioInVideo: current.audioInVideo,
   });
-  const current = readSettingsFromControls();
   const currentKey = streamReconnectSettingsKey(current);
   const incomingKey = streamReconnectSettingsKey(incoming);
   if (incomingKey === currentKey) {
