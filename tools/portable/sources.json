@@ -1,0 +1,42 @@
+{
+  "git": {
+    "tinyx": {
+      "url": "https://github.com/tinycorelinux/tinyx",
+      "commit": "feab72ca891bc04b18763763e15ee4e532369cdf"
+    },
+    "pulseaudio": {
+      "url": "https://github.com/pulseaudio/pulseaudio.git",
+      "commit": "77d25a1e613095bdf87a1d13b65e7c330565077a"
+    },
+    "aurora-wm": {
+      "url": "https://github.com/ecooxai/aurora-wm.git",
+      "commit": "86a97cd910b285e30fc4b2d12497c9288eede4de"
+    },
+    "xdotool": {
+      "url": "https://github.com/jordansissel/xdotool",
+      "commit": "eb489de1b4fb3fd0cd935d68ae16ecd4c653ac7d"
+    },
+    "libxkbcommon": {
+      "url": "https://github.com/xkbcommon/libxkbcommon.git",
+      "commit": "b3465081878e80ca6c11fe35c81787ec374ec15a"
+    }
+  },
+  "source_archives_sha256": {
+    "libsndfile.tar.xz": "3799ca9924d3125038880367bf1468e53a1b7e3686a934f098b7e1d286cdb80e",
+    "libXfont.tar.bz2": "1a7f7490774c87f2052d146d1e0e64518d32e6848184a18654e8d0bb57883242",
+    "libXtst.tar.xz": "b50d4c25b97009a744706c1039c598f4d8e64910c9fde381994e1cae235d9242",
+    "libxkbcommon.tar.xz": "3b4033aa4bf2b8309454d31de317fd45a2ff805a39b58bc4a06c833565f844a4",
+    "x265.tar.gz": "a31699c6a89806b74b0151e5e6a7df65de4b49050482fe5ebf8a4379d7af8f29",
+    "opus.tar.gz": "65c1d2f78b9f2fb20082c38cbe47c951ad5839345876e46941612ee87f9a7ce1",
+    "libXau.tar.xz": "f3fa3282f5570c3f6bd620244438dbfbdd580fc80f02f549587a0f8ab329bbeb",
+    "ffmpeg.tar.xz": "f0bf043299db9e3caacb435a712fc541fbb07df613c4b893e8b77e67baf3adbe",
+    "libXi.tar.xz": "d0e0555e53d6e2114eabfa44226ba162d2708501a25e18d99cfb35c094c6c104",
+    "dbus.tar.xz": "0ba2a1a4b16afe7bceb2c07e9ce99a8c2c3508e5dec290dbb643384bd6beb7e2",
+    "libXdmcp.tar.xz": "d8a5222828c3adab70adf69a5583f1d32eb5ece04304f7f8392b6a353aa2228c",
+    "libXinerama.tar.xz": "5094d1f0fcc1828cb1696d0d39d9e866ae32520c54d01f618f1a3c1e30c2085c",
+    "libvpx.tar.gz": "26fcd3db88045dee380e581862a6ef106f49b74b6396ee95c2993a260b4636aa",
+    "libfontenc.tar.xz": "7b02c3d405236e0d86806b1de9d6868fe60c313628b38350b032914aa4fd14c6"
+  },
+  "alpine": "3.24.2",
+  "alpine_rootfs_sha256": "c5ca053cfe1d85c5b96dff8b9bc57045f7f184a30ffb6b65776409ca90388677"
+}

@@ -369,6 +369,15 @@ impl ServerConfig {
                         _ => anyhow::bail!("--localhost must be yes or no"),
                     }
                 }
+                "--passwd-file" => {
+                    let path = args.next().context("missing value for --passwd-file")?;
+                    let value = std::fs::read_to_string(&path).context("reading --passwd-file")?;
+                    let value = value.trim_end_matches(['\n', '\r']).to_string();
+                    if value.trim().is_empty() || value.len() > 4096 {
+                        anyhow::bail!("invalid password file");
+                    }
+                    passwd = Some(value);
+                }
                 "--passwd" => {
                     let value = args.next().context("missing value for --passwd")?;
                     if value.trim().is_empty() {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use x11rb::{
     NONE,
     connection::Connection,
@@ -94,8 +94,7 @@ impl X11InputInjector {
     }
 
     pub fn queue_key_event(&self, key: &str, down: bool) -> Result<()> {
-        let keysym =
-            key_name_to_keysym(key).ok_or_else(|| anyhow!("unsupported X11 key {key}"))?;
+        let keysym = key_name_to_keysym(key).ok_or_else(|| anyhow!("unsupported X11 key {key}"))?;
         let keycode = self
             .keycodes
             .get(&keysym)

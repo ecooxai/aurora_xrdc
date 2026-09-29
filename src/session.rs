@@ -28,7 +28,8 @@ use crate::{
     streamer::StreamFrame,
     system_stats::StatsSampler,
     transport::{WireSink, WireStream},
-    uinput::{UInputPointerInjector, UInputWheelInjector},
+    uinput::UInputPointerInjector,
+    wheel::{WheelDispatcher, WheelEvent},
     x11_input::{X11InputInjector, screen_size},
 };
 
@@ -50,35 +51,11 @@ const MIC_STREAM_ID_BYTES: usize = std::mem::size_of::<u32>();
 const VIDEO_PACKET_QUEUE_CAPACITY: usize = 64;
 const AUDIO_PACKET_QUEUE_CAPACITY: usize = 128;
 const DISPLAY_WAKE_INTERVAL: Duration = Duration::from_millis(350);
-// The X11 backend injects wheel input as button clicks. Keep pixel-mode input
-// responsive for slow trackpad deltas, but never turn one browser wheel event
-// into a burst of server clicks.
-const WHEEL_PIXEL_STEP: f64 = 12.0;
-const WHEEL_LINE_STEP: f64 = 3.0;
-const WHEEL_PAGE_STEPS: f64 = 8.0;
-const WHEEL_MAX_STEPS_PER_MESSAGE: f64 = 1.0;
-const WHEEL_GESTURE_IDLE_INTERVAL: Duration = Duration::from_millis(800);
-const WEBCLIENT_CLICK_SCROLL_DISTANCE_SCALE: f64 = 0.5;
-const WEBCLIENT_SMOOTH_SCROLL_DISTANCE_SCALE: f64 = 2.0;
-const SMOOTH_WHEEL_UNITS_PER_PIXEL: f64 = 1.0;
-const SMOOTH_WHEEL_LINE_PIXELS: f64 = 40.0;
-const SMOOTH_WHEEL_PAGE_PIXELS: f64 = 800.0;
-const SMOOTH_WHEEL_MAX_UNITS_PER_MESSAGE: f64 = 120.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PointerMotionCommand {
     Absolute { x: i32, y: i32 },
     Relative { dx: i32, dy: i32 },
-}
-
-#[derive(Debug, Default)]
-struct WheelAccumulator {
-    x_steps: f64,
-    y_steps: f64,
-    x_last_at: Option<Instant>,
-    y_last_at: Option<Instant>,
-    x_last_sign: i8,
-    y_last_sign: i8,
 }
 
 pub async fn handle_socket(
@@ -94,7 +71,17 @@ pub async fn handle_socket(
 ) -> Result<()> {
     match role {
         SessionRole::All => {
-            handle_combined_socket(sink, stream, server, media, config, audio_config, close_rx, clients).await
+            handle_combined_socket(
+                sink,
+                stream,
+                server,
+                media,
+                config,
+                audio_config,
+                close_rx,
+                clients,
+            )
+            .await
         }
         SessionRole::Control => {
             handle_control_socket(sink, stream, server, media, close_rx, clients).await
@@ -957,7 +944,7 @@ async fn handle_client(
     let mut mic_input = MicInputState::Idle;
     let mut last_key_state_at = None;
     let mut last_display_wake_at = None;
-    let mut wheel_accumulator = WheelAccumulator::default();
+    let wheel = WheelDispatcher::new(server.display.clone(), uinput_input_enabled())?;
     let input_injector = match X11InputInjector::connect(&server.display) {
         Ok(injector) => Some(injector),
         Err(err) => {
@@ -977,20 +964,10 @@ async fn handle_client(
     } else {
         None
     };
-    let mut smooth_wheel_injector = if use_uinput {
-        match UInputWheelInjector::connect() {
-            Ok(injector) => Some(injector),
-            Err(err) => {
-                warn!("smooth uinput wheel unavailable, falling back to X11 wheel clicks: {err}");
-                None
-            }
-        }
-    } else {
-        None
-    };
     let mut pending_message = None;
     let mut key_watchdog = tokio::time::interval(KEY_STATE_WATCHDOG_INTERVAL);
     key_watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let receive_result: Result<()> = async {
     loop {
         tokio::select! {
             message = async {
@@ -1006,6 +983,12 @@ async fn handle_client(
                 match message? {
                     Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(client) => {
+                            if let ClientMessage::PointerWheel { delta_x, delta_y, delta_mode, scroll_speed } = &client {
+                                maybe_wake_display(&server.display, &mut last_display_wake_at);
+                                wheel.submit(WheelEvent::new(*delta_x, *delta_y, *delta_mode, *scroll_speed));
+                                continue;
+                            }
+                            if matches!(&client, ClientMessage::ResetInput) { wheel.clear(); }
                             let receiver_closed = if is_pointer_motion_message(&client) {
                                 let mut motions = Vec::new();
                                 push_pointer_motion_command(&mut motions, &client);
@@ -1030,13 +1013,11 @@ async fn handle_client(
                                     &server.display,
                                     &mut pointer_motion_injector,
                                     input_injector.as_ref(),
-                                    smooth_wheel_injector.as_mut(),
                                     &sender,
                                     &media,
                                     client,
                                     &mut pressed_keys,
                                     &mut last_key_state_at,
-                                    &mut wheel_accumulator,
                                 )
                                 .await?;
                                 false
@@ -1074,9 +1055,13 @@ async fn handle_client(
             }
         }
     }
-    reset_input_state(&server.display, input_injector.as_ref(), &mut pressed_keys).await?;
+        Ok(())
+    }.await;
+    wheel.clear();
+    let reset_result =
+        reset_input_state(&server.display, input_injector.as_ref(), &mut pressed_keys).await;
     shutdown_mic_input(&mut mic_input).await;
-    Ok(())
+    receive_result.and(reset_result)
 }
 
 fn should_wake_display_for_message(message: &ClientMessage) -> bool {
@@ -1139,7 +1124,7 @@ fn drain_pointer_motion_messages(
     pending_message: &mut Option<Message>,
     motions: &mut Vec<PointerMotionCommand>,
 ) -> Result<bool> {
-    loop {
+    for _ in 0..128 {
         match receiver.next().now_or_never() {
             None => return Ok(false),
             Some(None) => return Ok(true),
@@ -1162,195 +1147,7 @@ fn drain_pointer_motion_messages(
             Some(Some(Err(err))) => return Err(err.into()),
         }
     }
-}
-
-fn wheel_clicks_for_delta(
-    accumulator: &mut WheelAccumulator,
-    delta_x: f64,
-    delta_y: f64,
-    delta_mode: Option<u8>,
-    scroll_speed: Option<f64>,
-) -> Vec<(u8, u32)> {
-    let speed = wheel_speed_scale(
-        scroll_speed,
-        delta_mode,
-        WEBCLIENT_CLICK_SCROLL_DISTANCE_SCALE,
-    );
-    let x_steps = normalize_wheel_delta(delta_x, delta_mode) * speed;
-    let y_steps = normalize_wheel_delta(delta_y, delta_mode) * speed;
-    let horizontal_steps = accumulate_wheel_steps(
-        &mut accumulator.x_steps,
-        &mut accumulator.x_last_at,
-        &mut accumulator.x_last_sign,
-        x_steps,
-        true,
-    );
-    let vertical_steps = accumulate_wheel_steps(
-        &mut accumulator.y_steps,
-        &mut accumulator.y_last_at,
-        &mut accumulator.y_last_sign,
-        y_steps,
-        true,
-    );
-    let mut clicks = Vec::with_capacity(2);
-    if horizontal_steps < 0 {
-        clicks.push((6, horizontal_steps.unsigned_abs()));
-    } else if horizontal_steps > 0 {
-        clicks.push((7, horizontal_steps as u32));
-    }
-    if vertical_steps < 0 {
-        clicks.push((4, vertical_steps.unsigned_abs()));
-    } else if vertical_steps > 0 {
-        clicks.push((5, vertical_steps as u32));
-    }
-    clicks
-}
-
-fn smooth_wheel_units_for_delta(
-    accumulator: &mut WheelAccumulator,
-    delta_x: f64,
-    delta_y: f64,
-    delta_mode: Option<u8>,
-    scroll_speed: Option<f64>,
-) -> (i32, i32) {
-    let speed = wheel_speed_scale(
-        scroll_speed,
-        delta_mode,
-        WEBCLIENT_SMOOTH_SCROLL_DISTANCE_SCALE,
-    );
-    let x_units = normalize_smooth_wheel_delta(delta_x, delta_mode) * speed;
-    let y_units = normalize_smooth_wheel_delta(delta_y, delta_mode) * speed;
-    let horizontal_units = accumulate_wheel_steps(
-        &mut accumulator.x_steps,
-        &mut accumulator.x_last_at,
-        &mut accumulator.x_last_sign,
-        x_units,
-        false,
-    );
-    let vertical_units = accumulate_wheel_steps(
-        &mut accumulator.y_steps,
-        &mut accumulator.y_last_at,
-        &mut accumulator.y_last_sign,
-        y_units,
-        false,
-    );
-    (horizontal_units, -vertical_units)
-}
-
-fn normalize_wheel_delta(delta: f64, delta_mode: Option<u8>) -> f64 {
-    if !delta.is_finite() {
-        return 0.0;
-    }
-    let delta = delta.clamp(-10_000.0, 10_000.0);
-    match delta_mode {
-        // Old clients sent already-quantized wheel steps and had no deltaMode.
-        None => delta,
-        Some(0) => delta / WHEEL_PIXEL_STEP,
-        Some(1) => delta / WHEEL_LINE_STEP,
-        Some(2) => delta * WHEEL_PAGE_STEPS,
-        Some(_) => delta / WHEEL_PIXEL_STEP,
-    }
-    .clamp(-WHEEL_MAX_STEPS_PER_MESSAGE, WHEEL_MAX_STEPS_PER_MESSAGE)
-}
-
-fn wheel_speed_scale(
-    scroll_speed: Option<f64>,
-    delta_mode: Option<u8>,
-    webclient_scale: f64,
-) -> f64 {
-    let speed = scroll_speed
-        .filter(|speed| speed.is_finite())
-        .unwrap_or(1.0)
-        .clamp(0.1, 5.0);
-    if delta_mode.is_some() {
-        speed * webclient_scale
-    } else {
-        speed
-    }
-}
-
-fn normalize_smooth_wheel_delta(delta: f64, delta_mode: Option<u8>) -> f64 {
-    if !delta.is_finite() {
-        return 0.0;
-    }
-    let delta = delta.clamp(-10_000.0, 10_000.0);
-    match delta_mode {
-        None => delta * 120.0,
-        Some(0) => delta * SMOOTH_WHEEL_UNITS_PER_PIXEL,
-        Some(1) => delta * SMOOTH_WHEEL_LINE_PIXELS,
-        Some(2) => delta * SMOOTH_WHEEL_PAGE_PIXELS,
-        Some(_) => delta * SMOOTH_WHEEL_UNITS_PER_PIXEL,
-    }
-    .clamp(
-        -SMOOTH_WHEEL_MAX_UNITS_PER_MESSAGE,
-        SMOOTH_WHEEL_MAX_UNITS_PER_MESSAGE,
-    )
-}
-
-fn accumulate_wheel_steps(
-    remainder: &mut f64,
-    last_at: &mut Option<Instant>,
-    last_sign: &mut i8,
-    delta_steps: f64,
-    kick_start: bool,
-) -> i32 {
-    if !delta_steps.is_finite() || delta_steps == 0.0 {
-        return 0;
-    }
-    let now = Instant::now();
-    let idle =
-        last_at.is_none_or(|last_at| now.duration_since(last_at) > WHEEL_GESTURE_IDLE_INTERVAL);
-    let sign = if delta_steps > 0.0 { 1 } else { -1 };
-    if idle || (*last_sign != 0 && *last_sign != sign) {
-        *remainder = 0.0;
-        *last_sign = 0;
-    }
-    *last_at = Some(now);
-    *last_sign = sign;
-    *remainder += delta_steps;
-    let mut whole_steps = if *remainder >= 0.0 {
-        remainder.floor()
-    } else {
-        remainder.ceil()
-    };
-    // On a fresh gesture (the pointer has been idle), emit at least one step in
-    // the scroll direction right away instead of swallowing the first event
-    // while the sub-step remainder fills up. This keeps coarse XTEST wheel
-    // clicks (headless X11) responsive: the first notch moves immediately. The
-    // borrowed fraction is repaid against the next event so the overall scroll
-    // rate is unchanged. Only the discrete-click path opts in; the high-res
-    // uinput path already moves on every event.
-    if kick_start && idle && whole_steps == 0.0 {
-        whole_steps = sign as f64;
-    }
-    *remainder -= whole_steps;
-    whole_steps as i32
-}
-
-async fn apply_wheel_clicks(
-    display: &str,
-    input_injector: Option<&X11InputInjector>,
-    clicks: &[(u8, u32)],
-) -> Result<()> {
-    if clicks.is_empty() {
-        return Ok(());
-    }
-    if let Some(input_injector) = input_injector {
-        for (button, count) in clicks {
-            for _ in 0..*count {
-                input_injector.queue_pointer_click(*button)?;
-            }
-        }
-        return input_injector.flush();
-    }
-    let mut args = Vec::new();
-    for (button, count) in clicks {
-        for _ in 0..*count {
-            args.push("click".to_string());
-            args.push(button.to_string());
-        }
-    }
-    run_xdotool(display, &args).await
+    Ok(false)
 }
 
 fn maybe_wake_display(display: &str, last_wake_at: &mut Option<Instant>) {
@@ -1377,13 +1174,11 @@ async fn apply_client_message(
     display: &str,
     pointer_motion_injector: &mut Option<UInputPointerInjector>,
     input_injector: Option<&X11InputInjector>,
-    smooth_wheel_injector: Option<&mut UInputWheelInjector>,
     sender: &mpsc::Sender<Message>,
     media: &MediaHub,
     message: ClientMessage,
     pressed_keys: &mut HashSet<String>,
     last_key_state_at: &mut Option<Instant>,
-    wheel_accumulator: &mut WheelAccumulator,
 ) -> Result<()> {
     match message {
         ClientMessage::PointerMove { dx, dy } => {
@@ -1408,36 +1203,8 @@ async fn apply_client_message(
                 run_xdotool(display, [action, &button.to_string()]).await?;
             }
         }
-        ClientMessage::PointerWheel {
-            delta_x,
-            delta_y,
-            delta_mode,
-            scroll_speed,
-        } => {
-            if let Some(smooth_wheel_injector) = smooth_wheel_injector {
-                let (horizontal, vertical) = smooth_wheel_units_for_delta(
-                    wheel_accumulator,
-                    delta_x,
-                    delta_y,
-                    delta_mode,
-                    scroll_speed,
-                );
-                smooth_wheel_injector.emit_scroll(horizontal, vertical)?;
-            } else {
-                let clicks = wheel_clicks_for_delta(
-                    wheel_accumulator,
-                    delta_x,
-                    delta_y,
-                    delta_mode,
-                    scroll_speed,
-                );
-                // Prefer the persistent XTEST connection (headless X11). Spawning
-                // an `xdotool` process per wheel event takes tens of milliseconds
-                // and, because this receive loop is serial, stalls the pointer-move
-                // and key messages queued behind it — input appears frozen while
-                // scrolling. Only fall back to xdotool when no injector exists.
-                apply_wheel_clicks(display, input_injector, &clicks).await?;
-            }
+        ClientMessage::PointerWheel { .. } => {
+            // Dispatched before this ordered keyboard/button path.
         }
         ClientMessage::TouchTap => {
             if let Some(input_injector) = input_injector {
@@ -1458,14 +1225,8 @@ async fn apply_client_message(
                     && key_logical_modifier(&key).is_none()
                     && key_modifiers_active(modifiers)
                 {
-                    tap_key_with_modifiers(
-                        display,
-                        input_injector,
-                        pressed_keys,
-                        &key,
-                        modifiers,
-                    )
-                    .await?;
+                    tap_key_with_modifiers(display, input_injector, pressed_keys, &key, modifiers)
+                        .await?;
                     *last_key_state_at = if pressed_keys.is_empty() {
                         None
                     } else {
@@ -1912,9 +1673,7 @@ async fn apply_key_event(
         match input_injector.key_event(key, down) {
             Ok(()) => return Ok(()),
             Err(err) => {
-                warn!(
-                    "persistent X11 key event failed for {key}, falling back to xdotool: {err}"
-                );
+                warn!("persistent X11 key event failed for {key}, falling back to xdotool: {err}");
             }
         }
     }
@@ -1953,10 +1712,11 @@ async fn reset_input_state(
 #[cfg(test)]
 mod tests {
     use super::{
-        PointerMotionCommand, WheelAccumulator, key_chord_rank, push_pointer_motion_command,
-        should_wake_display_for_message, smooth_wheel_units_for_delta, wheel_clicks_for_delta,
+        PointerMotionCommand, key_chord_rank, push_pointer_motion_command,
+        should_wake_display_for_message,
     };
     use crate::messages::ClientMessage;
+    use crate::wheel::{WheelAccumulator, smooth_wheel_units_for_delta, wheel_clicks_for_delta};
 
     #[test]
     fn chord_modifiers_sort_before_regular_keys() {

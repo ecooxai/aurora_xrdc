@@ -2,4 +2,9 @@
 /dist
 /tmp
 /ssl_keys
-Cargo.lock
+
+.agentwork/
+.output/
+
+__pycache__/
+*.pyc

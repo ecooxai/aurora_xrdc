@@ -1,3 +1,4 @@
+import { WheelQueue } from "./wheel_queue.mjs";
 const $ = (id) => document.getElementById(id);
 const SETTINGS_STORAGE_KEY = "vibe_rdesk.settings";
 const API_ORIGIN_STORAGE_KEY = "vibe_rdesk.api_origin";
@@ -2505,6 +2506,7 @@ class WtSocket {
     this._transport = null;
     this._writer = null;
     this._writeChain = Promise.resolve();
+    this.bufferedAmount = 0;
     this._closed = false;
     this._textDecoder = new TextDecoder();
     this._textEncoder = new TextEncoder();
@@ -2686,8 +2688,10 @@ class WtSocket {
       return;
     }
     const writer = this._writer;
+    this.bufferedAmount += frame.byteLength;
     this._writeChain = this._writeChain
       .then(() => writer.write(frame))
+      .finally(() => { this.bufferedAmount = Math.max(0, this.bufferedAmount - frame.byteLength); })
       .catch((err) => {
         if (this.onerror) this.onerror({ target: this, message: String(err?.message || err) });
       });
@@ -4958,6 +4962,7 @@ function shouldUseInputSocket(message) {
 }
 
 function clearPendingPointerMotion() {
+  wheelQueue.clear();
   if (state.pointerFlushTimer) {
     clearTimeout(state.pointerFlushTimer);
     state.pointerFlushTimer = 0;
@@ -5522,16 +5527,17 @@ function scrollSpeedScale() {
   return Math.min(Math.max(value * 0.25, 0.1), 5);
 }
 
+const wheelQueue = new WheelQueue((message) => {
+  flushPendingPointerMotion();
+  sendNow(message);
+}, () => {
+  const socket = isInputConnected() ? state.inputSocket : state.socket;
+  return !isSocketOpen(socket) || (socket.bufferedAmount || 0) > 32768;
+});
+
 function sendWheelDelta(deltaX, deltaY, deltaMode = 0, scrollSpeed = scrollSpeedScale()) {
-  if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)) return;
-  if (!deltaX && !deltaY) return;
-  send({
-    type: "pointer_wheel",
-    delta_x: deltaX,
-    delta_y: deltaY,
-    delta_mode: deltaMode,
-    scroll_speed: scrollSpeed,
-  });
+  wheelQueue.push({ type: "pointer_wheel", delta_x: deltaX, delta_y: deltaY,
+    delta_mode: deltaMode, scroll_speed: scrollSpeed });
 }
 
 function queuePointerMove(x, y) {

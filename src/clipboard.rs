@@ -260,7 +260,9 @@ impl X11ClipboardClient {
                 CURRENT_TIME,
             )
             .context("failed to request X11 clipboard conversion")?;
-        self.connection.flush().context("failed to flush X11 requests")?;
+        self.connection
+            .flush()
+            .context("failed to flush X11 requests")?;
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if Instant::now() >= deadline {
@@ -352,7 +354,9 @@ impl ClipboardServer {
         self.connection
             .set_selection_owner(self.window, self.atoms.clipboard, CURRENT_TIME)
             .context("failed to set X11 clipboard owner")?;
-        self.connection.flush().context("failed to flush X11 requests")?;
+        self.connection
+            .flush()
+            .context("failed to flush X11 requests")?;
         let owner = self
             .connection
             .get_selection_owner(self.atoms.clipboard)
@@ -409,7 +413,9 @@ impl ClipboardServer {
         self.connection
             .send_event(false, event.requestor, EventMask::NO_EVENT, notify)
             .context("failed to send X11 clipboard selection notification")?;
-        self.connection.flush().context("failed to flush X11 requests")?;
+        self.connection
+            .flush()
+            .context("failed to flush X11 requests")?;
         Ok(())
     }
 

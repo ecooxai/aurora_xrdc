@@ -409,6 +409,18 @@ pub async fn run(server: ServerConfig) -> Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/app.js", get(js))
+        .route(
+            "/wheel_queue.mjs",
+            get(|| async {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/javascript; charset=utf-8",
+                    )],
+                    include_str!("../web/wheel_queue.mjs"),
+                )
+            }),
+        )
         .route("/app.css", get(css))
         .route("/video_renderer_worker.js", get(video_renderer_worker_js))
         .route("/manifest.webmanifest", get(manifest))
@@ -785,24 +797,24 @@ async fn ws(
     ws.max_message_size(WS_MAX_MESSAGE_SIZE)
         .max_frame_size(WS_MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| async move {
-        let _lease = lease;
-        let (sink, stream) = transport::from_websocket(socket);
-        if let Err(err) = session::handle_socket(
-            sink,
-            stream,
-            state.server.clone(),
-            state.media.clone(),
-            config,
-            audio_config,
-            role,
-            close_rx,
-            state.clients.clone(),
-        )
-        .await
-        {
-            warn!(error = %err, "websocket session ended with an error");
-        }
-    })
+            let _lease = lease;
+            let (sink, stream) = transport::from_websocket(socket);
+            if let Err(err) = session::handle_socket(
+                sink,
+                stream,
+                state.server.clone(),
+                state.media.clone(),
+                config,
+                audio_config,
+                role,
+                close_rx,
+                state.clients.clone(),
+            )
+            .await
+            {
+                warn!(error = %err, "websocket session ended with an error");
+            }
+        })
 }
 
 #[derive(Debug, Deserialize)]

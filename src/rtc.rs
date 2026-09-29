@@ -177,7 +177,12 @@ pub async fn answer(
                 "vibe-rdesk".to_owned(),
             ));
             add_track(&pc, at.clone()).await?;
-            spawn_opus_track_feed(at.clone(), server.clone(), audio_config.clone(), shutdown.clone());
+            spawn_opus_track_feed(
+                at.clone(),
+                server.clone(),
+                audio_config.clone(),
+                shutdown.clone(),
+            );
             audio_track = Some(at);
         }
     }
@@ -678,8 +683,8 @@ fn avcc_to_annex_b(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 16);
     let mut pos = 0;
     while pos + 4 <= data.len() {
-        let len = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
-            as usize;
+        let len =
+            u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
         if len == 0 || pos + len > data.len() {
             // Not valid AVCC framing; fall back to the raw payload.
@@ -711,7 +716,8 @@ fn spawn_opus_track_feed(
     shutdown: Arc<Notify>,
 ) {
     tokio::spawn(async move {
-        let mut child = match crate::ffmpeg::spawn_opus_audio_capture(&server, &audio_config).await {
+        let mut child = match crate::ffmpeg::spawn_opus_audio_capture(&server, &audio_config).await
+        {
             Ok(child) => child,
             Err(err) => {
                 warn!(error = %err, "failed to start opus audio capture for webrtc media");

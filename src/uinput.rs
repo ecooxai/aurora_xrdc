@@ -233,7 +233,7 @@ fn write_input_event(device: &mut File, type_: i32, code: i32, value: i32) -> Re
 }
 
 fn ioctl(fd: libc::c_int, request: libc::c_ulong, value: libc::c_int) -> io::Result<()> {
-    let result = unsafe { libc::ioctl(fd, request, value) };
+    let result = unsafe { libc::ioctl(fd, request as _, value) };
     if result == -1 {
         Err(io::Error::last_os_error())
     } else {

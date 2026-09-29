@@ -15,6 +15,12 @@ use crate::settings::{
 };
 use crate::x11_input::screen_size;
 
+fn ffmpeg_program() -> std::ffi::OsString {
+    std::env::var_os("AURORA_FFMPEG")
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "ffmpeg".into())
+}
+
 #[derive(Debug, Clone)]
 pub struct EncoderChoice {
     pub ffmpeg_encoder: String,
@@ -79,7 +85,6 @@ const VIRTUAL_MIC_SINK_NAME: &str = "vibe_rdesk_virtual_mic_sink";
 const VIRTUAL_CAMERA_LABEL: &str = "VibeRDesk Camera";
 const LEGACY_VIRTUAL_CAMERA_LABELS: &[&str] = &["viberdeskcamera", "vibedeskcamera"];
 const VIRTUAL_CAMERA_NR: &str = "42";
-const DISPLAY_WAKE_RETRY_DELAY: Duration = Duration::from_millis(150);
 
 const H264_GPU_ENCODERS: &[EncoderProfile] = &[
     EncoderProfile {
@@ -405,7 +410,7 @@ async fn has_working_encoder(encoders: &str, profile: EncoderProfile) -> bool {
 }
 
 async fn ffmpeg_probe_encoder(profile: EncoderProfile) -> Result<bool> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_program());
     cmd.args(["-loglevel", "error"]);
     append_hw_device_args(&mut cmd, profile.backend)?;
     cmd.args([
@@ -446,7 +451,7 @@ pub fn spawn_capture(
     let fps = stream.fps.to_string();
     let gop = video_gop_frames(stream.fps, stream.performance.gop_ms).to_string();
     let backend = encoder_backend(&encoder.ffmpeg_encoder);
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_program());
     cmd.env("DISPLAY", &server.display).args([
         "-loglevel",
         "error",
@@ -828,7 +833,7 @@ pub async fn spawn_audio_capture(
 ) -> Result<tokio::process::Child> {
     let source = ensure_pulse_monitor_source(server).await?;
     let bitrate = format!("{}k", config.bitrate_kbps);
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_program());
     cmd.env("DISPLAY", &server.display)
         .args([
             "-loglevel",
@@ -891,7 +896,7 @@ pub async fn spawn_opus_audio_capture(
 ) -> Result<tokio::process::Child> {
     let source = ensure_pulse_monitor_source(server).await?;
     let bitrate = format!("{}k", config.bitrate_kbps);
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_program());
     cmd.env("DISPLAY", &server.display)
         .args([
             "-loglevel",
@@ -950,8 +955,8 @@ pub async fn spawn_opus_audio_capture(
 
 pub async fn warm_audio_stack(server: &ServerConfig) -> Result<()> {
     ensure_pulse_server().await?;
-    ensure_virtual_sink(server).await?;
-    ensure_virtual_mic_source().await?;
+    ensure_pulse_monitor_source(server).await?;
+    // Microphone devices are created lazily when the user enables microphone input.
     Ok(())
 }
 
@@ -960,6 +965,11 @@ pub async fn ensure_virtual_camera_device() -> Result<String> {
         return Ok(device);
     }
 
+    if std::env::var_os("VIBE_RDESK_MANAGED_RUNTIME").is_some() {
+        anyhow::bail!(
+            "virtual camera requires a preconfigured host v4l2loopback device; portable mode never modifies host kernel modules"
+        );
+    }
     let output = Command::new("modprobe")
         .args([
             "v4l2loopback",
@@ -986,7 +996,7 @@ pub async fn ensure_virtual_camera_device() -> Result<String> {
 }
 
 pub fn spawn_virtual_camera_relay(device: &str) -> Result<VirtualCameraRelayHandle> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_program());
     cmd.args([
         "-loglevel",
         "error",
@@ -1023,7 +1033,7 @@ pub fn spawn_virtual_camera_relay(device: &str) -> Result<VirtualCameraRelayHand
 }
 
 pub fn spawn_virtual_camera_placeholder(device: &str) -> Result<VirtualCameraPlaceholderHandle> {
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_program());
     cmd.args([
         "-loglevel",
         "error",
@@ -1136,7 +1146,7 @@ fn permission_denied_stderr(stderr: &[u8]) -> bool {
 pub async fn spawn_mic_input_injector(server: &ServerConfig) -> Result<MicInputHandle> {
     ensure_virtual_mic_source().await?;
     let mic_sink_name = virtual_mic_sink_name();
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(ffmpeg_program());
     cmd.env("DISPLAY", &server.display)
         .args([
             "-loglevel",
@@ -1189,7 +1199,7 @@ pub async fn spawn_mic_input_injector(server: &ServerConfig) -> Result<MicInputH
 }
 
 async fn ffmpeg_list_encoders() -> Result<String> {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(ffmpeg_program())
         .arg("-encoders")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1207,11 +1217,14 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let status = Command::new("xdotool")
+    let mut command = Command::new("xdotool");
+    command
         .env("DISPLAY", display)
         .args(args)
-        .status()
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(Duration::from_millis(500), command.status())
         .await
+        .context("xdotool timed out")?
         .context("failed to run xdotool")?;
     if status.success() {
         Ok(())
@@ -1221,132 +1234,26 @@ where
 }
 
 pub async fn wake_display(display: &str) -> Result<()> {
-    let mut woke = false;
-    let mut errors = Vec::new();
-
-    woke |= wake_display_once(display, &mut errors).await;
-    sleep(DISPLAY_WAKE_RETRY_DELAY).await;
-    woke |= wake_display_once(display, &mut errors).await;
-
-    if woke {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "all display wake attempts failed: {}",
-            errors.join("; ")
-        ))
-    }
-}
-
-async fn run_xset<I, S>(display: &str, args: I) -> Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("xset")
-        .env("DISPLAY", display)
-        .args(args)
-        .status()
-        .await
-        .context("failed to run xset")?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("xset exited with {}", status))
-    }
-}
-
-async fn wake_display_once(display: &str, errors: &mut Vec<String>) -> bool {
-    let mut woke = false;
-    let headless_display = std::env::var_os("VIBE_RDESK_HEADLESS_DISPLAY_ACTIVE").is_some();
-
-    record_wake_result(
-        "xset s reset",
-        run_xset(display, ["s", "reset"]).await,
-        &mut woke,
-        errors,
-    );
-    if !headless_display {
-        record_wake_result(
-            "xset dpms force on",
-            run_xset(display, ["dpms", "force", "on"]).await,
-            &mut woke,
-            errors,
-        );
-        record_wake_result(
-            "dbus-send org.freedesktop.ScreenSaver.SimulateUserActivity",
-            run_dbus_send(
-                display,
-                [
-                    "--session",
-                    "--type=method_call",
-                    "--dest=org.freedesktop.ScreenSaver",
-                    "/ScreenSaver",
-                    "org.freedesktop.ScreenSaver.SimulateUserActivity",
-                ],
-            )
-            .await,
-            &mut woke,
-            errors,
-        );
-        record_wake_result(
-            "dbus-send org.gnome.ScreenSaver.SimulateUserActivity",
-            run_dbus_send(
-                display,
-                [
-                    "--session",
-                    "--type=method_call",
-                    "--dest=org.gnome.ScreenSaver",
-                    "/org/gnome/ScreenSaver",
-                    "org.gnome.ScreenSaver.SimulateUserActivity",
-                ],
-            )
-            .await,
-            &mut woke,
-            errors,
-        );
-    }
-    record_wake_result(
-        "xdotool pointer wiggle",
-        wiggle_pointer(display).await,
-        &mut woke,
-        errors,
-    );
-    woke
-}
-
-fn record_wake_result(step: &str, result: Result<()>, woke: &mut bool, errors: &mut Vec<String>) {
-    match result {
-        Ok(()) => *woke = true,
-        Err(err) => {
-            warn!(step, "display wake step failed: {err}");
-            errors.push(format!("{step}: {err}"));
+    let display = display.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use x11rb::{
+            connection::Connection,
+            protocol::{
+                dpms::{ConnectionExt as _, DPMSMode},
+                xproto::{ConnectionExt as _, ScreenSaver},
+            },
+        };
+        let (connection, _) = x11rb::connect(Some(&display))?;
+        connection.force_screen_saver(ScreenSaver::RESET)?;
+        // DPMS is optional (e.g. absent on TinyX). Never wiggle the user's pointer.
+        if std::env::var_os("VIBE_RDESK_HEADLESS_DISPLAY_ACTIVE").is_none() {
+            let _ = connection.dpms_force_level(DPMSMode::ON);
         }
-    }
-}
-
-async fn run_dbus_send<I, S>(display: &str, args: I) -> Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let status = Command::new("dbus-send")
-        .env("DISPLAY", display)
-        .args(args)
-        .status()
-        .await
-        .context("failed to run dbus-send")?;
-    if status.success() {
+        connection.flush()?;
         Ok(())
-    } else {
-        Err(anyhow!("dbus-send exited with {}", status))
-    }
-}
-
-async fn wiggle_pointer(display: &str) -> Result<()> {
-    run_xdotool(display, ["mousemove_relative", "--sync", "--", "1", "0"]).await?;
-    run_xdotool(display, ["mousemove_relative", "--sync", "--", "-1", "0"]).await?;
-    Ok(())
+    })
+    .await
+    .context("display wake worker failed")?
 }
 
 pub async fn read_stderr(child: &mut tokio::process::Child) -> String {
@@ -1381,7 +1288,6 @@ pub fn project_virtual_audio_sink_name(server: &ServerConfig) -> String {
 
 pub async fn list_audio_output_devices(server: &ServerConfig) -> Result<Vec<AudioOutputDevice>> {
     ensure_pulse_server().await?;
-    ensure_virtual_sink_exists(server).await?;
     let virtual_sink = project_virtual_audio_sink_name(server);
     let default_sink = pactl(["get-default-sink"])
         .await
@@ -1500,14 +1406,14 @@ async fn ensure_virtual_sink_exists(server: &ServerConfig) -> Result<(String, St
         if let Some(existing_sink) = pulse_device_by_description("sinks", "VibeRDesk").await? {
             sink_name = existing_sink;
         } else {
-        let _module_id = pactl([
-            "load-module",
-            "module-null-sink",
-            &format!("sink_name={sink_name}"),
-            "sink_properties=device.description=VibeRDesk",
-        ])
-        .await?;
-        wait_for_sink(&sink_name).await?;
+            let _module_id = pactl([
+                "load-module",
+                "module-null-sink",
+                &format!("sink_name={sink_name}"),
+                "sink_properties=device.description=VibeRDesk",
+            ])
+            .await?;
+            wait_for_sink(&sink_name).await?;
         }
     }
     Ok((sink_name.clone(), format!("{sink_name}.monitor")))
@@ -1533,7 +1439,9 @@ async fn ensure_virtual_mic_source() -> Result<String> {
         return Ok(VIRTUAL_MIC_SOURCE_NAME.into());
     }
 
-    if let Some(existing_source) = pulse_device_by_description("sources", VIRTUAL_MIC_SOURCE_NAME).await? {
+    if let Some(existing_source) =
+        pulse_device_by_description("sources", VIRTUAL_MIC_SOURCE_NAME).await?
+    {
         return Ok(existing_source);
     }
 
@@ -1544,14 +1452,14 @@ async fn ensure_virtual_mic_source() -> Result<String> {
         {
             mic_sink_name = existing_sink;
         } else {
-        pactl([
-            "load-module",
-            "module-null-sink",
-            &format!("sink_name={mic_sink_name}"),
-            "sink_properties=device.description=VibeRDeskVirtualMicSink",
-        ])
-        .await?;
-        wait_for_sink(&mic_sink_name).await?;
+            pactl([
+                "load-module",
+                "module-null-sink",
+                &format!("sink_name={mic_sink_name}"),
+                "sink_properties=device.description=VibeRDeskVirtualMicSink",
+            ])
+            .await?;
+            wait_for_sink(&mic_sink_name).await?;
         }
     }
     if !source_exists(VIRTUAL_MIC_SOURCE_NAME).await? {
@@ -1569,51 +1477,11 @@ async fn ensure_virtual_mic_source() -> Result<String> {
 }
 
 async fn ensure_pulse_server() -> Result<()> {
-    if wait_for_pulse_server().await {
-        return Ok(());
-    }
-    let _ = run_best_effort(
-        "systemctl",
-        &[
-            "--user",
-            "start",
-            "pipewire",
-            "pipewire-pulse",
-            "wireplumber",
-        ],
-    )
-    .await;
-    if wait_for_pulse_server().await {
-        return Ok(());
-    }
-    let _ = run_status_best_effort("pulseaudio", &["--check"]).await;
-    let _ = run_status_best_effort(
-        "pulseaudio",
-        &["--start", "--daemonize=yes", "--exit-idle-time=-1"],
-    )
-    .await;
-    if wait_for_pulse_server().await {
-        return Ok(());
-    }
-    let _ = run_best_effort("pipewire", &[]).await;
-    let _ = run_best_effort("pipewire-pulse", &[]).await;
-    let _ = run_best_effort("wireplumber", &[]).await;
-    if wait_for_pulse_server().await {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "PulseAudio/PipeWire server is not running and could not be started"
-    ))
-}
-
-async fn wait_for_pulse_server() -> bool {
-    for _ in 0..12 {
-        if pactl(["info"]).await.is_ok() {
-            return true;
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
-    false
+    // Only the supervisor owns fallback processes. Never start/restart host services here.
+    pactl(["info"])
+        .await
+        .map(|_| ())
+        .context("audio service unavailable; launch with ./aurora for automatic isolated fallback")
 }
 
 async fn sink_exists(sink_name: &str) -> Result<bool> {
@@ -1689,12 +1557,15 @@ async fn move_sink_inputs(sink_name: &str) -> Result<()> {
 }
 
 async fn pactl<const N: usize>(args: [&str; N]) -> Result<String> {
-    let output = Command::new("pactl")
+    let mut command = Command::new("pactl");
+    command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(2), command.output())
         .await
+        .context("pactl timed out")?
         .context("failed to run pactl")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1705,27 +1576,6 @@ async fn pactl<const N: usize>(args: [&str; N]) -> Result<String> {
         ));
     }
     String::from_utf8(output.stdout).context("pactl output was not utf-8")
-}
-
-async fn run_best_effort(program: &str, args: &[&str]) -> Result<()> {
-    let _ = Command::new(program)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to spawn {program}"))?;
-    Ok(())
-}
-
-async fn run_status_best_effort(program: &str, args: &[&str]) -> Result<()> {
-    let _ = Command::new(program)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .with_context(|| format!("failed to run {program}"))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1806,7 +1656,7 @@ mod tests {
 
     #[test]
     fn h264_output_inserts_aud_bitstream_filter() {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(super::ffmpeg_program());
         super::append_bitstream_filter_args(&mut cmd, "h264");
         let args = cmd.as_std().get_args().collect::<Vec<_>>();
         assert_eq!(args, vec!["-bsf:v", "h264_metadata=aud=insert"]);
@@ -1814,7 +1664,7 @@ mod tests {
 
     #[test]
     fn vp8_output_does_not_add_bitstream_filter() {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(super::ffmpeg_program());
         super::append_bitstream_filter_args(&mut cmd, "ivf");
         assert!(cmd.as_std().get_args().next().is_none());
     }

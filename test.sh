@@ -1,11 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Prefer a rustup-managed toolchain when available in the current workspace.
-if [[ -f "${HOME}/.cargo/env" ]]; then
-    # shellcheck disable=SC1090
-    . "${HOME}/.cargo/env"
-fi
-
-cargo test
-cargo build
+#!/bin/sh
+set -eu
+cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+cargo test --locked
+node --check web/app.js
+node --test tests/*.test.mjs
+python3 tests/package_audit_test.py
