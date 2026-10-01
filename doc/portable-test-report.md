@@ -4,8 +4,15 @@ Baseline: ecooxai/aurora_xrdc `1ca4ee3`. Tested on Linux x86_64, kernel 6.6.122+
 8 virtual CPUs in the current Colab high-RAM development instance.
 
 - Baseline Rust tests: 54 passed.
-- Updated Rust tests: 63 passed (57 server/input and 6 supervisor).
+- Updated Rust tests: 66 passed (57 server/input and 9 supervisor).
 - JavaScript wheel queue: 5 passed; app syntax check passed.
+- Deterministic headless mapping tests passed for CLI and scripts: port `11220` maps to
+  TinyX `DISPLAY=:220`; explicit `--display` overrides the mapping and collisions fail closed.
+- Debian 11 (`debian:11-slim`, bullseye) chroot QA passed at port 11220 / display :220.
+  The release started TinyX, private D-Bus, static PulseAudio and the server as an unprivileged
+  UID, captured a real 1280x720 X11 frame with the bundled FFmpeg, and authenticated password
+  `2208`. DNS and apt sources were disabled before startup; dpkg status, apt lists, and apt
+  archives were byte-for-byte unchanged after the run: zero package downloads/installs occurred.
 - ELF audit tests: 4 passed, including rejection of runtime loaders/shared libraries/wrong architecture.
 - Helper integration: TinyX XTEST accepted valid auth and rejected missing auth;
   static PulseAudio native protocol worked, built-in modules loaded, external modules rejected.

@@ -68,14 +68,24 @@ impl Default for Options {
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
     let mut o = Options::default();
     let mut args = args.into_iter().peekable();
-    while let Some(a) = args.next() {
-        if a == "--headless" && args.peek().is_none_or(|v| v.starts_with('-')) {
+    while let Some(raw) = args.next() {
+        let (a, inline_value) = match raw.split_once('=') {
+            Some((key, value)) if key.starts_with('-') => (key.to_owned(), Some(value.to_owned())),
+            _ => (raw, None),
+        };
+        if a == "--headless"
+            && inline_value.is_none()
+            && args.peek().is_none_or(|v| v.starts_with('-'))
+        {
             o.headless = Mode::Yes;
             continue;
         }
-        let v = args
-            .next()
-            .with_context(|| format!("missing value for {a}"))?;
+        let v = match inline_value {
+            Some(value) => value,
+            None => args
+                .next()
+                .with_context(|| format!("missing value for {a}"))?,
+        };
         match a.as_str() {
             "--port" | "-p" => {
                 o.port = v.parse()?;
@@ -177,6 +187,27 @@ fn bus_address_escape(path: &str) -> String {
         .collect()
 }
 
+fn display_number(display: &str) -> Result<u16> {
+    let number = display
+        .strip_prefix(':')
+        .context("private display must be local, for example :220")?
+        .split('.')
+        .next()
+        .context("private display number is missing")?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("invalid private display {display}; expected :N or :N.0");
+    }
+    number
+        .parse::<u16>()
+        .with_context(|| format!("invalid private display number in {display}"))
+}
+fn private_display_number(options: &Options) -> Result<u16> {
+    match options.display.as_deref() {
+        Some(display) => display_number(display),
+        None => Ok(options.port % 1000),
+    }
+}
+
 fn display_free(n: u16) -> bool {
     !Path::new(&format!("/tmp/.X{n}-lock")).exists()
         && !Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
@@ -226,12 +257,12 @@ pub fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().is_some_and(|s| s == "--help" || s == "-h") {
         println!(
-            "Aurora portable X11 remote desktop\n\n./aurora --passwd-file /private/password --port 18443\n\n--headless auto|yes|no    Prefer DISPLAY/:0; TinyX fallback (default auto)\n--audio auto|yes|no       Prefer host PulseAudio/PipeWire; private fallback\n--dbus auto|yes|no        Prefer host session bus; private fallback\n--https yes|no           Native TLS (default yes); use no behind HTTPS proxy\n--localhost yes|no       Restrict TCP bind (default no)\n--display :N             Prefer a specific existing X11 display\n--launcher none|COMMAND  Override private desktop launcher\n--state-dir PATH         Private per-run logs/runtime parent (mode 700)\n--passwd TEXT            Alternative to --passwd-file (visible in initial argv)\n--probe-display :N       Check X11 and XTEST without starting services\n--version               Print version\n\nNo root, service manager, shell, or runtime package installation is required.\nFallbacks never replace or stop host services. Audio yes / D-Bus yes force private services.\nTinyX provides a software X11 desktop, not XKB/XInput/GLX. Camera loopback/GPU require host drivers."
+            "Aurora portable X11 remote desktop\n\n./aurora --passwd-file /private/password --port 18443\n\n--headless auto|yes|no    Prefer DISPLAY/:0; TinyX fallback (default auto)\n--audio auto|yes|no       Prefer host PulseAudio/PipeWire; private fallback\n--dbus auto|yes|no        Prefer host session bus; private fallback\n--https yes|no           Native TLS (default yes); use no behind HTTPS proxy\n--localhost yes|no       Restrict TCP bind (default no)\n--display :N             Existing display, or exact private display in headless mode\n--launcher none|COMMAND  Override private desktop launcher\n--state-dir PATH         Private per-run logs/runtime parent (mode 700)\n--passwd TEXT            Alternative to --passwd-file (visible in initial argv)\n--probe-display :N       Check X11 and XTEST without starting services\n--version               Print version\n\nNo root, service manager, shell, or runtime package installation is required.\nFallbacks never replace or stop host services. Audio yes / D-Bus yes force private services.\nTinyX provides a software X11 desktop, not XKB/XInput/GLX. Private TinyX defaults to :PORT_LAST_3 (11220 -> :220); --display overrides it. Camera loopback/GPU require host drivers."
         );
         return Ok(());
     }
     if args.first().is_some_and(|s| s == "--version") {
-        println!("aurora 0.2.0 portable");
+        println!("aurora 0.2.1 portable");
         return Ok(());
     }
     if args.first().is_some_and(|s| s == "--probe-display") {
@@ -302,6 +333,15 @@ pub fn run() -> Result<()> {
         );
     }
     let parent = parent.canonicalize()?;
+    // sudo/chroot and some service managers preserve an unusable HOME (for example
+    // /root while running as an unprivileged UID). Keep a real user home when it
+    // belongs to us; otherwise use the private state parent as a writable fallback.
+    let child_home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| {
+            fs::metadata(home).is_ok_and(|metadata| metadata.is_dir() && metadata.uid() == uid)
+        })
+        .unwrap_or_else(|| parent.clone());
     let directory = parent.join(format!("session-{}", hex(&random_bytes(8)?)));
     fs::DirBuilder::new().mode(0o700).create(&directory)?;
     let mut p = Processes {
@@ -312,6 +352,7 @@ pub fn run() -> Result<()> {
     let mut paths = vec![bin.clone()];
     paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
     set(&mut p.env, "PATH", env::join_paths(paths)?);
+    set(&mut p.env, "HOME", child_home.as_os_str());
     set(&mut p.env, "VIBE_RDESK_MANAGED_RUNTIME", "1");
     set(
         &mut p.env,
@@ -353,9 +394,17 @@ pub fn run() -> Result<()> {
         if options.headless == Mode::No {
             bail!("cannot access host DISPLAY={preferred}; check DISPLAY and XAUTHORITY");
         }
-        let n = (0..100u16)
-            .find(|n| display_free(*n))
-            .context("no free private X11 display in :0..:99")?;
+        let n = private_display_number(&options)?;
+        if !display_free(n) {
+            let source = if options.display.is_some() {
+                "explicit --display"
+            } else {
+                "last three digits of --port"
+            };
+            bail!(
+                "private X11 display :{n} ({source}) is already in use; choose another port or pass --display :N"
+            );
+        }
         let display = format!(":{n}");
         let auth = p.directory.join("Xauthority");
         private_write(&auth, &auth_record(&display, &random_bytes(16)?)?)?;
@@ -621,6 +670,37 @@ mod tests {
         ] {
             assert!(parse(a.into_iter().map(String::from)).is_err());
         }
+    }
+    #[test]
+    fn private_display_defaults_to_last_three_port_digits() {
+        for (port, expected) in [
+            (11220, 220),
+            (18443, 443),
+            (9990, 990),
+            (10000, 0),
+            (65535, 535),
+        ] {
+            let mut o = Options::default();
+            o.port = port;
+            assert_eq!(private_display_number(&o).unwrap(), expected);
+        }
+    }
+    #[test]
+    fn explicit_private_display_overrides_port_mapping() {
+        let mut o = Options::default();
+        o.port = 11220;
+        o.display = Some(":321.0".into());
+        assert_eq!(private_display_number(&o).unwrap(), 321);
+        o.display = Some("remote:9".into());
+        assert!(private_display_number(&o).is_err());
+    }
+    #[test]
+    fn equals_style_arguments_are_supported() {
+        let o =
+            parse(["--port=11220", "--headless=yes", "--display=:220"].map(String::from)).unwrap();
+        assert_eq!(o.port, 11220);
+        assert_eq!(o.headless, Mode::Yes);
+        assert_eq!(o.display.as_deref(), Some(":220"));
     }
     #[test]
     fn xauth_cookie_has_correct_wire_format() {

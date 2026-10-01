@@ -23,7 +23,7 @@ def audit_elf(path, machine=62):
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--binaries',type=Path,required=True)
-    ap.add_argument('--out',type=Path,default=Path('.output/dist'));ap.add_argument('--version',default='0.2.0');ap.add_argument('--with-diagnostics',action='store_true',help='Include the optional static ffprobe test/diagnostic utility');args=ap.parse_args()
+    ap.add_argument('--out',type=Path,default=Path('.output/dist'));ap.add_argument('--version',default='0.2.1');ap.add_argument('--with-diagnostics',action='store_true',help='Include the optional static ffprobe test/diagnostic utility');args=ap.parse_args()
     root=Path(__file__).resolve().parents[2];out=args.out.resolve();out.mkdir(parents=True,exist_ok=True)
     name=f'aurora-xrdc-{args.version}-linux-x86_64';stage=out/name
     if stage.exists():shutil.rmtree(stage)
@@ -41,7 +41,7 @@ def main():
     for applet in ['sh','ash','ls','cat','cp','mv','rm','mkdir','rmdir','pwd','echo','printf','env','id','whoami','uname','date','sleep','head','tail','grep','sed','awk','find','sort','wc','touch','chmod','ps','kill','df','du','free','tar','gzip','gunzip','vi','clear','which']:
         (stage/'vendor/x86_64/bin'/applet).symlink_to('busybox')
     for alias in ['paplay','parec','pamon','parecord']:(stage/'vendor/x86_64/bin'/alias).symlink_to('pacat')
-    for source,dest in [('doc/portable.md','README.md'),('doc/portable-test-report.md','TEST-REPORT.md'),('vendor/licenses','licenses'),('tools/portable','build/portable')]:
+    for source,dest in [('doc/portable.md','README.md'),('doc/portable-test-report.md','TEST-REPORT.md'),('run.sh','run.sh'),('vendor/licenses','licenses'),('tools/portable','build/portable')]:
         source=root/source
         if source.is_dir():shutil.copytree(source,stage/dest,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
         else:shutil.copy2(source,stage/dest)
@@ -55,7 +55,7 @@ def main():
         info.uid=info.gid=0;info.uname=info.gname='';info.mtime=epoch
         if info.isdir():info.mode=0o755
         elif info.issym():info.mode=0o777
-        else:info.mode=0o755 if info.name in [name+'/'+n for n in binaries] else 0o644
+        else:info.mode=0o755 if info.name in [name+'/'+n for n in binaries] or info.name == name+'/run.sh' else 0o644
         return info
     archive=out/(name+'.tar.gz')
     with archive.open('wb') as f,gzip.GzipFile(filename='',mode='wb',fileobj=f,mtime=epoch,compresslevel=9) as gz,tarfile.open(fileobj=gz,mode='w',format=tarfile.PAX_FORMAT) as tar:

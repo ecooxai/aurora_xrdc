@@ -1,9 +1,11 @@
 # Portable release
 
 A zero-install **Linux x86_64** release is available via `./build-dist.sh` and the generated
-`.output/dist/aurora-xrdc-0.2.0-linux-x86_64.tar.gz`. Extract it and run `./aurora --passwd-file /private/password`.
+`.output/dist/aurora-xrdc-0.2.1-linux-x86_64.tar.gz`. Extract it and run `./aurora --passwd-file /private/password`.
 It prefers host X11/audio/session D-Bus and starts private static fallbacks only when needed.
 See [portable usage, security, build and limitations](doc/portable.md). Original development notes follow.
+
+Headless private displays use the last three digits of the server port (`11220 -> :220`). Pass `--display :N` to override.
 
 # vibe_rdesk
 

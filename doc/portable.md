@@ -6,8 +6,8 @@ There is no install step, package-manager call, service-manager call, or shared-
 Run as an ordinary Linux user, not root. Keep the extracted directory together.
 
 ```sh
-tar -xzf aurora-xrdc-0.2.0-linux-x86_64.tar.gz
-cd aurora-xrdc-0.2.0-linux-x86_64
+tar -xzf aurora-xrdc-0.2.1-linux-x86_64.tar.gz
+cd aurora-xrdc-0.2.1-linux-x86_64
 # Use an existing private password file; restrict it to mode 600.
 ./aurora --passwd-file "$HOME/.config/aurora/password" --port 18443
 ```
@@ -23,9 +23,12 @@ in process arguments; password files are preferable. No default password is inst
 ## Service selection
 
 `--headless auto` first probes `DISPLAY`, or `:0` when DISPLAY is unset. A working X11/XTEST
-connection is required; an existing socket alone is not treated as success. The host's
-Xauthority is preserved. If access fails, a private TinyX memory framebuffer is started
-on a free display. Use `--headless no` to require host X11 instead of falling back, or
+connection is required; an existing socket alone is not treated as success. When a private
+TinyX display is needed, Aurora uses the last three decimal digits of the server port
+(`--port 11220` -> `DISPLAY=:220`, `--port 9990` -> `:990`). Explicit `--display :N` overrides
+this mapping. A collision is an error rather than silently choosing a different display.
+The host's Xauthority is preserved. If access fails, a private TinyX memory framebuffer is
+started on that deterministic display. Use `--headless no` to require host X11 instead of falling back, or
 `--headless yes` to explicitly request a private desktop. Existing X sockets and lock
 files are never removed. The private server disables TCP and requires a random Xauthority
 cookie; it does not use `-ac`, a physical input device, a framebuffer device, or a VT.
@@ -111,8 +114,9 @@ fix DISPLAY/XAUTHORITY or explicitly choose a private fallback.
 
 ## Validation commands
 
-`./test.sh` runs Rust unit tests, browser wheel-queue tests, syntax validation and the
-ELF audit rejection tests. `python3 tests/helpers_smoke.py` tests the static X/audio helpers.
+`./test.sh` runs Rust unit tests, launch-script mapping tests, browser wheel-queue tests,
+syntax validation and the ELF audit rejection tests. A stricter compatibility check can be run
+with `sudo python3 tests/debian11_chroot_qa.py --archive .output/dist/aurora-xrdc-0.2.1-linux-x86_64.tar.gz --port 11220`; it downloads the official Debian 11 slim rootfs on the build host, disables DNS/package repositories inside the chroot, and verifies that Aurora runs without changing the Debian package database or apt cache. `python3 tests/helpers_smoke.py` tests the static X/audio helpers.
 The live test scripts operate only on an explicitly owned QA instance: set `.output/qa-release`
 to its extracted package and `.output/qa-session` to its printed session directory, place
 the QA password in `.output/qa-password` (mode 600), and use port 19990. Run
