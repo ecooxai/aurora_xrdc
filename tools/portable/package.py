@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Package and audit a relocatable static release. Requires only Python on the build host."""
-import argparse,gzip,hashlib,json,os,shutil,struct,tarfile,subprocess
+import argparse,gzip,hashlib,json,os,shutil,struct,tarfile,subprocess,tomllib
 from pathlib import Path
 
 def audit_elf(path, machine=62):
@@ -23,7 +23,7 @@ def audit_elf(path, machine=62):
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--binaries',type=Path,required=True)
-    ap.add_argument('--out',type=Path,default=Path('.output/dist'));ap.add_argument('--version',default='0.2.1');ap.add_argument('--with-diagnostics',action='store_true',help='Include the optional static ffprobe test/diagnostic utility');args=ap.parse_args()
+    ap.add_argument('--out',type=Path,default=Path('.output/dist'));ap.add_argument('--version',default=tomllib.loads((Path(__file__).resolve().parents[2]/'Cargo.toml').read_text())['package']['version']);ap.add_argument('--with-diagnostics',action='store_true',help='Include the optional static ffprobe test/diagnostic utility');args=ap.parse_args()
     root=Path(__file__).resolve().parents[2];out=args.out.resolve();out.mkdir(parents=True,exist_ok=True)
     name=f'aurora-xrdc-{args.version}-linux-x86_64';stage=out/name
     if stage.exists():shutil.rmtree(stage)

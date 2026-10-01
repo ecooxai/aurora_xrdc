@@ -1,53 +1,79 @@
-# Portable Aurora validation report
+# Aurora XRDC v0.2.2 verification report
 
-Baseline: ecooxai/aurora_xrdc `1ca4ee3`. Tested on Linux x86_64, kernel 6.6.122+,
-8 virtual CPUs in the current Colab high-RAM development instance.
+## Acceptance result
 
-- Baseline Rust tests: 54 passed.
-- Updated Rust tests: 66 passed (57 server/input and 9 supervisor).
-- JavaScript wheel queue: 5 passed; app syntax check passed.
-- Deterministic headless mapping tests passed for CLI and scripts: port `11220` maps to
-  TinyX `DISPLAY=:220`; explicit `--display` overrides the mapping and collisions fail closed.
-- Debian 11 (`debian:11-slim`, bullseye) chroot QA passed at port 11220 / display :220.
-  The release started TinyX, private D-Bus, static PulseAudio and the server as an unprivileged
-  UID, captured a real 1280x720 X11 frame with the bundled FFmpeg, and authenticated password
-  `2208`. DNS and apt sources were disabled before startup; dpkg status, apt lists, and apt
-  archives were byte-for-byte unchanged after the run: zero package downloads/installs occurred.
-- ELF audit tests: 4 passed, including rejection of runtime loaders/shared libraries/wrong architecture.
-- Helper integration: TinyX XTEST accepted valid auth and rejected missing auth;
-  static PulseAudio native protocol worked, built-in modules loaded, external modules rejected.
-- Authenticated HTTP health/API/asset tests passed; protected API rejected unauthenticated access.
-- Real 1280x720 TinyX capture encoded and decoded with H.264, H.265, VP8 and VP9.
-- Real monitor audio playback/capture encoded and decoded with AAC and Opus; RMS checks were nonzero.
-- 2,000 wheel messages interleaved with 50 key pairs and 50 click pairs: all key edges,
-  button releases and 50 pongs observed. Latest localhost p50 1.74 ms, p95 3.93 ms,
-  maximum 5.71 ms during concurrent build activity. These are local test measurements,
-  not WAN performance guarantees or a controlled before/after benchmark.
-- Abrupt transport abort released the held key and button within 21.4 ms. The earlier
-  implementation failed this test; the final input cleanup runs on the error path too.
-- Chromium desktop/mobile smoke passed with rendered nonblank 1280x720 video, zero
-  JavaScript errors, zero HTTP 5xx, and no horizontal overflow at 390 px viewport width.
-  WebSocket, WebRTC data-channel and WebRTC media modes were exercised. WebRTC connection
-  and ICE states were explicitly checked as connected; media mode had a received video track.
-- Login became visible in approximately 150–214 ms in local browser runs.
-- Native HTTPS health passed with internally generated TLS keys/certificates.
-- Host-reuse tests started no fallback processes, preserved the host's default audio sink,
-  and left the test host X11, audio and session D-Bus services alive after shutdown.
-- Empty-root test passed with no host shell, shared-library directories, installed runtime
-  packages, or /proc. TinyX, PulseAudio, D-Bus, Aurora WM and the server started as UID 1001.
-  The private D-Bus machine-id query is also checked without `/etc/machine-id`. Owned processes shut down successfully. /dev/null, /dev/urandom and writable runtime
-  directories were provided as kernel/runtime facilities, not installed packages.
+The requested port-to-display mapping and launcher cleanup are implemented and tested.
+The official Debian 11 slim (bullseye) root filesystem ran the extracted Linux x86_64
+release at port 11220 / display :220 as UID 1000, without installing or downloading
+additional packages inside that root filesystem. The build was performed outside it.
 
-Packaging performs a fresh PT_INTERP/DT_NEEDED check on every included ELF and records
-SHA-256 hashes. The minimal archive omits ffprobe (only needed for tests/diagnostics).
-The optional diagnostic build includes that additional static executable.
+## What was corrected
 
-Not validated on ARM64, other kernels, or every distribution/browser. GPU/AV1 encoding
-requires an explicitly selected suitable host FFmpeg and drivers; no GPU driver, physical
-audio stack, NetworkManager, Bluetooth service, or v4l2loopback module is installed by this
-release. TinyX does not implement modern XKB/XInput2/GLX functionality. WebTransport-over-QUIC
-and physical camera/microphone devices are not claimed as end-to-end tested by this report.
+The shell scripts no longer contain their own competing option parser. The static Rust
+launcher parses arguments once, treats leading-zero ports as decimal, preserves a password
+such as `--port` as a value, honors a final explicit port over the dev default, and maps a
+private display to port modulo 1000. `--display :N` or `:N.0` overrides it. Invalid screen
+suffixes and occupied/dangling-symlink X paths are rejected; no host lock or display is removed.
+Help/version do not build, build failures propagate, and paths/arguments with spaces are preserved.
 
-Detailed execution logs, JSON results, sample streams and screenshots are retained in
-`.output/` in the source checkout. Runtime credentials are deliberately excluded from
-both the release archive and the report.
+Expanded tests found that the old bundled xdotool dereferenced a missing XKB keyboard map
+on TinyX. Its static rebuild now uses core X11 keyboard mapping when XKB is absent and does
+not read uninitialized XKB group state. Native server input, video and audio remain unchanged.
+The helper's separate Alpine build environment is not the Debian runtime test environment.
+
+## Automated checks
+
+70 Rust tests passed (13 launcher, 57 server/input); 17 wrapper regression tests,
+5 JavaScript wheel-queue tests and 4 ELF-audit rejection tests passed. All 12 bundled
+executables are checked for absent PT_INTERP and DT_NEEDED entries. The manifest lists
+no required runtime packages and records each binary's SHA-256.
+
+The real-service matrix passed: run.sh 11220 -> :220; dev.sh 11221 -> :221;
+011222 -> :222; explicit 12220 + --display :321.0 -> :321; automatic headless fallback;
+option-looking password authentication; same-suffix collision rejected without affecting
+the first instance; existing X/audio/D-Bus reused; all owned children reaped on shutdown.
+
+Real 1280x720 X11 capture encoded and decoded with H.264, H.265, VP8 and VP9. Real monitor
+audio encoded and decoded with AAC and Opus, with nonzero RMS. The mixed-input test sent
+2,000 wheel messages interleaved with 50 key pairs, 50 click pairs and 50 pings. All key
+pairs and pings arrived. Local ping median: 0.89 ms; p95: 2.04 ms;
+maximum: 2.09 ms. These are local measurements, not WAN guarantees.
+
+Headless Chromium rendered nonblank 1280x720 desktops using WebSocket, WebRTC data-channel
+and WebRTC media modes. ICE/peer states were connected where applicable; media mode received
+a video track. No JavaScript errors or mobile horizontal overflow were observed at 390px width.
+These are functionality checks, not a claim of pixel-perfect window-manager rendering; a
+pre-existing intermittent dark strip was visible in the WM settings sidebar screenshot.
+
+## Debian 11 test provenance
+
+Official image: debian:11-slim, linux/amd64.
+Manifest: sha256:70509c95d1857a3704c0a5d92ee2e0adac95f612a9386889d70760bfd7c1ebba
+Rootfs layer: sha256:4705738e5e0492efae5d2523aa791e06c852e2e1acb5e70a365cc08f9da0c556
+
+The rootfs layer was downloaded and digest-verified by the host-side test driver. DNS and
+apt repositories were disabled inside the test root. The dpkg status database, apt lists
+and apt archive cache were unchanged before/after execution. Inside that root, TinyX,
+PulseAudio, D-Bus machine-id queries, xdotool geometry/mouse/keyboard commands, FFmpeg capture
+and HTTP authentication passed. No apt install, apt update or package download was run there.
+
+A chroot shares its host kernel. This validates Debian 11 userspace on the current Linux
+6.6.122+ host; it does not validate a separate Debian 11 kernel or ARM64, GPU drivers, physical
+camera devices, or every Xorg extension. TinyX still lacks XKB/XInput2/GLX. WebTransport-over-QUIC
+and all possible desktop applications are not claimed as end-to-end tested by this run.
+
+## Reproduction
+
+Run `./test.sh`, then `./build-dist.sh`. With test ports free, run:
+
+```sh
+python3 tests/launcher_runtime_test.py --package .output/dist/current --output .output/runtime-qa
+python3 tests/browser_launcher_test.py --package .output/dist/current --output .output/browser-qa
+sudo python3 tests/debian11_chroot_qa.py \
+  --archive .output/dist/aurora-xrdc-0.2.2-linux-x86_64.tar.gz \
+  --work "$PWD/.agentwork/debian11-fresh-qa" --port 11220
+```
+
+Python/Chromium/Rust/build tools are needed only on the build/test host. The deployed
+Debian server does not need them. Current build packaging requires Python 3.11 or newer.
+Runtime test password 2208 is fixture data, not an installed default in the release.

@@ -88,9 +88,14 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options> {
         };
         match a.as_str() {
             "--port" | "-p" => {
-                o.port = v.parse()?;
+                if v.is_empty() || !v.bytes().all(|c| c.is_ascii_digit()) {
+                    bail!("port must be a decimal integer in 1..65535");
+                }
+                o.port = v
+                    .parse()
+                    .context("port must be a decimal integer in 1..65535")?;
                 if o.port == 0 {
-                    bail!("port must be 1..65535");
+                    bail!("port must be a decimal integer in 1..65535");
                 }
             }
             "--https" => o.https = parse_bool(&v)?,
@@ -188,12 +193,14 @@ fn bus_address_escape(path: &str) -> String {
 }
 
 fn display_number(display: &str) -> Result<u16> {
-    let number = display
+    let local = display
         .strip_prefix(':')
-        .context("private display must be local, for example :220")?
-        .split('.')
-        .next()
-        .context("private display number is missing")?;
+        .context("private display must be local: :N or :N.0")?;
+    let number = match local.split_once('.') {
+        Some((number, "0")) => number,
+        Some(_) => bail!("private display supports only screen 0: use :N or :N.0"),
+        None => local,
+    };
     if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
         bail!("invalid private display {display}; expected :N or :N.0");
     }
@@ -201,6 +208,7 @@ fn display_number(display: &str) -> Result<u16> {
         .parse::<u16>()
         .with_context(|| format!("invalid private display number in {display}"))
 }
+
 fn private_display_number(options: &Options) -> Result<u16> {
     match options.display.as_deref() {
         Some(display) => display_number(display),
@@ -209,8 +217,13 @@ fn private_display_number(options: &Options) -> Result<u16> {
 }
 
 fn display_free(n: u16) -> bool {
-    !Path::new(&format!("/tmp/.X{n}-lock")).exists()
-        && !Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
+    // A dangling symlink or unreadable path also reserves the display; never overwrite it.
+    [format!("/tmp/.X{n}-lock"), format!("/tmp/.X11-unix/X{n}")]
+        .iter()
+        .all(|path| {
+            fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        })
 }
 fn wait_ready(
     p: &mut Processes,
@@ -262,7 +275,7 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     if args.first().is_some_and(|s| s == "--version") {
-        println!("aurora 0.2.1 portable");
+        println!("aurora {} portable", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if args.first().is_some_and(|s| s == "--probe-display") {
@@ -702,6 +715,41 @@ mod tests {
         assert_eq!(o.headless, Mode::Yes);
         assert_eq!(o.display.as_deref(), Some(":220"));
     }
+    #[test]
+    fn decimal_port_and_last_override_are_consistent() {
+        for text in ["09990", "0009990", "9990"] {
+            let options = parse(["--port", text, "--headless"].map(String::from)).unwrap();
+            assert_eq!(private_display_number(&options).unwrap(), 990);
+        }
+        let options = parse(["--port", "9990", "--port=11220"].map(String::from)).unwrap();
+        assert_eq!(private_display_number(&options).unwrap(), 220);
+        for text in ["+9990", "-1", "65536", "0", "", "0x100", " 22"] {
+            assert!(parse(["--port", text].map(String::from)).is_err());
+        }
+    }
+    #[test]
+    fn option_looking_values_are_not_reinterpreted() {
+        let options =
+            parse(["--port", "11220", "--passwd", "--port", "--headless"].map(String::from))
+                .unwrap();
+        assert_eq!(options.password.as_deref(), Some("--port"));
+        assert_eq!(private_display_number(&options).unwrap(), 220);
+    }
+    #[test]
+    fn private_display_rejects_invalid_screen_suffixes() {
+        for text in [
+            ":220.bad", ":220.1", ":220.0.0", ":", ":+220", ":65536", "host:220",
+        ] {
+            assert!(display_number(text).is_err(), "accepted {text}");
+        }
+        assert_eq!(display_number(":0220.0").unwrap(), 220);
+    }
+    #[test]
+    fn xauthority_accepts_three_digit_displays() {
+        let record = auth_record(":220", &[42; 16]).unwrap();
+        assert_eq!(&record[4..9], &[0, 3, b'2', b'2', b'0']);
+    }
+
     #[test]
     fn xauth_cookie_has_correct_wire_format() {
         let b = auth_record(":71", &[7; 16]).unwrap();

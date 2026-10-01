@@ -6,8 +6,8 @@ There is no install step, package-manager call, service-manager call, or shared-
 Run as an ordinary Linux user, not root. Keep the extracted directory together.
 
 ```sh
-tar -xzf aurora-xrdc-0.2.1-linux-x86_64.tar.gz
-cd aurora-xrdc-0.2.1-linux-x86_64
+tar -xzf aurora-xrdc-0.2.2-linux-x86_64.tar.gz
+cd aurora-xrdc-0.2.2-linux-x86_64
 # Use an existing private password file; restrict it to mode 600.
 ./aurora --passwd-file "$HOME/.config/aurora/password" --port 18443
 ```
@@ -103,7 +103,7 @@ covers the package files. Packaging rejects any PT_INTERP or DT_NEEDED entry. Th
 are stricter than copying a loader and shared libraries next to a supposedly static binary.
 
 In the source checkout, `./build-dist.sh` rebuilds the Rust release and creates the archive.
-Rust, a musl C compiler and Python 3 are **build-host** tools only. The vendored helper
+Rust, a musl C compiler and Python 3.11+ are **build-host** tools only. The vendored helper
 rebuild scripts, source pins and licenses document their separate musl build. Runtime
 startup never downloads anything. Original launchers are preserved in `tools/legacy/`
 for comparison; they are not used by the portable release.
@@ -116,7 +116,7 @@ fix DISPLAY/XAUTHORITY or explicitly choose a private fallback.
 
 `./test.sh` runs Rust unit tests, launch-script mapping tests, browser wheel-queue tests,
 syntax validation and the ELF audit rejection tests. A stricter compatibility check can be run
-with `sudo python3 tests/debian11_chroot_qa.py --archive .output/dist/aurora-xrdc-0.2.1-linux-x86_64.tar.gz --port 11220`; it downloads the official Debian 11 slim rootfs on the build host, disables DNS/package repositories inside the chroot, and verifies that Aurora runs without changing the Debian package database or apt cache. `python3 tests/helpers_smoke.py` tests the static X/audio helpers.
+with `sudo python3 tests/debian11_chroot_qa.py --archive .output/dist/aurora-xrdc-0.2.2-linux-x86_64.tar.gz --port 11220`; it downloads the official Debian 11 slim rootfs on the build host, disables DNS/package repositories inside the chroot, and verifies that Aurora runs without changing the Debian package database or apt cache. `python3 tests/helpers_smoke.py` tests the static X/audio helpers.
 The live test scripts operate only on an explicitly owned QA instance: set `.output/qa-release`
 to its extracted package and `.output/qa-session` to its printed session directory, place
 the QA password in `.output/qa-password` (mode 600), and use port 19990. Run
@@ -131,3 +131,18 @@ To rebuild vendored helpers from pinned source archives/commits, run
 The Alpine build-only package inventory is included with the notices. The source downloads
 are hash/revision checked; the distribution repository for build-only packages can evolve,
 so this is not a promise of bit-identical builds across future toolchain updates.
+
+## Launcher hardening in 0.2.2
+
+`run.sh` forwards argument boundaries unchanged and lets the static Rust launcher perform
+all option validation and display selection. It no longer treats decimal ports with leading
+zeros as shell octal, or mistakes a password like `--port` for an option. `dev.sh` supplies
+its default port before user arguments, so the explicit user port wins. Help and version
+requests do not trigger a build. Build failures propagate rather than launching stale output.
+
+An explicit private display accepts `:N` or `:N.0`; invalid screen suffixes are rejected.
+A dangling X socket/lock symlink also counts as an occupied display and is never removed.
+The bundled xdotool now falls back to core X11 keyboard mapping when XKB is unavailable,
+instead of dereferencing a missing XKB map. It remains a statically linked executable.
+The small helper rebuild recipe is `tools/portable/rebuild-xdotool.sh`; all of its packages
+are installed only into the separate Alpine build environment, not into the Debian test root.

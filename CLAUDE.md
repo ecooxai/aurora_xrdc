@@ -4,60 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-**Development (auto-rebuild on file change):**
-```bash
-bash dev.sh --passwd passwd
-```
-Runs `test.sh` first, then starts the debug binary and watches `src/`, `web/`, and `Cargo.toml` for changes. Starts Xvfb + a window manager if no `DISPLAY` is available. Generates a self-signed TLS cert in `ssl_keys/` if absent.
+**Development:** `./dev.sh --passwd-file /private/password --port 9990 --headless yes`.
+Builds the portable release once, then execs the launcher. Private display is `:990` for
+port 9990 and `:220` for port 11220. Set `AURORA_DEV_SKIP_BUILD=1` to reuse an existing
+release; `AURORA_DEV_PORT` changes the default port. An explicit CLI port wins.
 
-**Starting the dev server (standard invocation for Claude):**
+**Production:** `./run.sh --passwd-file /private/password --port 18443`.
+Prefers an accessible host display/audio/session bus. `--headless yes` forces TinyX,
+`--headless no` requires host X11, and `--display :N` overrides the private display.
+The private display is otherwise port modulo 1000. Collisions fail; never kill arbitrary
+port owners, delete X locks, start an unauthenticated Xvfb or stop unrelated host services.
 
-Use port `9990` and display `:0`. Kill any process already holding port 9990, then ensure display `:0` is running before launching:
+**Build:** `./build-dist.sh` creates the Linux x86_64 static archive under `.output/dist/`.
+Runtime binaries are bundled; build tools are not required on the deployment host.
+Release code targets baseline x86-64, not the build CPU.
 
-```bash
-# 1. Free port 9990 if occupied
-fuser -k 9990/tcp 2>/dev/null || true
-sleep 0.5
+**Tests:** `./test.sh` runs Rust tests, JS wheel tests, launcher-wrapper tests and the ELF audit.
+`tests/launcher_runtime_test.py` tests a supplied extracted package's real services.
+`sudo python3 tests/debian11_chroot_qa.py --archive ARCHIVE --work FRESH_QA_DIRECTORY`
+downloads the official Debian 11 rootfs on the host and runs Aurora as UID 1000 inside it;
+no target package installation is allowed. This chroot is a userspace compatibility test,
+not a test of a separate Debian kernel.
 
-# 2. Start Xvfb on :0 if the display is not already available
-if ! DISPLAY=:0 xdpyinfo >/dev/null 2>&1; then
-    Xvfb :0 -screen 0 1280x720x24 -ac -nolisten tcp &
-    sleep 1
-fi
-
-# 3. Launch dev server
-DISPLAY=:0 bash dev.sh --passwd passwd --port 9990
-```
-
-- Always kill the existing process on port 9990 before starting a new one.
-- If `DISPLAY=:0` is unavailable, start Xvfb on `:0` (not a different display number).
-- Pass `--port 9990` explicitly; do not rely on the default port.
-
-**Production:**
-```bash
-bash run.sh --passwd passwd --port 18443 --https yes --headless no
-```
-
-**Build (optimized release):**
-```bash
-bash build.sh
-```
-Sets `target-cpu=native` by default. Release binary ends up in `target/release/vibe_rdesk`; the intended verification path is `/var/tmp/vibe_rdesk-build/release/vibe_rdesk`.
-
-**Test + debug build (what `dev.sh` calls):**
-```bash
-bash test.sh        # cargo test && cargo build
-```
-
-**Run a single test:**
-```bash
-cargo test <test_name>
-```
-
-**Logging:**
-```bash
-RUST_LOG=debug bash dev.sh --passwd passwd
-```
+**Logging:** `RUST_LOG=debug ./run.sh ...`; inspect the printed private runtime directory.
 
 ## Architecture
 

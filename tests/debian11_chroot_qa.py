@@ -34,7 +34,9 @@ def download(tok,digest,path):
     if h.hexdigest()!=expected:raise RuntimeError('Debian layer checksum mismatch')
     tmp.replace(path)
 
-def run(args,**kw):return subprocess.run([str(x) for x in args],check=True,text=True,**kw)
+def run(args,**kw):
+    kw.setdefault('timeout',60)
+    return subprocess.run([str(x) for x in args],check=True,text=True,**kw)
 def digest_tree(path):
     h=hashlib.sha256()
     if path.exists():
@@ -84,9 +86,18 @@ def main():
     with log.open('wb') as f:p=subprocess.Popen([str(x) for x in cmd],stdin=subprocess.DEVNULL,stdout=f,stderr=f,start_new_session=True)
     try:
         wait_health(a.port,p);session=max((root/'state').glob('session-*'),key=lambda x:x.stat().st_mtime);rt=json.loads((session/'session.json').read_text());expected=f':{a.port%1000}';assert rt['DISPLAY']==expected and rt['private_x11'] is True,rt
-        base=['sudo','chroot','--userspec=1000:1000',root,'/opt/aurora/vendor/x86_64/bin/busybox','env','-i','HOME=/home/aurora','PATH=/opt/aurora/vendor/x86_64/bin',f'DISPLAY={rt["DISPLAY"]}',f'XAUTHORITY={rt["XAUTHORITY"]}',f'PULSE_SERVER={rt["PULSE_SERVER"]}',f'PULSE_COOKIE={rt["PULSE_COOKIE"]}','PULSE_CLIENTCONFIG=/state/client.conf']
+        base=['sudo','chroot','--userspec=1000:1000',root,'/opt/aurora/vendor/x86_64/bin/busybox','env','-i','HOME=/home/aurora','PATH=/opt/aurora/vendor/x86_64/bin',f'DISPLAY={rt["DISPLAY"]}',f'XAUTHORITY={rt["XAUTHORITY"]}',f'PULSE_SERVER={rt["PULSE_SERVER"]}',f'PULSE_COOKIE={rt["PULSE_COOKIE"]}',f'PULSE_CLIENTCONFIG=/{session.relative_to(root).as_posix()}/client.conf']
         run(base+['/opt/aurora/vendor/x86_64/bin/ffmpeg','-v','error','-f','x11grab','-video_size','1280x720','-i',rt['DISPLAY'],'-frames:v','1','-f','null','-'])
         q=run(base+['/opt/aurora/vendor/x86_64/bin/pactl','info'],capture_output=True);assert 'Server String' in q.stdout
+        geometry=run(base+['/opt/aurora/vendor/x86_64/bin/xdotool','getdisplaygeometry'],capture_output=True)
+        assert geometry.stdout.strip()=='1280 720',geometry.stdout
+        run(base+['/opt/aurora/vendor/x86_64/bin/xdotool','mousemove','200','200','click','--delay','0','1'])
+        run(base+['/opt/aurora/vendor/x86_64/bin/xdotool','key','--delay','0','a'])
+        busbase=base.copy()
+        # Insert child environment values before the executable, never install a D-Bus package.
+        busbase += [f'DBUS_SESSION_BUS_ADDRESS={rt["DBUS_SESSION_BUS_ADDRESS"]}',f'AURORA_DBUS_MACHINE_ID_FILE={rt["AURORA_DBUS_MACHINE_ID_FILE"]}']
+        bus=run(busbase+['/opt/aurora/vendor/x86_64/bin/dbus-send','--session','--print-reply','--dest=org.freedesktop.DBus','/','org.freedesktop.DBus.Peer.GetMachineId'],capture_output=True)
+        assert 'string' in bus.stdout,bus.stdout
         c=http.client.HTTPConnection('127.0.0.1',a.port,timeout=3);c.request('POST','/api/auth',json.dumps({'passwd':'2208'}),{'Content-Type':'application/json'});r=c.getresponse();r.read();assert r.status==200;c.close()
     finally:
         if p.poll() is None:
@@ -94,6 +105,6 @@ def main():
             try:p.wait(timeout=8)
             except subprocess.TimeoutExpired:os.killpg(p.pid,signal.SIGKILL);p.wait(timeout=3)
     after=(hashlib.sha256(status.read_bytes()).hexdigest(),digest_tree(root/'var/lib/apt/lists'),digest_tree(root/'var/cache/apt/archives'));assert before==after,'Debian package database/cache changed'
-    result={'image':'debian:11-slim','manifest_digest':md,'layer_digest':layers[0]['digest'],'os':'Debian GNU/Linux 11 (bullseye)','port':a.port,'display':f':{a.port%1000}','health':'ok','auth_2208':'ok','tinyx_capture':'ok','pulseaudio':'ok','package_database_unchanged':True,'apt_cache_unchanged':True,'package_downloads_inside_chroot':0,'package_installs_inside_chroot':0,'dns_inside_chroot':'disabled during QA'}
+    result={'image':'debian:11-slim','manifest_digest':md,'layer_digest':layers[0]['digest'],'os':'Debian GNU/Linux 11 (bullseye)','port':a.port,'display':f':{a.port%1000}','health':'ok','auth_2208':'ok','tinyx_capture':'ok','pulseaudio':'ok','xdotool_core_x11':'ok','dbus_machine_id':'ok','runtime_uid':1000,'archive_sha256':hashlib.sha256(a.archive.read_bytes()).hexdigest(),'kernel_note':'chroot uses the host Linux kernel; Debian 11 userspace tested','package_database_unchanged':True,'apt_cache_unchanged':True,'package_downloads_inside_chroot':0,'package_installs_inside_chroot':0,'dns_inside_chroot':'disabled during QA'}
     out=ROOT/'.output/debian11-chroot-qa.json';out.parent.mkdir(exist_ok=True);out.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2));print('log:',log)
 if __name__=='__main__':main()

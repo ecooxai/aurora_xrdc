@@ -18,6 +18,7 @@ meson setup /build/xkb-build /build/libxkbcommon-1.8.1 --prefix=/out --default-l
 ninja -C /build/xkb-build -j4
 ninja -C /build/xkb-build install
 cd /build/xdotool
+python3 /build/patch-xdotool.py /build/xdotool
 make -j4 xdotool.static LDFLAGS='-static -Wl,--gc-sections' \
   CFLAGS="-O2 -I/out/include -I/usr/include -fPIC -std=gnu99" \
   LIBXDO_LIBS="$(pkgconf --static --libs xi x11 xtst xinerama xkbcommon)" \
