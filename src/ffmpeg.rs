@@ -257,6 +257,10 @@ pub async fn choose_encoder(
     ))
 }
 
+pub async fn choose_encoder_for_stream(stream: &StreamConfig) -> Result<EncoderChoice> {
+    choose_encoder(stream.codec, stream.encode_preference).await
+}
+
 pub async fn available_encoder_options(codec: CodecKind) -> Result<Vec<AvailableEncoderOption>> {
     let encoders = ffmpeg_list_encoders().await?;
     let mut options = Vec::new();

@@ -54,8 +54,23 @@ impl VideoScale {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureBackend {
+    Native,
+    Ffmpeg,
+}
+
+impl Default for CaptureBackend {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") { Self::Native } else { Self::Ffmpeg }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct VideoPerformanceConfig {
+    #[serde(default)]
+    pub capture_backend: CaptureBackend,
     #[serde(default)]
     pub encoder_latency: EncoderLatencyMode,
     #[serde(default)]
@@ -69,6 +84,7 @@ pub struct VideoPerformanceConfig {
 impl Default for VideoPerformanceConfig {
     fn default() -> Self {
         Self {
+            capture_backend: CaptureBackend::default(),
             encoder_latency: EncoderLatencyMode::Low,
             encoder_quality: EncoderQualityMode::Balanced,
             gop_ms: 4_000,
@@ -80,6 +96,9 @@ impl Default for VideoPerformanceConfig {
 
 impl VideoPerformanceConfig {
     pub fn normalized(mut self) -> Self {
+        if !cfg!(target_os = "macos") {
+            self.capture_backend = CaptureBackend::Ffmpeg;
+        }
         self.gop_ms = self.gop_ms.clamp(250, 4_000);
         self.buffer_ms = self.buffer_ms.clamp(50, 2_000);
         self
@@ -248,7 +267,11 @@ impl Default for StreamConfig {
             codec: CodecKind::H264,
             bitrate_kbps: 3_000,
             fps: 30,
-            encode_preference: EncodePreference::Cpu,
+            encode_preference: if cfg!(target_os = "macos") {
+                EncodePreference::Gpu
+            } else {
+                EncodePreference::Cpu
+            },
             performance: VideoPerformanceConfig::default(),
         }
     }
@@ -260,16 +283,23 @@ impl StreamConfig {
         self.fps = self.fps.clamp(1, 60);
         self.encode_preference = self.encode_preference.normalized_for_codec(self.codec);
         self.performance = self.performance.normalized();
+        if self.performance.capture_backend == CaptureBackend::Native
+            && self.codec != CodecKind::H264
+        {
+            self.performance.capture_backend = CaptureBackend::Ffmpeg;
+        }
         self
     }
 
     pub fn h264_cpu_fallback(&self) -> Self {
+        let mut performance = self.performance.clone();
+        performance.capture_backend = CaptureBackend::Ffmpeg;
         Self {
             codec: CodecKind::H264,
             bitrate_kbps: self.bitrate_kbps,
             fps: self.fps,
             encode_preference: EncodePreference::Cpu,
-            performance: self.performance.clone(),
+            performance,
         }
         .normalized()
     }

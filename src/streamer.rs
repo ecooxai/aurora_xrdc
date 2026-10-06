@@ -6,7 +6,7 @@ use tokio::{io::AsyncReadExt, process::Child, sync::broadcast};
 
 use crate::{
     annexb::{AnnexBParser, EncodedFrame, IvfParser},
-    ffmpeg::{EncoderChoice, choose_encoder, spawn_capture},
+    ffmpeg::{EncoderChoice, choose_encoder_for_stream, spawn_capture},
     settings::{CodecKind, ServerConfig, StreamConfig},
 };
 
@@ -21,7 +21,7 @@ pub async fn start(
     config: StreamConfig,
     tx: broadcast::Sender<StreamFrame>,
 ) -> Result<(EncoderChoice, Child)> {
-    let encoder = choose_encoder(config.codec, config.encode_preference).await?;
+    let encoder = choose_encoder_for_stream(&config).await?;
     let mut child = spawn_capture(&server, &config, &encoder)?;
     let mut stdout = child.stdout.take().expect("ffmpeg stdout missing");
     tokio::spawn(async move {

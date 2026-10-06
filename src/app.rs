@@ -35,8 +35,8 @@ use crate::{
     rtc::{self, RtcMode},
     session::{self, SessionRole},
     settings::{
-        AudioStreamConfig, CodecKind, EncodePreference, EncoderLatencyMode, EncoderQualityMode,
-        ServerConfig, StreamConfig, VideoPerformanceConfig, VideoScale,
+        AudioStreamConfig, CaptureBackend, CodecKind, EncodePreference, EncoderLatencyMode,
+        EncoderQualityMode, ServerConfig, StreamConfig, VideoPerformanceConfig, VideoScale,
     },
     transport, webtransport,
 };
@@ -269,6 +269,7 @@ struct WsQuery {
     audio_bitrate_kbps: Option<u32>,
     fps: Option<u32>,
     encode_preference: Option<EncodePreference>,
+    capture_backend: Option<CaptureBackend>,
     encoder_latency: Option<EncoderLatencyMode>,
     encoder_quality: Option<EncoderQualityMode>,
     gop_ms: Option<u32>,
@@ -289,8 +290,11 @@ impl WsQuery {
                 .bitrate_kbps
                 .unwrap_or_else(|| StreamConfig::default().bitrate_kbps),
             fps: self.fps.unwrap_or_else(|| StreamConfig::default().fps),
-            encode_preference: self.encode_preference.unwrap_or_default(),
+            encode_preference: self
+                .encode_preference
+                .unwrap_or_else(|| StreamConfig::default().encode_preference),
             performance: VideoPerformanceConfig {
+                capture_backend: self.capture_backend.unwrap_or_default(),
                 encoder_latency: self.encoder_latency.unwrap_or_default(),
                 encoder_quality: self.encoder_quality.unwrap_or_default(),
                 gop_ms: self

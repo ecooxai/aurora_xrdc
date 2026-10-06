@@ -3,7 +3,9 @@ use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use tokio::{io::AsyncReadExt, process::{Child, ChildStdin, Command}};
 
-use crate::settings::{AudioStreamConfig, CodecKind, EncodePreference, ServerConfig, StreamConfig};
+use crate::settings::{
+    AudioStreamConfig, CaptureBackend, CodecKind, EncodePreference, ServerConfig, StreamConfig,
+};
 
 fn ffmpeg_program() -> std::ffi::OsString {
     std::env::var_os("AURORA_FFMPEG").filter(|p| !p.is_empty()).unwrap_or_else(|| "ffmpeg".into())
@@ -61,16 +63,30 @@ pub async fn choose_encoder(codec: CodecKind, pref: EncodePreference) -> Result<
     Err(anyhow!("no working ffmpeg encoder available for requested codec {codec:?}"))
 }
 
+pub async fn choose_encoder_for_stream(stream: &StreamConfig) -> Result<EncoderChoice> {
+    if stream.performance.capture_backend == CaptureBackend::Native {
+        if stream.codec != CodecKind::H264 {
+            return Err(anyhow!("Apple native capture currently supports H.264 only"));
+        }
+        return Ok(EncoderChoice {
+            ffmpeg_encoder: "apple_videotoolbox".into(),
+            mode: "gpu",
+            output_format: "h264",
+        });
+    }
+    choose_encoder(stream.codec, stream.encode_preference).await
+}
+
 pub async fn available_encoder_options(codec: CodecKind) -> Result<Vec<AvailableEncoderOption>> {
     let encoders = ffmpeg_list_encoders().await?;
     let mut out=Vec::new();
     match codec {
         CodecKind::H264 => {
-            if encoders.contains(" h264_videotoolbox ") { out.push(AvailableEncoderOption{value:EncodePreference::Gpu,label:"h264_videotoolbox (GPU)".into(),mode:"gpu",ffmpeg_encoder:Some("h264_videotoolbox".into())}); }
+            if encoders.contains(" h264_videotoolbox ") { out.push(AvailableEncoderOption{value:EncodePreference::Gpu,label:"Apple VideoToolbox (GPU)".into(),mode:"gpu",ffmpeg_encoder:Some("h264_videotoolbox".into())}); }
             if encoders.contains(" libx264 ") { out.push(AvailableEncoderOption{value:EncodePreference::Cpu,label:"libx264 (CPU)".into(),mode:"cpu",ffmpeg_encoder:Some("libx264".into())}); }
         }
         CodecKind::H265 => {
-            if encoders.contains(" hevc_videotoolbox ") { out.push(AvailableEncoderOption{value:EncodePreference::Gpu,label:"hevc_videotoolbox (GPU)".into(),mode:"gpu",ffmpeg_encoder:Some("hevc_videotoolbox".into())}); }
+            if encoders.contains(" hevc_videotoolbox ") { out.push(AvailableEncoderOption{value:EncodePreference::Gpu,label:"Apple VideoToolbox HEVC (GPU)".into(),mode:"gpu",ffmpeg_encoder:Some("hevc_videotoolbox".into())}); }
             if encoders.contains(" libx265 ") { out.push(AvailableEncoderOption{value:EncodePreference::Cpu,label:"libx265 (CPU)".into(),mode:"cpu",ffmpeg_encoder:Some("libx265".into())}); }
         }
         CodecKind::Vp8 => if encoders.contains(" libvpx ") { out.push(AvailableEncoderOption{value:EncodePreference::Cpu,label:"libvpx (CPU)".into(),mode:"cpu",ffmpeg_encoder:Some("libvpx".into())}); },
@@ -124,18 +140,68 @@ fn mac_screen_input() -> String {
     "0:none".to_string()
 }
 
-pub fn spawn_capture(_server:&ServerConfig, stream:&StreamConfig, encoder:&EncoderChoice) -> Result<Child> {
-    let fps=stream.fps.to_string();
-    let device = mac_screen_input();
-    let mut cmd=Command::new(ffmpeg_program());
-    cmd.args(["-loglevel","error","-f","avfoundation","-capture_cursor","1","-framerate",&fps,"-i",&device,"-an","-sn","-c:v",&encoder.ffmpeg_encoder]);
-    match encoder.ffmpeg_encoder.as_str() {
-        "h264_videotoolbox"|"hevc_videotoolbox" => { cmd.args(["-realtime","1","-b:v",&format!("{}k",stream.bitrate_kbps)]); }
-        _ => { cmd.args(["-preset","veryfast","-tune","zerolatency","-b:v",&format!("{}k",stream.bitrate_kbps)]); }
+pub fn spawn_capture(
+    _server: &ServerConfig,
+    stream: &StreamConfig,
+    encoder: &EncoderChoice,
+) -> Result<Child> {
+    if stream.performance.capture_backend == CaptureBackend::Native {
+        return spawn_native_capture(stream);
     }
-    cmd.args(["-g",&(stream.fps.saturating_mul(2).max(1)).to_string(),"-pix_fmt","yuv420p","-f",encoder.output_format,"pipe:1"]);
+    spawn_ffmpeg_capture(stream, encoder)
+}
+
+fn native_capture_program() -> Result<std::ffi::OsString> {
+    if let Some(path) = std::env::var_os("APPLE_XRDC_NATIVE_CAPTURE_BIN").filter(|p| !p.is_empty()) {
+        return Ok(path);
+    }
+    option_env!("APPLE_XRDC_NATIVE_CAPTURE_BIN")
+        .map(std::ffi::OsString::from)
+        .ok_or_else(|| anyhow!("native ScreenCaptureKit helper was not built"))
+}
+
+fn spawn_native_capture(stream: &StreamConfig) -> Result<Child> {
+    if stream.codec != CodecKind::H264 {
+        return Err(anyhow!("Apple ScreenCaptureKit backend currently supports H.264 only"));
+    }
+    let target_height = stream.performance.scale.target_height().unwrap_or(0).to_string();
+    let mut cmd = Command::new(native_capture_program()?);
+    cmd.args([
+        "--fps", &stream.fps.to_string(),
+        "--bitrate-kbps", &stream.bitrate_kbps.to_string(),
+        "--gop-ms", &stream.performance.gop_ms.to_string(),
+        "--height", &target_height,
+    ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    cmd.spawn().context("failed to spawn macOS ffmpeg screen capture")
+    cmd.spawn().context("failed to spawn Apple ScreenCaptureKit + VideoToolbox capture")
+}
+
+fn spawn_ffmpeg_capture(stream: &StreamConfig, encoder: &EncoderChoice) -> Result<Child> {
+    let fps = stream.fps.to_string();
+    let device = mac_screen_input();
+    let gop = stream.fps.saturating_mul(stream.performance.gop_ms).saturating_add(999) / 1_000;
+    let bitrate = format!("{}k", stream.bitrate_kbps);
+    let mut cmd = Command::new(ffmpeg_program());
+    cmd.args([
+        "-loglevel","error","-probesize","32","-analyzeduration","0",
+        "-fflags","nobuffer","-flush_packets","1",
+        "-f","avfoundation","-capture_cursor","1","-framerate",&fps,
+        "-i",&device,"-an","-sn","-c:v",&encoder.ffmpeg_encoder,
+    ]);
+    if let Some(height) = stream.performance.scale.target_height() {
+        cmd.args(["-vf", &format!("scale=-2:{height}")]);
+    }
+    match encoder.ffmpeg_encoder.as_str() {
+        "h264_videotoolbox" | "hevc_videotoolbox" => {
+            cmd.args(["-realtime","1","-allow_sw","1","-b:v",&bitrate]);
+        }
+        _ => {
+            cmd.args(["-preset","veryfast","-tune","zerolatency","-threads","2","-b:v",&bitrate]);
+        }
+    }
+    cmd.args(["-g",&gop.max(1).to_string(),"-pix_fmt","yuv420p","-f",encoder.output_format,"pipe:1"]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    cmd.spawn().context("failed to spawn macOS FFmpeg/AVFoundation capture")
 }
 
 pub async fn spawn_audio_capture(_server:&ServerConfig, _config:&AudioStreamConfig) -> Result<Child> {
