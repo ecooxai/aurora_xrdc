@@ -10,6 +10,7 @@ fn main() {
     let output = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("apple_xrdc_capture");
     let status = Command::new("xcrun")
         .arg("swiftc")
+        .arg("-parse-as-library")
         .arg("-O")
         .arg(&source)
         .arg("-o")
