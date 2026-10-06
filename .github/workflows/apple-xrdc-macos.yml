@@ -43,6 +43,24 @@ jobs:
             -i "0:none" -frames:v 1 -y "$RUNNER_TEMP/apple-xrdc-screen.png"
           test -s "$RUNNER_TEMP/apple-xrdc-screen.png"
           sips -g pixelWidth -g pixelHeight "$RUNNER_TEMP/apple-xrdc-screen.png"
+      - name: Smoke test macOS server runtime
+        run: |
+          VIBE_RDESK_BIND="127.0.0.1:18443" \
+            ./target/debug/vibe_rdesk --passwd mac-ci >"$RUNNER_TEMP/apple-xrdc-server.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:18443/healthz" | grep -q "ok"; then
+              exit 0
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/apple-xrdc-server.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/apple-xrdc-server.log"
+          exit 1
       - name: Port status
         if: always()
         run: |
@@ -55,5 +73,6 @@ jobs:
             echo "- Input backend: CoreGraphics CGEvent"
             echo "- Clipboard: pbcopy/pbpaste"
             echo "- Screen capture smoke test: passed"
+            echo "- HTTP server runtime smoke test: passed"
             echo "- System audio / virtual camera: pending native macOS implementation"
           } >> "$GITHUB_STEP_SUMMARY"
