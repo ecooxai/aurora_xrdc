@@ -47,6 +47,21 @@ jobs:
           ffprobe -v error -f h264 \
             -show_entries stream=codec_name,width,height \
             -of default=noprint_wrappers=1 "$RUNNER_TEMP/apple-native.h264"
+
+          ffmpeg -hide_banner -loglevel error \
+            -f h264 -i "$RUNNER_TEMP/apple-native.h264" \
+            -vf "select=eq(n\\,0),signalstats,metadata=print" \
+            -frames:v 1 -f null - 2>"$RUNNER_TEMP/native-frame-stats.txt" || true
+          cat "$RUNNER_TEMP/native-frame-stats.txt"
+          yavg="$(grep -Eo 'lavfi.signalstats.YAVG=[0-9.]+' "$RUNNER_TEMP/native-frame-stats.txt" | head -n1 | cut -d= -f2 || true)"
+          test -n "$yavg"
+          python3 - "$yavg" <<'PY'
+import sys
+y = float(sys.argv[1])
+print(f"native_frame_yavg={y:.3f}")
+if y < 8.0:
+    raise SystemExit("native ScreenCaptureKit frame is effectively black")
+PY
       - name: Probe AVFoundation devices
         run: |
           ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | tee avfoundation-devices.txt || true
