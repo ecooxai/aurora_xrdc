@@ -40,7 +40,7 @@ jobs:
           chmod 600 "$PASS_FILE"
           echo "PREVIEW_PASSWORD=$PASS" >> "$GITHUB_ENV"
 
-          mkdir -p "$RUNNER_TEMP/aurora-state"
+          install -d -m 700 "$RUNNER_TEMP/aurora-state"
           "$AURORA_BIN"             --passwd-file "$PASS_FILE"             --port "$AURORA_PORT"             --https no             --localhost yes             --headless yes             --audio no             --dbus no             --state-dir "$RUNNER_TEMP/aurora-state"             >"$RUNNER_TEMP/aurora.log" 2>&1 &
           echo "AURORA_PID=$!" >> "$GITHUB_ENV"
 
