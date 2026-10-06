@@ -1,6 +1,7 @@
 name: Apple XRDC Preview
 
 # Native preview generation: ScreenCaptureKit capture + VideoToolbox H.264 by default.
+# Stream framing fix: VideoToolbox access units include H.264 AUD delimiters.
 
 on:
   workflow_dispatch:
