@@ -1,5 +1,7 @@
 name: Apple XRDC Preview
 
+# Native preview generation: ScreenCaptureKit capture + VideoToolbox H.264 by default.
+
 on:
   workflow_dispatch:
   push:
@@ -122,6 +124,9 @@ jobs:
             echo "Password: $PREVIEW_PASSWORD"
             echo
             echo "Runner: $(sw_vers -productVersion) / $(uname -m)"
+            echo "Capture: Apple ScreenCaptureKit"
+            echo "Encoder: Apple VideoToolbox H.264"
+            echo "FFmpeg/AVFoundation: selectable fallback in Performance settings"
           } >> "$GITHUB_STEP_SUMMARY"
 
           payload="$(jq -n \
