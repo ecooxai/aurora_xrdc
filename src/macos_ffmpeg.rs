@@ -1,7 +1,7 @@
 use std::{ffi::OsStr, process::Stdio};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
-use tokio::{io::AsyncReadExt, process::{Child, ChildStdin, Command}, time::Duration};
+use tokio::{io::AsyncReadExt, process::{Child, ChildStdin, Command}};
 
 use crate::settings::{AudioStreamConfig, CodecKind, EncodePreference, ServerConfig, StreamConfig};
 
@@ -88,9 +88,45 @@ pub async fn available_codec_options() -> Result<Vec<AvailableCodecOption>> {
     Ok(out)
 }
 
+fn mac_screen_input() -> String {
+    if let Ok(value) = std::env::var("AURORA_MAC_SCREEN_DEVICE") {
+        let value = value.trim();
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+
+    let output = std::process::Command::new(ffmpeg_program())
+        .args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""])
+        .output();
+
+    if let Ok(output) = output {
+        let listing = String::from_utf8_lossy(&output.stderr);
+        for line in listing.lines() {
+            if !line.contains("Capture screen") {
+                continue;
+            }
+            // FFmpeg formats AVFoundation entries as "... [N] Capture screen N".
+            if let Some(start) = line.rfind("] [") {
+                let tail = &line[start + 3..];
+                if let Some(end) = tail.find(']') {
+                    let index = &tail[..end];
+                    if index.chars().all(|ch| ch.is_ascii_digit()) {
+                        return format!("{index}:none");
+                    }
+                }
+            }
+        }
+    }
+
+    // Screen 0 is the normal AVFoundation screen input when no explicit override
+    // is supplied. Keep the environment override for unusual device layouts.
+    "0:none".to_string()
+}
+
 pub fn spawn_capture(_server:&ServerConfig, stream:&StreamConfig, encoder:&EncoderChoice) -> Result<Child> {
     let fps=stream.fps.to_string();
-    let device=std::env::var("AURORA_MAC_SCREEN_DEVICE").unwrap_or_else(|_| "1:none".into());
+    let device = mac_screen_input();
     let mut cmd=Command::new(ffmpeg_program());
     cmd.args(["-loglevel","error","-f","avfoundation","-capture_cursor","1","-framerate",&fps,"-i",&device,"-an","-sn","-c:v",&encoder.ffmpeg_encoder]);
     match encoder.ffmpeg_encoder.as_str() {
