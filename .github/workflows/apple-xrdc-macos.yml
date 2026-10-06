@@ -1,0 +1,51 @@
+name: apple_xrdc macOS
+
+on:
+  push:
+    branches: [apple_xrdc]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-build-test:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Environment
+        run: |
+          sw_vers
+          uname -m
+          rustc --version
+          cargo --version
+          ffmpeg -version | head -n 3 || true
+      - name: Ensure FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            brew install ffmpeg
+          fi
+      - name: Rust format check
+        run: cargo fmt --all -- --check
+      - name: Build macOS server
+        run: cargo build --all-targets
+      - name: Test macOS server
+        run: cargo test --all-targets
+      - name: Probe AVFoundation devices
+        continue-on-error: true
+        run: |
+          ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | tee avfoundation-devices.txt
+      - name: Port status
+        if: always()
+        run: |
+          {
+            echo "## apple_xrdc macOS validation"
+            echo
+            echo "- Runner: macos-latest"
+            echo "- Architecture: $(uname -m)"
+            echo "- Screen capture backend: FFmpeg AVFoundation"
+            echo "- Input backend: CoreGraphics CGEvent"
+            echo "- Clipboard: pbcopy/pbpaste"
+            echo "- System audio / virtual camera: pending native macOS implementation"
+          } >> "$GITHUB_STEP_SUMMARY"
