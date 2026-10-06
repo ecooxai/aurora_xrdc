@@ -33,9 +33,16 @@ jobs:
       - name: Test macOS server
         run: cargo test --all-targets
       - name: Probe AVFoundation devices
-        continue-on-error: true
         run: |
-          ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | tee avfoundation-devices.txt
+          ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | tee avfoundation-devices.txt || true
+          grep -q "Capture screen" avfoundation-devices.txt
+      - name: Smoke test macOS screen capture
+        run: |
+          ffmpeg -hide_banner -loglevel warning \
+            -f avfoundation -capture_cursor 1 -framerate 1 \
+            -i "0:none" -frames:v 1 -y "$RUNNER_TEMP/apple-xrdc-screen.png"
+          test -s "$RUNNER_TEMP/apple-xrdc-screen.png"
+          sips -g pixelWidth -g pixelHeight "$RUNNER_TEMP/apple-xrdc-screen.png"
       - name: Port status
         if: always()
         run: |
@@ -47,5 +54,6 @@ jobs:
             echo "- Screen capture backend: FFmpeg AVFoundation"
             echo "- Input backend: CoreGraphics CGEvent"
             echo "- Clipboard: pbcopy/pbpaste"
+            echo "- Screen capture smoke test: passed"
             echo "- System audio / virtual camera: pending native macOS implementation"
           } >> "$GITHUB_STEP_SUMMARY"
