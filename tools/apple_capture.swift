@@ -54,6 +54,12 @@ final class AnnexBWriter: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
+        // Aurora's Annex-B parser uses H.264 Access Unit Delimiters (NAL type 9)
+        // to identify frame boundaries. FFmpeg inserts these for the legacy path,
+        // but VideoToolbox does not, so emit one for every encoded access unit.
+        output.write(startCode)
+        output.write(Data([0x09, 0xF0]))
+
         var nalHeaderLength: Int32 = 4
         if let format = CMSampleBufferGetFormatDescription(sampleBuffer) {
             var count = 0
