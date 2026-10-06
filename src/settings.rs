@@ -516,11 +516,13 @@ mod tests {
     }
 
     #[test]
-    fn stream_config_defaults_to_cpu_preference() {
-        assert_eq!(
-            StreamConfig::default().encode_preference,
+    fn stream_config_uses_platform_encoder_default() {
+        let expected = if cfg!(target_os = "macos") {
+            EncodePreference::Gpu
+        } else {
             EncodePreference::Cpu
-        );
+        };
+        assert_eq!(StreamConfig::default().encode_preference, expected);
     }
 
     #[test]
