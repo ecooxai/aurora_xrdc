@@ -1,6 +1,5 @@
 use std::path::Path;
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt, process::Command};
 
@@ -26,12 +25,9 @@ pub async fn read_remote_clipboard(_display: &str) -> Result<ClipboardPayload> {
         (!value.is_empty()).then_some(value)
     } else { None };
 
-    let png = Command::new("osascript")
-        .args(["-e", "try", "-e", "set p to the clipboard as «class PNGf»", "-e", "return p", "-e", "on error", "-e", "return """, "-e", "end try"])
-        .output().await.ok()
-        .filter(|out| out.status.success() && !out.stdout.is_empty())
-        .map(|out| STANDARD.encode(out.stdout));
-    Ok(ClipboardPayload { text, image_png_b64: png })
+    // Text clipboard is native and reliable through pbpaste/pbcopy. PNG clipboard
+    // support will use NSPasteboard in the next native-backend pass.
+    Ok(ClipboardPayload { text, image_png_b64: None })
 }
 
 pub async fn write_remote_clipboard(_display: &str, payload: &ClipboardPayload) -> Result<()> {
