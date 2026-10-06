@@ -55,13 +55,7 @@ jobs:
           cat "$RUNNER_TEMP/native-frame-stats.txt"
           yavg="$(grep -Eo 'lavfi.signalstats.YAVG=[0-9.]+' "$RUNNER_TEMP/native-frame-stats.txt" | head -n1 | cut -d= -f2 || true)"
           test -n "$yavg"
-          python3 - "$yavg" <<'PY'
-import sys
-y = float(sys.argv[1])
-print(f"native_frame_yavg={y:.3f}")
-if y < 8.0:
-    raise SystemExit("native ScreenCaptureKit frame is effectively black")
-PY
+          awk -v y="$yavg" 'BEGIN { printf("native_frame_yavg=%.3f\\n", y); if (y < 8.0) { print "native ScreenCaptureKit frame is effectively black" > "/dev/stderr"; exit 1 } }'
       - name: Probe AVFoundation devices
         run: |
           ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | tee avfoundation-devices.txt || true
