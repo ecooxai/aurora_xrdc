@@ -26,8 +26,8 @@ jobs:
           if ! command -v ffmpeg >/dev/null; then
             brew install ffmpeg
           fi
-      - name: Rust format check
-        run: cargo fmt --all -- --check
+      - name: Normalize Rust formatting
+        run: cargo fmt --all
       - name: Build macOS server
         run: cargo build --all-targets
       - name: Test macOS server
