@@ -333,6 +333,7 @@ const audioRealOutputInput = $("audio-real-output");
 const audioInVideoInput = $("audio-in-video");
 const audioOutputStatus = $("audio-output-status");
 const autoDisconnectMinutesInput = $("auto-disconnect-minutes");
+const captureBackendSelect = $("capture-backend");
 const encoderLatencySelect = $("encoder-latency");
 const encoderQualitySelect = $("encoder-quality");
 const videoScaleSelect = $("video-scale");
@@ -423,6 +424,8 @@ const CAMERA_MIME_CANDIDATES = [
 const PERFORMANCE_PRESETS = {
   speed: {
     codec: "h264",
+    captureBackend: "native",
+    encodePreference: "gpu",
     bitrate: 3000,
     fps: 30,
     encoderLatency: "low",
@@ -438,6 +441,8 @@ const PERFORMANCE_PRESETS = {
   },
   quality: {
     codec: "h264",
+    captureBackend: "native",
+    encodePreference: "gpu",
     bitrate: 10000,
     fps: 30,
     encoderLatency: "balanced",
@@ -1043,6 +1048,7 @@ function streamReconnectSettingsKey(settings = readSettingsFromControls()) {
   return JSON.stringify({
     codec: settings.codec,
     encodePreference: settings.encodePreference,
+    captureBackend: settings.captureBackend,
     bitrate: settings.bitrate,
     audioBitrateKbps: settings.audioBitrateKbps,
     fps: settings.fps,
@@ -1077,6 +1083,7 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
   const incoming = normalizeSettings({
     codec: streamConfig?.codec,
     encodePreference: streamConfig?.encode_preference,
+    captureBackend: streamConfig?.performance?.capture_backend,
     bitrate: streamConfig?.bitrate_kbps,
     audioBitrateKbps: audioConfig?.bitrate_kbps,
     fps: streamConfig?.fps,
@@ -1123,6 +1130,7 @@ function syncServerStreamSettings(streamConfig, audioConfig, { force = false } =
     ...current,
     codec: incoming.codec,
     encodePreference: incoming.encodePreference,
+    captureBackend: incoming.captureBackend,
     bitrate: incoming.bitrate,
     audioBitrateKbps: incoming.audioBitrateKbps,
     fps: incoming.fps,
@@ -1367,6 +1375,7 @@ function normalizeSettings(settings = {}) {
   const allowedAudioBitrates = new Set(Array.from(audioBitrateSelect.options, (option) => Number(option.value)));
   const allowedMicBitrates = new Set(Array.from(micBitrateSelect.options, (option) => Number(option.value)));
   const allowedTouchModes = new Set(Array.from(touchModeSelect.options, (option) => option.value));
+  const allowedCaptureBackends = new Set(Array.from(captureBackendSelect.options, (option) => option.value));
   const allowedEncoderLatency = new Set(Array.from(encoderLatencySelect.options, (option) => option.value));
   const allowedEncoderQuality = new Set(Array.from(encoderQualitySelect.options, (option) => option.value));
   const allowedVideoScales = new Set(Array.from(videoScaleSelect.options, (option) => option.value));
@@ -1383,6 +1392,9 @@ function normalizeSettings(settings = {}) {
   return {
     codec,
     encodePreference: normalizeEncodePreferenceForCodec(settings.encodePreference, codec),
+    captureBackend: allowedCaptureBackends.has(settings.captureBackend)
+      ? settings.captureBackend
+      : captureBackendSelect.value,
     bitrate: clampControlValue(bitrateInput, settings.bitrate, defaultBitrate),
     audioBitrateKbps: allowedAudioBitrates.has(Number(settings.audioBitrateKbps))
       ? Number(settings.audioBitrateKbps)
@@ -1548,6 +1560,7 @@ function readSettingsFromControls() {
   return normalizeSettings({
     codec: codecSelect.value,
     encodePreference: encodePreferenceSelect.value,
+    captureBackend: captureBackendSelect.value,
     bitrate: bitrateInput.value,
     audioBitrateKbps: audioBitrateSelect.value,
     micBitrateKbps: micBitrateSelect.value,
@@ -1836,6 +1849,7 @@ function applySettings(settings) {
   codecSelect.value = normalized.codec;
   renderCodecOptions();
   renderEncodePreferenceOptions(encodeOptionsForCodec(normalized.codec), normalized.encodePreference);
+  captureBackendSelect.value = normalized.captureBackend;
   bitrateInput.value = String(normalized.bitrate);
   audioBitrateSelect.value = String(normalized.audioBitrateKbps);
   micBitrateSelect.value = String(normalized.micBitrateKbps);
@@ -1937,16 +1951,18 @@ function noteAutoDisconnectActivity(message) {
 }
 
 function defaultEncodePreferenceForCodec(codec) {
-  if (codec === "h265") return "libx265";
+  if (codec === "h264" || codec === "h265") return "gpu";
   if (codec === "vp8") return "libvpx";
   if (codec === "vp9") return "libvpx-vp9";
   if (codec === "av1") return "libsvtav1";
-  return "libx264";
+  return "gpu";
 }
 
 function defaultEncodeOptionsForCodec(codec) {
   if (codec === "h265") {
     return [
+      { value: "gpu", label: "Apple / GPU auto" },
+      { value: "cpu", label: "CPU auto" },
       { value: "hevc_nvenc", label: "hevc_nvenc" },
       { value: "hevc_qsv", label: "hevc_qsv" },
       { value: "hevc_vaapi", label: "hevc_vaapi" },
@@ -1973,6 +1989,8 @@ function defaultEncodeOptionsForCodec(codec) {
     ];
   }
   return [
+    { value: "gpu", label: "Apple / GPU auto" },
+    { value: "cpu", label: "CPU auto" },
     { value: "h264_nvenc", label: "h264_nvenc" },
     { value: "h264_qsv", label: "h264_qsv" },
     { value: "h264_vaapi", label: "h264_vaapi" },
@@ -2008,9 +2026,9 @@ function normalizeEncodePreferenceForCodec(value, codec) {
     : defaultEncodePreferenceForCodec(codec);
   const allowedValues = new Set(
     codec === "h264"
-      ? ["h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
+      ? ["gpu", "cpu", "nvidia", "h264_nvenc", "h264_qsv", "h264_vaapi", "libx264"]
       : codec === "h265"
-        ? ["hevc_nvenc", "hevc_qsv", "hevc_vaapi", "libx265"]
+        ? ["gpu", "cpu", "nvidia", "hevc_nvenc", "hevc_qsv", "hevc_vaapi", "libx265"]
         : codec === "vp8"
           ? ["libvpx"]
           : codec === "vp9"
@@ -2313,6 +2331,7 @@ function appendStreamQuery(url, settings) {
   }
   url.searchParams.set("codec", settings.codec);
   url.searchParams.set("encode_preference", settings.encodePreference);
+  url.searchParams.set("capture_backend", settings.captureBackend);
   url.searchParams.set("bitrate_kbps", settings.bitrate);
   url.searchParams.set("audio_bitrate_kbps", settings.audioBitrateKbps);
   url.searchParams.set("fps", settings.fps);
@@ -6484,6 +6503,7 @@ function initControls() {
   });
   fpsInput.addEventListener("input", persistCurrentSettings);
   fpsInput.addEventListener("change", persistCurrentSettings);
+  captureBackendSelect.addEventListener("change", persistCurrentSettings);
   encoderLatencySelect.addEventListener("change", persistCurrentSettings);
   encoderQualitySelect.addEventListener("change", persistCurrentSettings);
   videoScaleSelect.addEventListener("change", persistCurrentSettings);

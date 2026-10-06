@@ -32,6 +32,21 @@ jobs:
         run: cargo build --all-targets
       - name: Test macOS server
         run: cargo test --all-targets
+      - name: Smoke test ScreenCaptureKit + VideoToolbox
+        run: |
+          helper="$(find target/debug/build -type f -name apple_xrdc_capture -perm -111 | head -n 1)"
+          test -n "$helper"
+          "$helper" --fps 10 --bitrate-kbps 2500 --gop-ms 1000 --height 720 \
+            >"$RUNNER_TEMP/apple-native.h264" 2>"$RUNNER_TEMP/apple-native.log" &
+          helper_pid=$!
+          sleep 6
+          kill "$helper_pid" 2>/dev/null || true
+          wait "$helper_pid" 2>/dev/null || true
+          cat "$RUNNER_TEMP/apple-native.log"
+          test -s "$RUNNER_TEMP/apple-native.h264"
+          ffprobe -v error -f h264 \
+            -show_entries stream=codec_name,width,height \
+            -of default=noprint_wrappers=1 "$RUNNER_TEMP/apple-native.h264"
       - name: Probe AVFoundation devices
         run: |
           ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | tee avfoundation-devices.txt || true
@@ -69,7 +84,9 @@ jobs:
             echo
             echo "- Runner: macos-latest"
             echo "- Architecture: $(uname -m)"
-            echo "- Screen capture backend: FFmpeg AVFoundation"
+            echo "- Default capture backend: Apple ScreenCaptureKit"
+            echo "- Default encoder: Apple VideoToolbox"
+            echo "- Fallback capture backend: FFmpeg AVFoundation"
             echo "- Input backend: CoreGraphics CGEvent"
             echo "- Clipboard: pbcopy/pbpaste"
             echo "- Screen capture smoke test: passed"

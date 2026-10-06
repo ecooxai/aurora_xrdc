@@ -455,6 +455,13 @@
                       <option value="custom">Custom</option>
                     </select>
                   </label>
+                  <label>Capture method
+                    <select id="capture-backend">
+                      <option value="native" selected>Apple ScreenCaptureKit + VideoToolbox</option>
+                      <option value="ffmpeg">FFmpeg / AVFoundation</option>
+                    </select>
+                    <span class="field-help">Native is recommended on macOS. FFmpeg remains available as a compatibility fallback.</span>
+                  </label>
                   <div class="field-group">
                     <span class="field-label">Codec</span>
                     <div id="codec-group" class="radio-group" role="radiogroup" aria-label="Codec"></div>
@@ -476,8 +483,8 @@
                     ></div>
                     <select id="encode-preference" class="hidden" aria-hidden="true" tabindex="-1">
                       <option value="nvidia">NVIDIA auto</option>
-                      <option value="gpu">GPU auto</option>
-                      <option value="cpu" selected>CPU auto</option>
+                      <option value="gpu" selected>Apple / GPU auto</option>
+                      <option value="cpu">CPU auto</option>
                     </select>
                     <span id="encode-preference-help" class="field-help">Loading encoder availability...</span>
                   </div>
