@@ -106,7 +106,7 @@ pub async fn spawn_audio_capture(_server:&ServerConfig, _config:&AudioStreamConf
     Err(anyhow!("system-audio capture is not yet implemented on macOS"))
 }
 
-pub async fn spawn_mic_input_injector(_server:&ServerConfig) -> Result<MicInputHandle> {
+pub async fn spawn_opus_audio_capture(_server:&ServerConfig, _config:&AudioStreamConfig) -> Result<Child> {\n    Err(anyhow!("system-audio Opus capture is not yet implemented on macOS"))\n}\n\npub async fn spawn_mic_input_injector(_server:&ServerConfig) -> Result<MicInputHandle> {
     Err(anyhow!("virtual microphone uplink is not yet implemented on macOS"))
 }
 
