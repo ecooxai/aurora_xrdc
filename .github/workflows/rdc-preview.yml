@@ -1,0 +1,125 @@
+name: RDC Preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/rdc-preview.yml"
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      AURORA_PORT: "18443"
+    steps:
+      - name: Download Aurora portable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/aurora"
+          curl -fsSL             -o "$RUNNER_TEMP/aurora.tar.gz"             "https://github.com/ecooxai/aurora_xrdc/releases/download/v0.2.2/aurora-xrdc-0.2.2-linux-x86_64.tar.gz"
+          echo "5e073ad2d7511c25a31ee3881907a4f57a56711b1918a723b2d829673216da88  $RUNNER_TEMP/aurora.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/aurora.tar.gz" -C "$RUNNER_TEMP/aurora"
+          AURORA_BIN="$(find "$RUNNER_TEMP/aurora" -maxdepth 3 -type f -name aurora -perm -111 | head -n 1)"
+          test -n "$AURORA_BIN"
+          echo "AURORA_BIN=$AURORA_BIN" >> "$GITHUB_ENV"
+
+      - name: Start Aurora RDC
+        shell: bash
+        run: |
+          set -euo pipefail
+          PASS="Aurora-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PASS_FILE="$RUNNER_TEMP/aurora-passwd"
+          printf '%s\n' "$PASS" > "$PASS_FILE"
+          chmod 600 "$PASS_FILE"
+          echo "PREVIEW_PASSWORD=$PASS" >> "$GITHUB_ENV"
+
+          mkdir -p "$RUNNER_TEMP/aurora-state"
+          "$AURORA_BIN"             --passwd-file "$PASS_FILE"             --port "$AURORA_PORT"             --https no             --localhost yes             --headless yes             --audio no             --dbus no             --state-dir "$RUNNER_TEMP/aurora-state"             >"$RUNNER_TEMP/aurora.log" 2>&1 &
+          echo "AURORA_PID=$!" >> "$GITHUB_ENV"
+
+          for _ in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:$AURORA_PORT/" >/dev/null; then
+              echo "Aurora is ready on localhost:$AURORA_PORT"
+              exit 0
+            fi
+            if ! kill -0 "$!" 2>/dev/null; then
+              cat "$RUNNER_TEMP/aurora.log"
+              exit 1
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/aurora.log"
+          exit 1
+
+      - name: Start public preview tunnel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsSL             -o "$RUNNER_TEMP/cloudflared"             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          chmod +x "$RUNNER_TEMP/cloudflared"
+
+          "$RUNNER_TEMP/cloudflared" tunnel             --no-autoupdate             --url "http://127.0.0.1:$AURORA_PORT"             >"$RUNNER_TEMP/cloudflared.log" 2>&1 &
+          CF_PID=$!
+
+          PREVIEW_URL=""
+          for _ in $(seq 1 90); do
+            PREVIEW_URL="$(grep -Eo 'https://[-a-z0-9]+\.trycloudflare\.com' "$RUNNER_TEMP/cloudflared.log" | head -n 1 || true)"
+            if [ -n "$PREVIEW_URL" ]; then
+              break
+            fi
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              cat "$RUNNER_TEMP/cloudflared.log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ -z "$PREVIEW_URL" ]; then
+            cat "$RUNNER_TEMP/cloudflared.log"
+            exit 1
+          fi
+
+          echo "PREVIEW_URL=$PREVIEW_URL" >> "$GITHUB_ENV"
+          echo "CLOUDFLARED_PID=$CF_PID" >> "$GITHUB_ENV"
+          echo "Preview URL: $PREVIEW_URL"
+          echo "Preview password: $PREVIEW_PASSWORD"
+
+          payload="$(jq -n             --arg state pending             --arg target_url "$PREVIEW_URL"             --arg description "RDC ready; password: $PREVIEW_PASSWORD"             --arg context "aurora/rdc-preview"             '{state:$state,target_url:$target_url,description:$description,context:$context}')"
+          curl -fsSL             -X POST             -H "Accept: application/vnd.github+json"             -H "Authorization: Bearer $GH_TOKEN"             -H "X-GitHub-Api-Version: 2022-11-28"             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA"             -d "$payload" >/dev/null
+
+      - name: Keep preview alive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            payload="$(jq -n               --arg state error               --arg target_url "$PREVIEW_URL"               --arg description "RDC preview stopped"               --arg context "aurora/rdc-preview"               '{state:$state,target_url:$target_url,description:$description,context:$context}')"
+            curl -fsSL               -X POST               -H "Accept: application/vnd.github+json"               -H "Authorization: Bearer $GH_TOKEN"               -H "X-GitHub-Api-Version: 2022-11-28"               "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA"               -d "$payload" >/dev/null || true
+          }
+          trap cleanup EXIT INT TERM
+
+          echo "RDC preview is live: $PREVIEW_URL"
+          echo "Password: $PREVIEW_PASSWORD"
+          echo "This GitHub-hosted preview remains available while this job is running."
+
+          while kill -0 "$AURORA_PID" 2>/dev/null && kill -0 "$CLOUDFLARED_PID" 2>/dev/null; do
+            sleep 30
+          done
+
+          echo "Aurora or cloudflared exited."
+          echo "--- Aurora log ---"
+          tail -n 80 "$RUNNER_TEMP/aurora.log" || true
+          echo "--- cloudflared log ---"
+          tail -n 80 "$RUNNER_TEMP/cloudflared.log" || true
+          exit 1
