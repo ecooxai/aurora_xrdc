@@ -50,8 +50,8 @@ jobs:
 
           ffmpeg -hide_banner -loglevel error \
             -f h264 -i "$RUNNER_TEMP/apple-native.h264" \
-            -vf "select=eq(n\\,0),signalstats,metadata=print" \
-            -frames:v 1 -f null - 2>"$RUNNER_TEMP/native-frame-stats.txt" || true
+            -vf "select=eq(n\\,0),signalstats,metadata=print:file=$RUNNER_TEMP/native-frame-stats.txt" \
+            -frames:v 1 -f null - >/dev/null 2>&1
           cat "$RUNNER_TEMP/native-frame-stats.txt"
           yavg="$(grep -Eo 'lavfi.signalstats.YAVG=[0-9.]+' "$RUNNER_TEMP/native-frame-stats.txt" | head -n1 | cut -d= -f2 || true)"
           test -n "$yavg"
