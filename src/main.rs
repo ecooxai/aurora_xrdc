@@ -4,7 +4,15 @@ mod audio;
 mod audio_streamer;
 mod camera;
 mod client_manager;
+#[cfg(target_os = "linux")]
 mod clipboard;
+#[cfg(target_os = "macos")]
+#[path = "macos_clipboard.rs"]
+mod clipboard;
+#[cfg(target_os = "linux")]
+mod ffmpeg;
+#[cfg(target_os = "macos")]
+#[path = "macos_ffmpeg.rs"]
 mod ffmpeg;
 mod media;
 mod messages;
@@ -14,9 +22,17 @@ mod settings;
 mod streamer;
 mod system_stats;
 mod transport;
+#[cfg(target_os = "linux")]
+mod uinput;
+#[cfg(target_os = "macos")]
+#[path = "macos_uinput.rs"]
 mod uinput;
 mod webtransport;
 mod wheel;
+#[cfg(target_os = "linux")]
+mod x11_input;
+#[cfg(target_os = "macos")]
+#[path = "macos_x11_input.rs"]
 mod x11_input;
 
 use anyhow::Result;
