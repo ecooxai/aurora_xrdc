@@ -32,3 +32,6 @@ codegen-units = 1
 incremental = false
 lto = "thin"
 panic = "abort"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
